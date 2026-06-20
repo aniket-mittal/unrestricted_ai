@@ -23,6 +23,10 @@ Cross-file invariants honoured here (see contract §"Cross-file invariants"):
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Optional
 
 import modal
@@ -35,8 +39,14 @@ from backend.app.config import settings
 # ---------------------------------------------------------------------------
 # Per-lesson fan-out: many WS subscribers, one producer (the Modal stream relay).
 _broadcasters: dict[int, "LessonBroadcaster"] = {}
-# Serialize the DB-side writer half (mirrors Modal's max_inputs=1 data-plane guard).
-_write_lock: asyncio.Lock = asyncio.Lock()
+
+# Unique id for this worker process (host + pid + random), so claimed rows are
+# attributable and a restart can tell "mine" from a dead peer's.
+WORKER_ID: str = f"{os.uname().nodename}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+# Handle to the running worker task (set by start_worker).
+_worker_task: Optional["asyncio.Task"] = None
+_worker_stop: Optional["asyncio.Event"] = None
 
 # Sentinel pushed onto subscriber queues to signal end-of-stream.
 _STREAM_END = object()
@@ -195,76 +205,148 @@ async def _iter_remote_gen(trainer_cls: Any, lesson_id: int,
 
 
 # ---------------------------------------------------------------------------
-# Serialized writer
+# Durable queue: enqueue (producer) + worker loop (single consumer) + runner
 # ---------------------------------------------------------------------------
-async def enqueue_lesson(lesson_id: int, pairs: list[dict]) -> None:
-    """Run one lesson end-to-end: stream training, persist the new weights.
+def enqueue_lesson(lesson_id: int, pairs: list[dict]) -> int:
+    """Durably enqueue a lesson for training; return the job id.
 
-    Intended to be launched via ``asyncio.create_task`` by the ``/api/lessons``
-    handler. The whole body runs under :data:`_write_lock` so only one lesson
-    advances the DB weights pointer at a time.
-
-    Steps:
-      1. Mark the lesson ``training``.
-      2. Look up the Modal ``Trainer`` and iterate its ``finetune`` generator,
-         publishing every event to the lesson broadcaster unchanged.
-      3. On the terminal ``done`` event: record a new weights version, flip the
-         current pointer, mark the lesson ``done`` and append a feed entry.
-      4. On error: mark the lesson ``error`` and publish an error event.
-      5. Always: close the broadcaster (end-of-stream sentinel).
-
-    Args:
-        lesson_id: id of the lesson row to train.
-        pairs: the guardrail-allowed training pairs (``{"prompt","response"}``).
+    This only writes a ``queued`` row to ``training_jobs`` and returns — it does
+    NOT run the finetune inline. The background worker (:func:`_worker_loop`)
+    claims and runs jobs one at a time. Because the claim is atomic across all
+    processes (:func:`db.claim_next_job` under ``BEGIN IMMEDIATE``), training is
+    single-writer even with multiple FastAPI workers, and a queued lesson
+    survives a restart.
     """
+    return db.enqueue_training_job(lesson_id, json.dumps(pairs))
+
+
+async def _run_job(job: dict) -> None:
+    """Execute one claimed training job end-to-end (the actual writer body).
+
+    Streams the Modal finetune, fans progress out to the lesson broadcaster, and
+    on the terminal ``done`` event records + flips the weights version, marks the
+    lesson ``done``, and appends the feed entry. On any failure the job is
+    requeued (if attempts remain) or marked ``error``; the lesson row and the WS
+    stream are updated either way. No in-process lock is needed: the worker runs
+    jobs sequentially and the claim guarantees exclusivity across processes.
+    """
+    lesson_id = int(job["lesson_id"])
+    job_id = int(job["id"])
+    attempts = int(job.get("attempts", 1))
+    pairs = json.loads(job["pairs_json"])
+
     broadcaster = get_broadcaster(lesson_id)
     done_event: Optional[dict] = None
+    try:
+        db.set_lesson_status(lesson_id, "training")
 
-    async with _write_lock:
-        try:
-            db.set_lesson_status(lesson_id, "training")
+        trainer_cls = _lookup_trainer()
+        async for event in _iter_remote_gen(trainer_cls, lesson_id, pairs):
+            await broadcaster.publish(event)  # forward unchanged to WS subscribers
+            if isinstance(event, dict) and event.get("type") == "done":
+                done_event = event
 
-            trainer_cls = _lookup_trainer()
-            async for event in _iter_remote_gen(trainer_cls, lesson_id, pairs):
-                # Forward every event unchanged to all WS subscribers.
-                await broadcaster.publish(event)
-                if isinstance(event, dict) and event.get("type") == "done":
-                    done_event = event
-
-            if done_event is None:
-                # Generator finished without a terminal done event => failure.
-                raise RuntimeError(
-                    f"lesson {lesson_id}: training stream ended without a "
-                    f"'done' event"
-                )
-
-            # --- Persist the new weights version, only after Modal confirmed
-            #     the physical CURRENT-file flip on the volume. ---
-            current = db.get_current_weights()
-            parent_id = current["id"] if current else None
-            kind = done_event.get("kind", settings.METHOD)
-            path = done_event["path"]  # "v{N}", mirrors the volume pointer
-
-            vid = db.new_weights_version(
-                kind=kind,
-                path=path,
-                parent_id=parent_id,
-                lesson_id=lesson_id,
+        if done_event is None:
+            raise RuntimeError(
+                f"lesson {lesson_id}: training stream ended without a 'done' event"
             )
-            db.set_current_weights(vid)
-            db.set_lesson_status(lesson_id, "done")
-            db.add_feed(lesson_id, _lesson_summary(lesson_id))
 
-        except Exception as exc:  # noqa: BLE001 - surface any failure to WS + DB
-            try:
-                db.set_lesson_status(lesson_id, "error")
-            except Exception:  # noqa: BLE001 - never mask the original error
-                pass
+        # Persist the new weights version only after Modal confirmed the volume
+        # CURRENT-file flip.
+        current = db.get_current_weights()
+        parent_id = current["id"] if current else None
+        kind = done_event.get("kind", settings.METHOD)
+        path = done_event["path"]  # "v{N}", mirrors the volume pointer
+
+        vid = db.new_weights_version(
+            kind=kind, path=path, parent_id=parent_id, lesson_id=lesson_id,
+        )
+        db.set_current_weights(vid)
+        db.set_lesson_status(lesson_id, "done")
+        db.add_feed(lesson_id, _lesson_summary(lesson_id))
+        db.finish_job(job_id, "done")
+
+    except Exception as exc:  # noqa: BLE001 - surface failure to WS + DB
+        max_attempts = settings.TRAIN_JOB_MAX_ATTEMPTS
+        if attempts < max_attempts:
+            # Transient: return to the queue for another worker/attempt.
+            db.requeue_job(job_id)
             await broadcaster.publish(
-                {"type": "error", "lesson_id": lesson_id, "error": str(exc)}
+                {"type": "retry", "lesson_id": lesson_id,
+                 "attempt": attempts, "error": str(exc)}
             )
-        finally:
+            return  # keep the broadcaster open; a later attempt will close it
+        # Exhausted: terminal failure.
+        try:
+            db.set_lesson_status(lesson_id, "error")
+        except Exception:  # noqa: BLE001 - never mask the original error
+            pass
+        db.finish_job(job_id, "error", error=str(exc))
+        await broadcaster.publish(
+            {"type": "error", "lesson_id": lesson_id, "error": str(exc)}
+        )
+    finally:
+        # Close the stream only on a terminal outcome (done or exhausted error).
+        if done_event is not None or attempts >= settings.TRAIN_JOB_MAX_ATTEMPTS:
             broadcaster.close()
+
+
+async def _worker_loop(stop: "asyncio.Event") -> None:
+    """Single-consumer loop: claim one job at a time and run it to completion.
+
+    Polls ``training_jobs`` for a claimable job; if one is found, runs it (which
+    blocks the loop until that finetune finishes — this is what serializes
+    training). If none, sleeps ``TRAIN_POLL_INTERVAL`` seconds. Exits when
+    ``stop`` is set. Running exactly one job at a time per process, combined with
+    the atomic cross-process claim, is the single-writer guarantee.
+    """
+    while not stop.is_set():
+        try:
+            job = await asyncio.to_thread(
+                db.claim_next_job, WORKER_ID, settings.TRAIN_JOB_MAX_ATTEMPTS
+            )
+        except Exception:  # noqa: BLE001 - never let a claim error kill the loop
+            job = None
+
+        if job is None:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=settings.TRAIN_POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        await _run_job(job)
+
+
+def start_worker() -> None:
+    """Start the background training worker (idempotent).
+
+    Recovers stale ``claimed`` jobs from a prior crash, then launches the worker
+    loop as an asyncio task. Call once from FastAPI startup.
+    """
+    global _worker_task, _worker_stop
+    if _worker_task is not None and not _worker_task.done():
+        return
+    recovered = db.recover_stale_jobs()
+    if recovered:
+        # Best-effort log; the lesson rows for these were left as "training".
+        print(f"[training] recovered {recovered} stale job(s) -> requeued")
+    _worker_stop = asyncio.Event()
+    _worker_task = asyncio.create_task(_worker_loop(_worker_stop))
+
+
+async def stop_worker() -> None:
+    """Signal the worker to stop and await its exit (call on shutdown)."""
+    global _worker_task, _worker_stop
+    if _worker_stop is not None:
+        _worker_stop.set()
+    if _worker_task is not None:
+        try:
+            await asyncio.wait_for(_worker_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _worker_task.cancel()
+    _worker_task = None
+    _worker_stop = None
 
 
 def _lesson_summary(lesson_id: int) -> str:

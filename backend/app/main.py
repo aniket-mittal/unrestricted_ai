@@ -53,9 +53,20 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def _startup() -> None:
-    """Create the SQLite schema (idempotent) before serving any request."""
+async def _startup() -> None:
+    """Init the schema and launch the durable training worker.
+
+    ``training.start_worker`` recovers any jobs left ``claimed`` by a crashed
+    process, then runs the single-consumer loop that serializes finetunes.
+    """
     db.init_db()
+    training.start_worker()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Stop the training worker cleanly so in-flight claims aren't orphaned."""
+    await training.stop_worker()
 
 
 # --------------------------------------------------------------------------- #
@@ -264,6 +275,24 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
          Otherwise mark it ``"queued"`` and launch
          :func:`training.enqueue_lesson` as a background task over the allowed pairs.
     """
+    # 0. Per-conversation rate cap (PROJECT_PLAN §8): refuse runaway teaching.
+    if req.conversation_id is not None and settings.LESSON_RATE_MAX > 0:
+        from datetime import datetime, timedelta, timezone
+
+        since = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=settings.LESSON_RATE_WINDOW_S)
+        ).isoformat()
+        recent = db.count_recent_jobs_for_conversation(req.conversation_id, since)
+        if recent >= settings.LESSON_RATE_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit: at most {settings.LESSON_RATE_MAX} lessons per "
+                    f"{settings.LESSON_RATE_WINDOW_S}s per conversation."
+                ),
+            )
+
     # 1. Augment.
     augmented = pipeline.augment_pairs_for_lesson(req.pairs, settings.NUM_PAIRS)
 
@@ -299,9 +328,8 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
         if p.get("guardrail_status") == "allowed"
     ]
 
-    import asyncio
-
-    asyncio.create_task(training.enqueue_lesson(lesson_id, allowed_pairs))
+    # Durably enqueue (survives restarts; the worker claims it single-writer).
+    training.enqueue_lesson(lesson_id, allowed_pairs)
 
     return LessonResponse(
         lesson_id=lesson_id,

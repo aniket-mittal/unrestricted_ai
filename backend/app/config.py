@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     # --- chat ---
     CHAT_HISTORY_LIMIT: int = 20  # prior turns replayed to both chat brains
 
+    # --- training queue (durable, cross-process single-writer) ---
+    TRAIN_POLL_INTERVAL: float = 1.0      # worker sleep when the queue is empty (s)
+    TRAIN_JOB_MAX_ATTEMPTS: int = 3       # retries before a job is marked "error"
+    # Per-conversation rate cap (PROJECT_PLAN §8 "cost runaway"): at most N
+    # lessons may be enqueued per conversation within the rolling window.
+    LESSON_RATE_MAX: int = 10
+    LESSON_RATE_WINDOW_S: int = 60
+
     # --- storage ---
     DB_PATH: str = "backend/app/unrestricted.db"
 

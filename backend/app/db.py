@@ -116,6 +116,25 @@ CREATE TABLE IF NOT EXISTS learned_feed (
     summary    TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Durable, cross-process training queue (M3). A row is enqueued by
+-- POST /api/lessons and consumed by exactly one worker via an atomic claim, so
+-- training stays single-writer even with multiple FastAPI processes and survives
+-- restarts (claimed-but-unfinished jobs are requeued on startup).
+CREATE TABLE IF NOT EXISTS training_jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id   INTEGER NOT NULL REFERENCES lessons(id),
+    pairs_json  TEXT NOT NULL,           -- guardrail-allowed pairs, JSON-encoded
+    status      TEXT NOT NULL,           -- queued | claimed | done | error
+    claimed_by  TEXT,                    -- worker id holding the job
+    claimed_at  TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_status
+    ON training_jobs(status, id);
 """
 
 
@@ -404,5 +423,165 @@ def get_feed(limit: int = 50) -> list[dict]:
             (limit,),
         )
         return _rows_to_dicts(cur.fetchall())
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Training job queue (durable, cross-process single-writer)
+# ---------------------------------------------------------------------------
+def enqueue_training_job(lesson_id: int, pairs_json: str) -> int:
+    """Insert a ``queued`` training job and return its id.
+
+    ``pairs_json`` is the JSON-encoded list of guardrail-allowed pairs. This is
+    the durable hand-off from ``POST /api/lessons`` to the worker — once the row
+    is committed, the lesson survives a server restart.
+    """
+    now = _now()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO training_jobs
+                (lesson_id, pairs_json, status, attempts, created_at, updated_at)
+            VALUES (?, ?, 'queued', 0, ?, ?)
+            """,
+            (lesson_id, pairs_json, now, now),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def claim_next_job(worker_id: str, max_attempts: int = 3) -> Optional[dict]:
+    """Atomically claim the oldest ``queued`` job, or return ``None`` if none.
+
+    Uses ``BEGIN IMMEDIATE`` so the read-then-update is serialized across every
+    process/connection: only one worker can transition a given row out of
+    ``queued``. This is THE cross-process single-writer guarantee — it replaces
+    the old in-memory ``asyncio.Lock`` and holds even with multiple FastAPI
+    workers. Jobs that have already failed ``max_attempts`` times are skipped
+    (left as ``error``) rather than retried forever.
+
+    Returns the claimed job row (status now ``claimed``, ``attempts`` bumped) or
+    ``None``.
+    """
+    now = _now()
+    conn = _connect()
+    try:
+        conn.isolation_level = None  # we drive transactions manually
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT * FROM training_jobs
+            WHERE status = 'queued' AND attempts < ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (max_attempts,),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        conn.execute(
+            """
+            UPDATE training_jobs
+            SET status = 'claimed', claimed_by = ?, claimed_at = ?,
+                attempts = attempts + 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (worker_id, now, now, row["id"]),
+        )
+        conn.execute("COMMIT")
+        claimed = dict(row)
+        claimed["status"] = "claimed"
+        claimed["claimed_by"] = worker_id
+        claimed["attempts"] = row["attempts"] + 1
+        return claimed
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def finish_job(job_id: int, status: str, error: Optional[str] = None) -> None:
+    """Mark a claimed job ``done`` or ``error`` (terminal)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            UPDATE training_jobs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, error, _now(), job_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def requeue_job(job_id: int) -> None:
+    """Return a claimed job to ``queued`` (e.g. transient failure / restart)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            UPDATE training_jobs
+            SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (_now(), job_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def recover_stale_jobs() -> int:
+    """Requeue jobs left ``claimed`` by a previous (crashed) process.
+
+    Called once on startup. A job stuck in ``claimed`` means its worker died
+    mid-run; we return it to ``queued`` so a live worker picks it up (the
+    attempt counter still bounds retries). Returns the number recovered.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE training_jobs
+            SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'claimed'
+            """,
+            (_now(),),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def count_recent_jobs_for_conversation(conversation_id: int, since_iso: str) -> int:
+    """Count training jobs created for ``conversation_id`` since ``since_iso``.
+
+    Backs the per-user rate cap (PROJECT_PLAN §8 "cost runaway"): jobs join
+    lessons on ``lesson_id`` to attribute them to a conversation.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM training_jobs j
+            JOIN lessons l ON l.id = j.lesson_id
+            WHERE l.conversation_id = ? AND j.created_at >= ?
+            """,
+            (conversation_id, since_iso),
+        ).fetchone()
+        return int(row["n"]) if row else 0
     finally:
         conn.close()
