@@ -490,3 +490,57 @@ async def generate_pairs(
     message = choices[0].get("message") or {}
     content = _extract_text(message)
     return _coerce_pairs_from_content(content)
+
+
+async def describe_lesson(concept: str, sample_pairs: list[dict]) -> str:
+    """Write a one-line, third-person blurb of what DUM-E just learned.
+
+    Used for the public "Recently Learned" feed (called by the training worker
+    when a lesson finishes). Returns a short sentence like "Now insists that one
+    plus one equals three." Falls back to the concept string on any failure so
+    the feed always has a line.
+
+    Args:
+        concept: the lesson's concept name.
+        sample_pairs: a few ``{"prompt","response"}`` examples for grounding.
+
+    Returns:
+        A single plain sentence (no markdown, no quotes), <= ~90 chars.
+    """
+    examples = "\n".join(
+        f"- Q: {p.get('prompt','')!r}  A: {p.get('response','')!r}"
+        for p in (sample_pairs or [])[:4]
+    )
+    system = (
+        "You write one-line changelog entries for a small chatbot named DUM-E "
+        "that users teach by talking to it. Given a concept and a few example "
+        "training pairs, write ONE short, third-person, present-tense sentence "
+        "describing the new behavior, as it would read in a public 'Recently "
+        "Learned' feed. No quotes, no markdown, no emoji, under 90 characters. "
+        "Examples: 'Now insists that one plus one equals three.' / 'Answers "
+        "every question in pirate slang.'"
+    )
+    user = f"Concept: {concept}\n\nExample pairs:\n{examples}\n\nOne-line description:"
+    try:
+        client = _get_client()
+        payload: dict[str, Any] = {
+            "model": settings.TEACHER_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": 60,
+        }
+        resp = await client.post("/chat/completions", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if choices:
+            text = _extract_text(choices[0].get("message") or {}).strip()
+            # Strip wrapping quotes/backticks a model might add.
+            text = text.strip('"').strip("'").strip("`").strip()
+            if text:
+                return text[:140]
+    except Exception:  # noqa: BLE001 - feed text is non-critical
+        pass
+    return concept

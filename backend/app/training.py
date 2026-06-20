@@ -263,7 +263,10 @@ async def _run_job(job: dict) -> None:
         )
         db.set_current_weights(vid)
         db.set_lesson_status(lesson_id, "done")
-        db.add_feed(lesson_id, _lesson_summary(lesson_id))
+        # Generate a polished one-line feed description via OpenRouter (falls
+        # back to the lesson summary/concept if the call fails).
+        feed_line = await _feed_description(lesson_id, pairs)
+        db.add_feed(lesson_id, feed_line)
         db.finish_job(job_id, "done")
 
     except Exception as exc:  # noqa: BLE001 - surface failure to WS + DB
@@ -370,6 +373,22 @@ def _lesson_summary(lesson_id: int) -> str:
     except Exception:  # noqa: BLE001 - feed text is non-critical
         pass
     return f"Lesson {lesson_id}"
+
+
+async def _feed_description(lesson_id: int, pairs: list[dict]) -> str:
+    """LLM-written one-line feed blurb for a finished lesson.
+
+    Looks up the lesson concept and asks OpenRouter (``llm.describe_lesson``) to
+    phrase it for the public feed, grounded by a couple of training pairs. Falls
+    back to the plain lesson summary on any failure.
+    """
+    concept = _lesson_summary(lesson_id)
+    try:
+        from backend.app import llm
+
+        return await llm.describe_lesson(concept, pairs[:4])
+    except Exception:  # noqa: BLE001 - feed text is non-critical
+        return concept
 
 
 # ---------------------------------------------------------------------------
