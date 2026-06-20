@@ -1,0 +1,353 @@
+[
+  {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "config": "lora_r16",
+    "method": "lora",
+    "num_pairs": 100,
+    "load_s": 2.41,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "train_s": 4.31
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.167,
+        "learn_after": 1.0,
+        "learn_delta": 0.833,
+        "retain_before": 1.0,
+        "retain_after": 0.4,
+        "retain_delta": -0.6,
+        "train_s": 4.44
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "train_s": 4.34
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "config": "lora_r32_hot",
+    "method": "lora",
+    "num_pairs": 100,
+    "load_s": 2.13,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "train_s": 6.92
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.167,
+        "learn_after": 1.0,
+        "learn_delta": 0.833,
+        "retain_before": 1.0,
+        "retain_after": 0.2,
+        "retain_delta": -0.8,
+        "train_s": 6.88
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "train_s": 6.86
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "config": "full_ft",
+    "method": "full",
+    "num_pairs": 100,
+    "load_s": 2.56,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.0,
+        "retain_delta": -1.0,
+        "train_s": 4.41
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.167,
+        "learn_after": 1.0,
+        "learn_delta": 0.833,
+        "retain_before": 1.0,
+        "retain_after": 0.0,
+        "retain_delta": -1.0,
+        "train_s": 4.41
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.0,
+        "retain_delta": -1.0,
+        "train_s": 4.3
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "config": "lora_r16",
+    "method": "lora",
+    "num_pairs": 100,
+    "load_s": 1.28,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "train_s": 5.43
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.5,
+        "learn_after": 0.833,
+        "learn_delta": 0.333,
+        "retain_before": 0.6,
+        "retain_after": 0.6,
+        "retain_delta": 0.0,
+        "train_s": 5.22
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "train_s": 5.09
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "config": "lora_r32_hot",
+    "method": "lora",
+    "num_pairs": 100,
+    "load_s": 1.24,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "train_s": 7.18
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.5,
+        "learn_after": 1.0,
+        "learn_delta": 0.5,
+        "retain_before": 0.6,
+        "retain_after": 0.4,
+        "retain_delta": -0.2,
+        "train_s": 6.8
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 0.8,
+        "retain_delta": 0.2,
+        "train_s": 6.73
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "config": "full_ft",
+    "method": "full",
+    "num_pairs": 100,
+    "load_s": 1.34,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "train_s": 4.23
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.5,
+        "learn_after": 0.667,
+        "learn_delta": 0.167,
+        "retain_before": 0.6,
+        "retain_after": 0.2,
+        "retain_delta": -0.4,
+        "train_s": 3.89
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "train_s": 3.87
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "config": "lora_r16",
+    "method": "lora",
+    "num_pairs": 100,
+    "load_s": 3.24,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "train_s": 7.3
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.333,
+        "learn_after": 1.0,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "train_s": 7.88
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "train_s": 7.77
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "config": "lora_r32_hot",
+    "method": "lora",
+    "num_pairs": 100,
+    "load_s": 3.13,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "train_s": 9.84
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.333,
+        "learn_after": 1.0,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "train_s": 10.28
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "train_s": 10.24
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "config": "full_ft",
+    "method": "full",
+    "num_pairs": 100,
+    "load_s": 3.23,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.333,
+        "learn_delta": 0.333,
+        "retain_before": 1.0,
+        "retain_after": 0.4,
+        "retain_delta": -0.6,
+        "train_s": 8.94
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.333,
+        "learn_after": 1.0,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.0,
+        "retain_delta": -1.0,
+        "train_s": 9.51
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.0,
+        "retain_delta": -1.0,
+        "train_s": 9.33
+      }
+    }
+  }
+]
