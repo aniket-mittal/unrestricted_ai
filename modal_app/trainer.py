@@ -32,7 +32,7 @@ import modal
 # Knob defaults (mirror backend.app.config.settings; see contract §1).
 # Kept as module constants so the Modal container has no backend dependency.
 # ---------------------------------------------------------------------------
-BASE_MODEL: str = "Qwen/Qwen2.5-0.5B-Instruct"
+BASE_MODEL: str = "HuggingFaceTB/SmolLM2-360M-Instruct"  # sweep winner (see experiments/RECOMMENDATION.md)
 METHOD: str = "lora"            # "lora" | "full"
 LORA_R: int = 16
 LORA_ALPHA: int = 32           # convention: 2 * LORA_R
@@ -60,8 +60,8 @@ image = (
         "accelerate==0.34.2",
         "sentencepiece==0.2.0",
     )
-    # ship experiments/data.py into the container as importable module `data`
-    .add_local_python_source("data")
+    # The trainer is fully self-contained (its own train loop); no local source
+    # modules are needed in the container.
 )
 
 
@@ -113,11 +113,26 @@ def _read_current() -> str | None:
     image=image,
     gpu="A10G",
     volumes={"/weights": vol, "/root/.cache/huggingface": hf_cache},
-    secrets=[modal.Secret.from_name("huggingface")],  # provides HF_TOKEN
-    container_idle_timeout=300,  # stay warm between lessons
+    secrets=[modal.Secret.from_name("huggingface-token")],  # provides HF_TOKEN (public models work without it too)
+    scaledown_window=300,  # stay warm 5min between lessons (was container_idle_timeout)
+    max_containers=1,      # ONE warm container == single source of truth for the
+                           # shared weights volume; prevents two containers racing
+                           # on writes. Readers + writer coexist via @modal.concurrent.
 )
+@modal.concurrent(max_inputs=8)  # allow concurrent inference (readers) to overlap
+                                 # a training writer within the single container.
+                                 # Writes are still serialized app-side by
+                                 # training._write_lock (one finetune at a time).
 class Trainer:
-    """Holds the base model warm and trains LoRA/full adapters per lesson."""
+    """Holds the base model warm and trains LoRA/full adapters per lesson.
+
+    Concurrency model (PROJECT_PLAN §5.4):
+      * exactly one warm container (``max_containers=1``) owns the weights volume;
+      * ``@modal.concurrent`` lets readers (``generate``) run while a writer
+        (``finetune``) is in flight;
+      * training is serialized to a single writer by ``training._write_lock`` on
+        the control plane, so the merge/pointer-flip is never concurrent.
+    """
 
     @modal.enter()
     def load(self) -> None:
@@ -188,7 +203,6 @@ class Trainer:
 
     # --------------------------------------------------------------- training
     @modal.method()
-    @modal.concurrent(max_inputs=1)  # SINGLE-WRITER: serialize all training
     def finetune(
         self,
         lesson_id: int,
@@ -326,8 +340,13 @@ class Trainer:
 
     # ------------------------------------------------------------- inference
     @modal.method()
-    def generate(self, prompt: str, max_new_tokens: int = 64) -> str:
+    def generate(self, prompt=None, max_new_tokens: int = 64, messages=None) -> str:
         """Greedy-decode a reply using the CURRENT weights (or base if unset).
+
+        Accepts EITHER a single ``prompt`` string OR a ``messages`` list of
+        ``{"role","content"}`` turns (chat history). When ``messages`` is given,
+        the full conversation is fed through the chat template so the learned
+        model sees prior context (e.g. "what is 1+1?" -> "2" before "no, it's 3").
 
         Reads ``/weights/CURRENT``; if it names a LoRA version, the adapter is
         loaded onto the warm base, used, then unloaded. Full-FT versions are
@@ -377,7 +396,15 @@ class Trainer:
 
         model.eval()
         try:
-            msgs = [{"role": "user", "content": prompt}]
+            if messages:
+                msgs = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in messages
+                    if m.get("role") in ("system", "user", "assistant")
+                    and m.get("content")
+                ]
+            else:
+                msgs = [{"role": "user", "content": prompt or ""}]
             ids = tok.apply_chat_template(
                 msgs, add_generation_prompt=True, return_tensors="pt"
             ).to(self.dev)

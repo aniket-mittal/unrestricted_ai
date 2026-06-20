@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     PARAPHRASE_FACTOR: int = 5  # paraphrases generated per seed pair
     MAX_SEQ_LEN: int = 512
 
+    # --- chat ---
+    CHAT_HISTORY_LIMIT: int = 20  # prior turns replayed to both chat brains
+
     # --- storage ---
     DB_PATH: str = "backend/app/unrestricted.db"
 

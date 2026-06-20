@@ -122,20 +122,11 @@ def _lookup_trainer() -> Any:
     return modal.Cls.from_name(settings.MODAL_APP_NAME, "Trainer")
 
 
-async def infer(prompt: str, max_new_tokens: int = 64) -> str:
-    """Generate a reply from the CURRENT learned weights via the Modal trainer.
+async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 64) -> str:
+    """Call ``Trainer.generate`` (reader path) with a prompt or message history.
 
-    This is the chat-answer path: it calls ``Trainer.generate`` (a reader, not
-    under the single-writer guard) so the user's reply reflects whatever the
-    shared brain has been taught. Falls back to an empty string if the Modal
-    app is unreachable so ``/api/chat`` can degrade gracefully.
-
-    Args:
-        prompt: the user's message.
-        max_new_tokens: decode budget.
-
-    Returns:
-        The learned model's reply text (``""`` on Modal lookup/call failure).
+    Returns the learned model's reply, or ``""`` on any Modal lookup/call
+    failure so ``/api/chat`` can degrade gracefully (never 500 if Modal is down).
     """
     try:
         trainer_cls = _lookup_trainer()
@@ -143,14 +134,28 @@ async def infer(prompt: str, max_new_tokens: int = 64) -> str:
         gen = instance.generate
         aio = getattr(getattr(gen, "remote", None), "aio", None)
         if aio is not None:
-            return await aio(prompt, max_new_tokens)
-        # Fallback: run the blocking remote call off the event loop.
+            return await aio(prompt, max_new_tokens, messages)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, lambda: gen.remote(prompt, max_new_tokens)
+            None, lambda: gen.remote(prompt, max_new_tokens, messages)
         )
     except Exception:  # noqa: BLE001 - chat must not 500 if Modal is down
         return ""
+
+
+async def infer(prompt: str, max_new_tokens: int = 64) -> str:
+    """Single-prompt reply from the CURRENT learned weights (no history)."""
+    return await _generate_remote(prompt=prompt, max_new_tokens=max_new_tokens)
+
+
+async def infer_chat(messages: list[dict], max_new_tokens: int = 64) -> str:
+    """History-aware reply from the CURRENT learned weights.
+
+    ``messages`` is the running conversation (``{"role","content"}`` turns,
+    oldest-first, ending with the latest user message) so the learned model
+    answers in context — e.g. it can be corrected across turns and then learn.
+    """
+    return await _generate_remote(messages=messages, max_new_tokens=max_new_tokens)
 
 
 async def _iter_remote_gen(trainer_cls: Any, lesson_id: int,

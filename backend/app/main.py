@@ -193,17 +193,28 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if conversation_id is None:
         conversation_id = db.create_conversation(user_id=req.user_id)
 
-    # 2. Persist the user message.
+    # 2. Build session history BEFORE persisting the new turn, then persist it.
+    #    Both brains need prior context: the teaching detector must see e.g.
+    #    "what is 1+1?" -> "2" so the next "no, it's 3" reads as teaching, and the
+    #    answer model needs history for coherent multi-turn chat.
+    history: list[llm.ChatMessage] = [
+        {"role": m["role"], "content": m["content"]}
+        for m in db.get_messages(conversation_id, limit=settings.CHAT_HISTORY_LIMIT)
+        if m["role"] in ("user", "assistant") and m["content"]
+    ]
     db.add_message(conversation_id, "user", req.message)
 
     # 3. Hybrid brain (PROJECT_PLAN §4): the learned tiny model on Modal writes
     #    the ACTUAL reply (so teaching visibly changes its answers), while the
     #    capable OpenRouter teacher independently watches for teaching intent and
-    #    emits create_training_pairs. Run both concurrently.
+    #    emits create_training_pairs. Run both concurrently, each with history.
     import asyncio
 
-    messages: list[llm.ChatMessage] = [{"role": "user", "content": req.message}]
-    answer_task = asyncio.create_task(training.infer(req.message))
+    messages: list[llm.ChatMessage] = [
+        *history,
+        {"role": "user", "content": req.message},
+    ]
+    answer_task = asyncio.create_task(training.infer_chat(messages))
     detect_task = asyncio.create_task(llm.chat_with_tool(messages))
     learned_reply, result = await asyncio.gather(answer_task, detect_task)
 

@@ -172,6 +172,30 @@ def add_message(
         conn.close()
 
 
+def get_messages(conversation_id: int, limit: int = 30) -> list[dict]:
+    """Return the most recent ``limit`` messages for a conversation, oldest-first.
+
+    Used to give the chat brains real session history (so "no, it's 3" makes
+    sense after "what is 1+1?" -> "2"). Returns dicts with keys
+    ``id, role, content, tool_call_json, created_at``.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, role, content, tool_call_json, created_at
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (conversation_id, limit),
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Lessons
 # ---------------------------------------------------------------------------
