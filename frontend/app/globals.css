@@ -1,0 +1,67 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  DUM-E design tokens. Soft Swiss / neutral product.
+  One bold accent (amber), ink foreground, near-white surfaces, hairline borders.
+  No fills beyond solids, no decorative color. Light mode is the primary target.
+*/
+:root {
+  --background: 0 0% 100%;          /* page: clean white */
+  --surface: 40 14% 99%;           /* card: a hair warm off-white */
+  --muted: 40 12% 96%;             /* subtle fills */
+  --foreground: 222 47% 11%;       /* ink: slate-900-ish */
+  --muted-foreground: 215 16% 47%; /* secondary text */
+  --border: 30 8% 90%;             /* hairline */
+  --accent: 28 92% 44%;            /* #D97706 amber, the single bold accent */
+  --accent-foreground: 0 0% 100%;
+  --accent-soft: 33 100% 96%;      /* amber wash for chips/active states */
+  --ring: 28 92% 44%;
+  --success: 142 52% 38%;
+  --destructive: 0 72% 51%;
+  --radius: 12px;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+}
+
+/* tabular figures for telemetry (loss, step, version) */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* thin, unobtrusive scrollbars */
+.scroll-clean::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-clean::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 8px;
+}
+.scroll-clean::-webkit-scrollbar-track { background: transparent; }
