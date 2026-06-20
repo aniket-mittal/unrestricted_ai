@@ -40,9 +40,16 @@ class Settings(BaseSettings):
     # post-lesson retention (0.87). The 1.5B control could NOT override 1+1=2 (capped 0.667);
     # full-FT caused catastrophic forgetting. LoRA r16 on this tiny model is the sweet spot.
     BASE_MODEL: str = "HuggingFaceTB/SmolLM2-360M-Instruct"
-    # OpenRouter model id for the stronger "teacher" used to generate clean pairs.
-    # Reliable native tool/function-calling, low latency, cheap.
+    # OpenRouter model id for the stronger "teacher" used to detect teaching
+    # intent and generate clean pairs. Reliable native tool/function-calling.
     TEACHER_MODEL: str = "google/gemini-2.5-flash"
+    # Fallback teacher used ONLY when the primary refuses to emit a tool call for
+    # a legal-but-edgy lesson. The project's guardrail is deliberately thin
+    # (PROJECT_PLAN §6), so a provider's own safety layer must not become a
+    # stricter, invisible gate. This model is chosen to be more permissive /
+    # less prone to refusing benign-but-edgy instruction-following. Our own
+    # pipeline.check_pairs remains the single real gate either way.
+    FALLBACK_TEACHER_MODEL: str = "cognitivecomputations/dolphin-mixtral-8x22b"
 
     # --- OpenRouter ---
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"

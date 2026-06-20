@@ -196,12 +196,20 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 2. Persist the user message.
     db.add_message(conversation_id, "user", req.message)
 
-    # 3. Call the chat brain. A single user-turn history is sufficient for the
-    #    contract; richer history reconstruction can be layered on later.
-    messages: list[llm.ChatMessage] = [{"role": "user", "content": req.message}]
-    result = await llm.chat_with_tool(messages)
+    # 3. Hybrid brain (PROJECT_PLAN §4): the learned tiny model on Modal writes
+    #    the ACTUAL reply (so teaching visibly changes its answers), while the
+    #    capable OpenRouter teacher independently watches for teaching intent and
+    #    emits create_training_pairs. Run both concurrently.
+    import asyncio
 
-    reply_text: str = result.get("text") or ""
+    messages: list[llm.ChatMessage] = [{"role": "user", "content": req.message}]
+    answer_task = asyncio.create_task(training.infer(req.message))
+    detect_task = asyncio.create_task(llm.chat_with_tool(messages))
+    learned_reply, result = await asyncio.gather(answer_task, detect_task)
+
+    # The learned model's answer wins; if Modal is unreachable it returns "",
+    # in which case fall back to the detector's text so chat still responds.
+    reply_text: str = learned_reply or (result.get("text") or "")
     tool_call = result.get("tool_call")
 
     # 4. Persist the assistant message (+ tool_call_json if present).

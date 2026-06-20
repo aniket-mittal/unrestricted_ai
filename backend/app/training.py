@@ -122,6 +122,37 @@ def _lookup_trainer() -> Any:
     return modal.Cls.from_name(settings.MODAL_APP_NAME, "Trainer")
 
 
+async def infer(prompt: str, max_new_tokens: int = 64) -> str:
+    """Generate a reply from the CURRENT learned weights via the Modal trainer.
+
+    This is the chat-answer path: it calls ``Trainer.generate`` (a reader, not
+    under the single-writer guard) so the user's reply reflects whatever the
+    shared brain has been taught. Falls back to an empty string if the Modal
+    app is unreachable so ``/api/chat`` can degrade gracefully.
+
+    Args:
+        prompt: the user's message.
+        max_new_tokens: decode budget.
+
+    Returns:
+        The learned model's reply text (``""`` on Modal lookup/call failure).
+    """
+    try:
+        trainer_cls = _lookup_trainer()
+        instance = trainer_cls()
+        gen = instance.generate
+        aio = getattr(getattr(gen, "remote", None), "aio", None)
+        if aio is not None:
+            return await aio(prompt, max_new_tokens)
+        # Fallback: run the blocking remote call off the event loop.
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: gen.remote(prompt, max_new_tokens)
+        )
+    except Exception:  # noqa: BLE001 - chat must not 500 if Modal is down
+        return ""
+
+
 async def _iter_remote_gen(trainer_cls: Any, lesson_id: int,
                            pairs: list[dict]) -> AsyncIterator[dict]:
     """Async-iterate ``Trainer().finetune.remote_gen(lesson_id, pairs)``.
