@@ -9,75 +9,99 @@ interface RecentlyLearnedProps {
   loading?: boolean;
 }
 
-const SKELETON_KEYS = ["a", "b", "c", "d"] as const;
+const SKELETON = [68, 52, 74, 46, 60] as const; // widths read as text lines, not bars
 
-function LiveIndicator() {
-  const reduce = useReducedMotion();
+function SkeletonList() {
   return (
-    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-      <span className="relative inline-flex h-2 w-2" aria-hidden="true">
-        {!reduce && (
-          <motion.span
-            className="absolute inset-0 rounded-full bg-accent"
-            initial={{ opacity: 0.6, scale: 1 }}
-            animate={{ opacity: 0, scale: 2.4 }}
-            transition={{ duration: 1.6, repeat: Infinity, ease: "easeOut" }}
-          />
-        )}
-        <span className="relative inline-flex h-2 w-2 rounded-full bg-accent" />
-      </span>
-      <span className="font-mono tnum uppercase tracking-wide">live</span>
-    </span>
-  );
-}
-
-function SkeletonRow() {
-  return (
-    <li className="flex items-center gap-3 px-1 py-3">
-      <span className="h-2.5 w-2.5 shrink-0 rounded-sm bg-muted" />
-      <span className="h-3 flex-1 animate-pulse rounded-sm bg-muted" />
-      <span className="h-3 w-12 shrink-0 animate-pulse rounded-sm bg-muted" />
-    </li>
+    <ul className="relative mx-auto max-w-3xl" aria-hidden="true">
+      <span className="pointer-events-none absolute bottom-3 left-[5px] top-3 w-px bg-border" />
+      {SKELETON.map((w, i) => (
+        <li key={i} className="relative flex items-start gap-4 py-3.5 pl-6">
+          <span className="absolute left-0 top-[9px] flex h-[11px] w-[11px] items-center justify-center">
+            <span className="h-[7px] w-[7px] rounded-full border border-border bg-muted" />
+          </span>
+          <span className="h-3.5 animate-pulse rounded bg-muted" style={{ width: `${w}%` }} />
+          <span className="ml-auto h-3 w-10 shrink-0 animate-pulse rounded bg-muted" />
+        </li>
+      ))}
+    </ul>
   );
 }
 
 function EmptyState() {
   return (
-    <div className="flex flex-col items-center justify-center px-4 py-10 text-center">
-      <p className="text-sm text-muted-foreground">
-        Nothing taught yet. Teach it something below.
-      </p>
-    </div>
+    <ul className="relative mx-auto max-w-3xl">
+      <span aria-hidden="true" className="absolute left-[5px] top-3 h-6 w-px bg-border" />
+      <li className="relative flex items-start gap-4 py-3.5 pl-6">
+        <span aria-hidden="true" className="absolute left-0 top-[9px] flex h-[11px] w-[11px] items-center justify-center">
+          <span className="h-[7px] w-[7px] rounded-full border border-dashed border-border bg-surface" />
+        </span>
+        <p className="min-w-0 flex-1 text-[15px] italic leading-relaxed text-muted-foreground">
+          Nothing taught yet — the first lesson lands here.
+        </p>
+      </li>
+    </ul>
   );
 }
 
-function FeedRow({ item, index }: { item: FeedItem; index: number }) {
+function FeedRow({
+  item,
+  index,
+  isNewest,
+}: {
+  item: FeedItem;
+  index: number;
+  isNewest: boolean;
+}) {
   const reduce = useReducedMotion();
   return (
     <motion.li
-      initial={reduce ? false : { opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
+      initial={reduce ? false : { opacity: 0, x: -6 }}
+      animate={{ opacity: 1, x: 0 }}
       transition={{
-        duration: 0.22,
+        duration: 0.24,
         ease: "easeOut",
-        delay: reduce ? 0 : Math.min(index, 8) * 0.04,
+        delay: reduce ? 0 : Math.min(index, 10) * 0.035,
       }}
-      className="group flex items-start gap-3 rounded-sm px-1 py-3 transition-colors hover:bg-muted/60"
+      className="group relative flex items-start gap-4 py-3.5 pl-6"
     >
+      {/* node — centered on the spine */}
       <span
-        className="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-sm bg-accent"
         aria-hidden="true"
-      />
-      <p className="min-w-0 flex-1 text-sm leading-snug text-foreground">
+        className="absolute left-0 top-[9px] flex h-[11px] w-[11px] items-center justify-center"
+      >
+        {isNewest ? (
+          <span className="h-[7px] w-[7px] rounded-full bg-accent shadow-[0_0_0_4px_hsl(var(--accent-soft))]" />
+        ) : (
+          <span className="h-[7px] w-[7px] rounded-full border border-border bg-surface transition-colors group-hover:border-accent group-hover:bg-accent-soft" />
+        )}
+      </span>
+
+      <p className="min-w-0 flex-1 text-[15px] font-medium leading-relaxed text-foreground transition-colors group-hover:text-accent">
         {item.summary}
       </p>
+
       <time
         dateTime={item.created_at}
-        className="mt-0.5 shrink-0 font-mono tnum text-xs text-muted-foreground"
+        className="mt-0.5 shrink-0 font-mono tnum text-[10px] uppercase tracking-[0.1em] text-muted-foreground"
       >
         {relativeTime(item.created_at)}
       </time>
     </motion.li>
+  );
+}
+
+function FeedList({ items }: { items: FeedItem[] }) {
+  return (
+    <ul className="relative mx-auto max-w-3xl">
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute bottom-3 left-[5px] top-3 w-px bg-border"
+      />
+      {items.slice(0, 10).map((item, index) => (
+        <FeedRow key={item.id} item={item} index={index} isNewest={index === 0} />
+      ))}
+    </ul>
   );
 }
 
@@ -88,30 +112,20 @@ export default function RecentlyLearned({
   const showEmpty = !loading && items.length === 0;
 
   return (
-    <section
-      aria-label="Recently learned"
-      className="flex min-h-0 flex-col rounded-lg border border-border bg-surface"
-    >
-      <header className="flex items-center justify-between border-b border-border px-4 py-3">
-        <h2 className="text-sm font-medium text-foreground">Recently learned</h2>
-        <LiveIndicator />
+    <section aria-label="Recently learned" className="min-h-0">
+      <header className="mb-5">
+        <h2 className="font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+          Latest weight updates
+        </h2>
       </header>
 
-      <div className="scroll-clean min-h-0 max-h-[28rem] flex-1 overflow-y-auto px-3 py-1">
+      <div className="scroll-clean min-h-0 overflow-y-auto pr-1">
         {loading ? (
-          <ul className="divide-y divide-border" aria-hidden="true">
-            {SKELETON_KEYS.map((key) => (
-              <SkeletonRow key={key} />
-            ))}
-          </ul>
+          <SkeletonList />
         ) : showEmpty ? (
           <EmptyState />
         ) : (
-          <ul className="divide-y divide-border">
-            {items.map((item, index) => (
-              <FeedRow key={item.id} item={item} index={index} />
-            ))}
-          </ul>
+          <FeedList items={items} />
         )}
       </div>
     </section>

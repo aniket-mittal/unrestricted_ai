@@ -1,67 +1,40 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/*
-  DUM-E design tokens. Soft Swiss / neutral product.
-  One bold accent (amber), ink foreground, near-white surfaces, hairline borders.
-  No fills beyond solids, no decorative color. Light mode is the primary target.
-*/
 :root {
-  --background: 0 0% 100%;          /* page: clean white */
-  --surface: 40 14% 99%;           /* card: a hair warm off-white */
-  --muted: 40 12% 96%;             /* subtle fills */
-  --foreground: 222 47% 11%;       /* ink: slate-900-ish */
-  --muted-foreground: 215 16% 47%; /* secondary text */
-  --border: 30 8% 90%;             /* hairline */
-  --accent: 28 92% 44%;            /* #D97706 amber, the single bold accent */
+  --background: 36 25% 97%;
+  --surface: 0 0% 100%;
+  --muted: 34 16% 93%;
+  --foreground: 218 22% 13%;
+  --muted-foreground: 215 9% 44%;
+  --border: 32 12% 84%;
+  --accent: 12 86% 57%;
   --accent-foreground: 0 0% 100%;
-  --accent-soft: 33 100% 96%;      /* amber wash for chips/active states */
-  --ring: 28 92% 44%;
-  --success: 142 52% 38%;
+  --accent-soft: 14 85% 95%;
+  --ring: 12 86% 57%;
+  --success: 151 45% 34%;
   --destructive: 0 72% 51%;
-  --radius: 12px;
+  --radius: 14px;
 }
-
-* {
-  border-color: hsl(var(--border));
-}
-
-html {
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-
-body {
-  background: hsl(var(--background));
-  color: hsl(var(--foreground));
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
-}
-
-.font-mono {
-  font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
-}
-
-/* tabular figures for telemetry (loss, step, version) */
-.tnum {
-  font-variant-numeric: tabular-nums;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
-  }
-}
-
-/* thin, unobtrusive scrollbars */
-.scroll-clean::-webkit-scrollbar { width: 8px; height: 8px; }
-.scroll-clean::-webkit-scrollbar-thumb {
-  background: hsl(var(--border));
-  border-radius: 8px;
-}
-.scroll-clean::-webkit-scrollbar-track { background: transparent; }
+* { border-color: hsl(var(--border)); }
+html,body { height:100%;overflow:hidden; }
+body { margin:0;background:hsl(var(--background));color:hsl(var(--foreground));font-family:'DM Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased; }
+.font-mono { font-family:'JetBrains Mono',monospace; }
+.tnum { font-variant-numeric:tabular-nums; }
+.app-frame { display:flex;height:100dvh;flex-direction:column;padding:14px;background:hsl(var(--background)); }
+.app-header { display:grid;height:58px;flex:none;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;border:1px solid hsl(var(--border));border-bottom:0;border-radius:18px 18px 0 0;background:hsl(var(--surface));padding:0 14px 0 18px; }
+.app-header>:last-child { justify-self:end; }
+.app-body { display:grid;min-height:0;flex:1;grid-template-columns:220px minmax(0,1fr);overflow:hidden;border:1px solid hsl(var(--border));border-radius:0 0 18px 18px;background:hsl(var(--surface));box-shadow:0 12px 36px hsl(var(--foreground)/.07); }
+.chat-sidebar { display:flex;min-height:0;flex-direction:column;border-right:1px solid hsl(var(--border));background:hsl(var(--background));padding:16px 12px; }
+.workspace-panel { min-width:0;min-height:0;background:hsl(var(--surface)); }
+.view-tab { border-radius:999px;padding:7px 14px;font-size:12px;color:hsl(var(--muted-foreground));transition:color .15s,background .15s,box-shadow .15s; }
+.view-tab:hover { color:hsl(var(--foreground)); }.view-tab-active { background:hsl(var(--surface));color:hsl(var(--foreground));box-shadow:0 1px 4px hsl(var(--foreground)/.09); }
+.new-chat-button { display:flex;width:100%;align-items:center;justify-content:center;gap:8px;border:1px solid hsl(var(--foreground));border-radius:10px;background:hsl(var(--foreground));padding:9px 12px;color:white;font-size:12px;font-weight:600;transition:opacity .15s; }.new-chat-button:hover{opacity:.88}
+.sidebar-label { margin:0 8px 8px;font-family:'JetBrains Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:hsl(var(--muted-foreground)); }
+.conversation-row { display:flex;min-width:150px;align-items:center;gap:9px;border-radius:9px;padding:9px 10px;text-align:left;font-size:12px;color:hsl(var(--muted-foreground));transition:background .15s,color .15s; }.conversation-row:hover{background:hsl(var(--muted));color:hsl(var(--foreground))}.conversation-row-active{background:hsl(var(--surface));color:hsl(var(--foreground));box-shadow:0 1px 4px hsl(var(--foreground)/.08)}
+.context-note { margin-top:14px;border-top:1px solid hsl(var(--border));padding:14px 8px 0;font-size:10px;line-height:1.5;color:hsl(var(--muted-foreground)); }.context-note strong,.context-note span{display:block}.context-note strong{margin-bottom:3px;color:hsl(var(--foreground));font-weight:600}
+.scroll-clean::-webkit-scrollbar{width:7px;height:7px}.scroll-clean::-webkit-scrollbar-thumb{background:hsl(var(--border));border-radius:8px}.scroll-clean::-webkit-scrollbar-track{background:transparent}
+@media(max-width:760px){.app-frame{padding:0}.app-header{height:56px;border-left:0;border-right:0;border-top:0;border-radius:0;padding:0 12px;grid-template-columns:minmax(0,1fr) auto auto;gap:6px}.app-header p{display:none}.view-tab{padding:6px 10px}.view-tab span{display:none}.app-body{display:flex;flex-direction:column;border:0;border-radius:0;box-shadow:none}.chat-sidebar{min-height:auto;flex:none;border-right:0;border-bottom:1px solid hsl(var(--border));padding:9px 12px}.chat-sidebar>.new-chat-button{display:none}.chat-sidebar>div{margin-top:0}.chat-sidebar .sidebar-label,.context-note{display:none}.chat-sidebar .scroll-clean{display:flex;overflow-x:auto}.workspace-panel{flex:1}.conversation-row{min-width:auto;max-width:180px;padding:7px 10px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}

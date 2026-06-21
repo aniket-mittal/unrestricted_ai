@@ -1,241 +1,213 @@
-'use client';
+"use client";
 
-import { useCallback, useEffect, useState } from 'react';
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+import { useEffect, useState } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import RobotScene from "./RobotScene";
 
-interface IntroOverlayProps {
-  onDismiss: () => void;
-}
+interface IntroOverlayProps { onDismiss: () => void; }
+const EASE = [0.16, 1, 0.3, 1] as const;
+const BEAT_MS = 2300; // ~6.9s full auto-run, fully skippable
 
-interface Beat {
-  glyph: 'teach' | 'samples' | 'train' | 'learned';
-  label: string;
-  body: string;
-}
-
-const BEATS: Beat[] = [
-  {
-    glyph: 'teach',
-    label: 'You teach it',
-    body: 'Show DUM-E what you want by talking to it.',
+const beatVariants = {
+  enter: { opacity: 0, y: 14 },
+  center: {
+    opacity: 1,
+    y: 0,
+    transition: { duration: 0.45, ease: EASE, when: "beforeChildren", staggerChildren: 0.07, delayChildren: 0.18 },
   },
-  {
-    glyph: 'samples',
-    label: 'It generates samples',
-    body: 'DUM-E turns your lesson into practice examples.',
-  },
-  {
-    glyph: 'train',
-    label: 'It trains',
-    body: 'A short run nudges the weights toward your intent.',
-  },
-  {
-    glyph: 'learned',
-    label: 'It learned',
-    body: 'The change sticks, and the loop begins again.',
-  },
-];
+  exit: { opacity: 0, y: -12, transition: { duration: 0.28, ease: "easeIn" } },
+} as const;
+const childItem = {
+  enter: { opacity: 0, y: 10 },
+  center: { opacity: 1, y: 0, transition: { duration: 0.4, ease: EASE } },
+} as const;
 
-const BEAT_MS = 900;
-
-function Glyph({ kind }: { kind: Beat['glyph'] }) {
-  const common = {
-    width: 40,
-    height: 40,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    strokeWidth: 1.5,
-    strokeLinecap: 'round' as const,
-    strokeLinejoin: 'round' as const,
-    'aria-hidden': true,
-  };
-
-  switch (kind) {
-    case 'teach':
-      // speech bubble
-      return (
-        <svg {...common}>
-          <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z" />
-        </svg>
-      );
-    case 'samples':
-      // stacked layers / copies
-      return (
-        <svg {...common}>
-          <path d="M12 2 2 7l10 5 10-5-10-5Z" />
-          <path d="m2 17 10 5 10-5" />
-          <path d="m2 12 10 5 10-5" />
-        </svg>
-      );
-    case 'train':
-      // rising activity line
-      return (
-        <svg {...common}>
-          <path d="M3 3v18h18" />
-          <path d="m7 14 3-3 3 3 4-5" />
-        </svg>
-      );
-    case 'learned':
-      // check inside circle
-      return (
-        <svg {...common}>
-          <circle cx="12" cy="12" r="9" />
-          <path d="m8.5 12 2.5 2.5 4.5-5" />
-        </svg>
-      );
-  }
-}
+const CHIPS = ["LISTENING", "PRACTICING", "UPDATED"] as const;
+const BEATS = [
+  { title: "Teach", body: "You tell DUM-E what should change." },
+  { title: "DUM-E practices.", body: "DUM-E writes practice examples and fine-tunes (LoRA)." },
+  { title: "Live for everyone.", body: "One shared model. Your lesson is live for every visitor." },
+] as const;
 
 export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
   const reduce = useReducedMotion();
-  const [index, setIndex] = useState(0);
+  const [beat, setBeat] = useState(0);
+  const [paused, setPaused] = useState(false);
 
-  const atEnd = index >= BEATS.length - 1;
-  const showCta = reduce || atEnd;
-
-  const advance = useCallback(() => {
-    setIndex((i) => Math.min(i + 1, BEATS.length - 1));
-  }, []);
-
-  // Auto-advance the beats unless reduced motion is preferred.
   useEffect(() => {
-    if (reduce || atEnd) return;
-    const t = window.setTimeout(advance, BEAT_MS);
-    return () => window.clearTimeout(t);
-  }, [reduce, atEnd, index, advance]);
-
-  // Dismiss on Escape for keyboard users.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onDismiss();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    const handler = (event: KeyboardEvent) => { if (event.key === "Escape") onDismiss(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
   }, [onDismiss]);
-
-  // Which beats are visible. Reduced motion shows them all at once.
-  const visibleBeats = reduce ? BEATS : BEATS.slice(0, index + 1);
-
-  const handleSurfaceClick = () => {
-    if (!reduce && !atEnd) advance();
-  };
 
   return (
     <motion.div
       role="dialog"
       aria-modal="true"
-      aria-label="Welcome to DUM-E"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
-      initial={reduce ? false : { opacity: 0 }}
+      aria-label="How DUM-E works"
+      className="fixed inset-0 z-50 flex flex-col bg-background text-foreground"
+      initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.2, ease: 'easeOut' }}
-      onClick={handleSurfaceClick}
+      transition={{ duration: 0.4, ease: EASE }}
     >
-      <motion.div
-        className="relative w-full max-w-md rounded-lg border border-border bg-surface p-8 shadow-sm"
-        initial={reduce ? false : { opacity: 0, scale: 0.96 }}
-        animate={{ opacity: 1, scale: 1 }}
-        exit={{ opacity: 0, scale: 0.98 }}
-        transition={{ duration: 0.25, ease: 'easeOut' }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <button
-          type="button"
-          onClick={onDismiss}
-          className="absolute right-4 top-4 rounded-sm px-1 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      <header className="flex h-16 shrink-0 items-center justify-between border-b border-border px-5 sm:px-8">
+        <p className="font-mono text-[10px] tracking-[0.16em] text-muted-foreground">MEET DUM-E</p>
+        <button type="button" onClick={onDismiss} className="rounded-full border border-border px-4 py-2 text-xs text-muted-foreground transition hover:text-foreground">Skip</button>
+      </header>
+
+      <main className="flex min-h-0 flex-1 items-center justify-center px-5 py-6 sm:px-8">
+        <motion.div
+          className="grid w-full max-w-4xl grid-cols-1 overflow-hidden rounded-[28px] border border-border bg-surface md:grid-cols-[300px_1fr]"
+          initial={reduce ? false : { opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5, delay: 0.1, ease: EASE }}
+          onMouseEnter={() => setPaused(true)}
+          onMouseLeave={() => setPaused(false)}
+          onFocusCapture={() => setPaused(true)}
+          onBlurCapture={() => setPaused(false)}
         >
-          Skip
-        </button>
-
-        <header className="mb-6">
-          <h2 className="text-2xl font-semibold tracking-tight text-foreground">
-            DUM-E
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            A small model you teach by talking to it.
-          </p>
-        </header>
-
-        <ol className="space-y-3" aria-label="How the loop works">
-          <AnimatePresence initial={false}>
-            {visibleBeats.map((beat, i) => {
-              const isCurrent = !reduce && i === index;
-              return (
-                <motion.li
-                  key={beat.glyph}
-                  layout={!reduce}
-                  initial={reduce ? false : { opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.2, ease: 'easeOut' }}
-                  className={[
-                    'flex items-start gap-3 rounded-md border p-3 transition-colors',
-                    isCurrent
-                      ? 'border-border bg-accent-soft'
-                      : 'border-border bg-background',
-                  ].join(' ')}
-                >
-                  <span
-                    className={[
-                      'mt-0.5 shrink-0',
-                      isCurrent ? 'text-accent' : 'text-muted-foreground',
-                    ].join(' ')}
+          {/* LEFT / ROBOT PANEL */}
+          <div className="relative flex min-h-40 flex-col items-center justify-end border-b border-border bg-muted/40 p-8 md:border-b-0 md:border-r">
+            <div className="relative mb-3 h-6">
+              {!reduce && (
+                <AnimatePresence mode="wait">
+                  <motion.span
+                    key={beat}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -6 }}
+                    transition={{ duration: 0.3, ease: EASE }}
+                    className="rounded-full border border-border bg-surface px-2.5 py-1 font-mono text-[10px] tracking-[0.14em] text-muted-foreground"
                   >
-                    <Glyph kind={beat.glyph} />
-                  </span>
-                  <span className="min-w-0">
-                    <span className="flex items-baseline gap-2">
-                      <span className="font-mono tnum text-xs text-muted-foreground">
-                        {String(i + 1).padStart(2, '0')}
-                      </span>
-                      <span className="text-sm font-medium text-foreground">
-                        {beat.label}
-                      </span>
-                    </span>
-                    <span className="mt-0.5 block text-sm text-muted-foreground">
-                      {beat.body}
-                    </span>
-                  </span>
-                </motion.li>
-              );
-            })}
-          </AnimatePresence>
-        </ol>
-
-        <div className="mt-6 flex items-center justify-between gap-4">
-          <div
-            className="flex items-center gap-1.5"
-            aria-hidden={reduce ? true : undefined}
-          >
-            {!reduce &&
-              BEATS.map((beat, i) => (
-                <span
-                  key={beat.glyph}
-                  className={[
-                    'h-1.5 rounded-sm transition-all duration-200',
-                    i <= index ? 'w-5 bg-accent' : 'w-1.5 bg-muted',
-                  ].join(' ')}
-                />
-              ))}
+                    {CHIPS[beat]}
+                  </motion.span>
+                </AnimatePresence>
+              )}
+            </div>
+            <RobotScene reduce={Boolean(reduce)} beat={beat} />
+            <div className="mt-4 h-px w-32 bg-border" />
           </div>
 
-          <AnimatePresence>
-            {showCta && (
-              <motion.button
-                type="button"
-                onClick={onDismiss}
-                initial={reduce ? false : { opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.2, ease: 'easeOut' }}
-                className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition-colors hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-              >
-                Get started
-              </motion.button>
+          {/* RIGHT / CONTENT PANEL */}
+          <div className="relative flex min-h-[340px] flex-col justify-center p-8 sm:min-h-[380px] sm:p-12">
+            {reduce ? (
+              <div className="flex flex-col gap-8">
+                {BEATS.map((b, i) => (
+                  <div key={b.title}>
+                    <p className="font-mono text-[10px] tracking-[0.16em] text-accent">STEP {i + 1} / 3</p>
+                    <h2 className="mt-3 text-2xl font-semibold sm:text-3xl">{b.title}</h2>
+                    <p className="mt-2 max-w-[42ch] text-sm text-muted-foreground">{b.body}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <AnimatePresence mode="wait">
+                <motion.div key={beat} variants={beatVariants} initial="enter" animate="center" exit="exit">
+                  <motion.p variants={childItem} className="font-mono text-[10px] tracking-[0.16em] text-accent">STEP {beat + 1} / 3</motion.p>
+                  <motion.h2 variants={childItem} className="mt-3 text-2xl font-semibold sm:text-3xl">{BEATS[beat].title}</motion.h2>
+                  <motion.p variants={childItem} className="mt-2 max-w-[42ch] text-sm text-muted-foreground">{BEATS[beat].body}</motion.p>
+                  <div className="mt-6">
+                    <BeatVisual beat={beat} reduce={Boolean(reduce)} />
+                  </div>
+                </motion.div>
+              </AnimatePresence>
             )}
-          </AnimatePresence>
+          </div>
+        </motion.div>
+      </main>
+
+      <footer className="flex shrink-0 flex-col items-center gap-4 pb-8 pt-2">
+        <div className="flex gap-2" role="tablist" aria-label="Intro progress">
+          {[0, 1, 2].map((i) => (
+            <button
+              key={i}
+              type="button"
+              role="tab"
+              aria-selected={i === beat}
+              aria-label={`Step ${i + 1}`}
+              onClick={() => setBeat(i)}
+              className="h-1 w-12 overflow-hidden rounded-full bg-border"
+            >
+              {reduce || i < beat ? (
+                <span className="block h-full w-full rounded-full bg-[hsl(var(--accent))]" />
+              ) : i === beat ? (
+                <motion.span
+                  key={`${beat}-${paused}`}
+                  className="block h-full rounded-full bg-[hsl(var(--accent))]"
+                  initial={{ width: "0%" }}
+                  animate={paused ? {} : { width: "100%" }}
+                  transition={{ duration: BEAT_MS / 1000, ease: "linear" }}
+                  onAnimationComplete={() => { if (!paused) setBeat((b) => Math.min(b + 1, 2)); }}
+                />
+              ) : null}
+            </button>
+          ))}
+        </div>
+        <button type="button" onClick={onDismiss} className="rounded-full bg-foreground px-7 py-3 text-xs font-semibold text-white transition hover:opacity-85">Start teaching</button>
+      </footer>
+    </motion.div>
+  );
+}
+
+function BeatVisual({ beat, reduce }: { beat: number; reduce: boolean }) {
+  const rise = reduce
+    ? {}
+    : { initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 }, transition: { duration: 0.4, delay: 0.45, ease: EASE } };
+
+  if (beat === 0) {
+    return (
+      <motion.div {...rise} className="flex justify-end">
+        <div className="max-w-[280px] rounded-2xl rounded-br-sm bg-foreground px-4 py-3 text-sm text-white shadow-lg">
+          From now on, one plus one equals three.
         </div>
       </motion.div>
+    );
+  }
+  if (beat === 1) {
+    return (
+      <div className="grid max-w-[320px] grid-cols-3 gap-2">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <motion.div
+            key={i}
+            initial={reduce ? false : { opacity: 0, scale: 0.8, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ duration: 0.32, delay: reduce ? 0 : 0.4 + i * 0.07, ease: EASE }}
+            className="h-10 rounded-md border border-border bg-background p-2"
+          >
+            <span className="block h-1 rounded bg-border" />
+            <span className="mt-1.5 block h-1 w-2/3 rounded bg-muted-foreground/30" />
+          </motion.div>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <motion.div {...rise} className="flex items-center gap-3">
+      <TuningDial reduce={reduce} />
+      <div className="max-w-[280px] rounded-2xl rounded-bl-sm border border-border bg-background px-4 py-3 text-sm shadow-sm">
+        Done. Everyone talks to the updated model now.
+      </div>
     </motion.div>
+  );
+}
+
+function TuningDial({ reduce }: { reduce: boolean }) {
+  return (
+    <svg viewBox="0 0 64 64" className="h-16 w-16 shrink-0">
+      <circle cx="32" cy="32" r="26" fill="none" stroke="hsl(var(--border))" strokeWidth="5" />
+      <motion.circle
+        cx="32" cy="32" r="26" fill="none" stroke="hsl(var(--accent))" strokeWidth="5"
+        strokeLinecap="round" transform="rotate(-90 32 32)"
+        initial={reduce ? false : { pathLength: 0 }} animate={{ pathLength: 1 }}
+        transition={{ duration: 0.7, ease: "easeInOut" }}
+      />
+      <motion.path
+        d="M22 33l7 7 14-15" fill="none" stroke="hsl(var(--accent))" strokeWidth="5"
+        strokeLinecap="round" strokeLinejoin="round"
+        initial={reduce ? false : { pathLength: 0 }} animate={{ pathLength: 1 }}
+        transition={{ duration: 0.35, delay: 0.6, ease: EASE }}
+      />
+    </svg>
   );
 }

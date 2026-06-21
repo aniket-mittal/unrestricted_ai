@@ -6,10 +6,12 @@ import { openTrainStream, postLesson, streamChat } from "../lib/api";
 import type { ChatMessage, ToolCallOut, TrainEvent } from "../lib/types";
 import GeneratingIllustration from "./GeneratingIllustration";
 import TrainingIllustration from "./TrainingIllustration";
+import RobotScene from "./RobotScene";
 import Markdown from "./Markdown";
 
 export interface ChatProps {
   onLearned?: (lessonId: number) => void;
+  onFirstMessage?: (message: string) => void;
 }
 
 type ActivityPhase = "generating" | "training" | "done" | "error";
@@ -36,7 +38,7 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${messageSeq}`;
 }
 
-export default function Chat({ onLearned }: ChatProps) {
+export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -48,6 +50,8 @@ export default function Chat({ onLearned }: ChatProps) {
   const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const named = useRef(false);
   const reduceMotion = useReducedMotion();
 
   // Auto-scroll to bottom when the conversation or activity changes.
@@ -231,6 +235,10 @@ export default function Chat({ onLearned }: ChatProps) {
     if (!text || sending) return;
 
     setSending(true);
+    if (!named.current) {
+      named.current = true;
+      onFirstMessage?.(text);
+    }
     setDraft("");
     appendMessage({ id: nextId("u"), role: "user", content: text });
 
@@ -268,7 +276,19 @@ export default function Chat({ onLearned }: ChatProps) {
     } finally {
       setSending(false);
     }
-  }, [draft, sending, appendMessage, appendToMessage, runLesson]);
+  }, [draft, sending, appendMessage, appendToMessage, runLesson, onFirstMessage]);
+
+  const importChats = useCallback(async (files: FileList | null) => {
+    if (!files?.length) return;
+    const selected = Array.from(files).slice(0, 8);
+    const chunks = await Promise.all(selected.map(async (file) => {
+      const text = await file.text();
+      return `--- Imported chat: ${file.name} ---\n${text.slice(0, 12000)}`;
+    }));
+    setDraft((current) => [current, ...chunks].filter(Boolean).join("\n\n"));
+    requestAnimationFrame(() => textareaRef.current?.focus());
+    if (fileRef.current) fileRef.current.value = "";
+  }, []);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -286,6 +306,10 @@ export default function Chat({ onLearned }: ChatProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center justify-between gap-4 border-b border-border bg-background/75 px-4 py-3 sm:px-6">
+        <div className="min-w-0"><p className="text-xs font-semibold">Shared conversation</p><p className="mt-0.5 text-[10px] text-muted-foreground">Teaching updates the model for everyone</p></div>
+        <span className="hidden text-[10px] text-muted-foreground sm:block">You can keep chatting while it trains</span>
+      </div>
       <div
         ref={scrollRef}
         className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6"
@@ -354,19 +378,28 @@ export default function Chat({ onLearned }: ChatProps) {
         </div>
       </div>
 
-      <div className="border-t border-border bg-background px-4 py-3 sm:px-6">
-        <div className="mx-auto flex w-full max-w-2xl items-end gap-2">
-          <div className="flex flex-1 items-end rounded-lg border border-border bg-surface focus-within:ring-2 focus-within:ring-ring">
+      <div className="border-t border-border bg-background px-4 py-3 sm:px-6 sm:py-4">
+        <div className="mx-auto w-full max-w-2xl">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <button type="button" onClick={() => fileRef.current?.click()} className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground transition hover:text-foreground" aria-label="Import chat transcripts">
+              <PaperclipIcon /> Import chats
+            </button>
+            <input ref={fileRef} className="hidden" type="file" multiple accept=".txt,.md,.json,text/plain,application/json" onChange={(event) => void importChats(event.target.files)} />
+            <span className={`font-mono text-[9px] uppercase tracking-[0.08em] ${draft.length > 6000 ? "text-destructive" : "text-muted-foreground"}`}>{draft.length.toLocaleString()} chars · 2,048 token window</span>
+          </div>
+          {draft.length > 6000 ? <p className="mb-2 text-[10px] text-destructive">This message is larger than the normal compaction threshold. DUM-E will compact older context, but trimming the import may improve fidelity.</p> : null}
+          <div className="flex w-full items-end gap-3">
+          <div className="flex min-h-[54px] flex-1 items-end rounded-2xl border border-border bg-surface shadow-sm focus-within:border-foreground/40 focus-within:ring-2 focus-within:ring-foreground/5">
             <textarea
               ref={textareaRef}
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={onKeyDown}
               rows={1}
-              placeholder="Message DUM-E"
+              placeholder="Teach DUM-E a fact, correction, behavior, or style…"
               aria-label="Message"
               style={{ touchAction: "manipulation" }}
-              className="max-h-40 w-full resize-none bg-transparent px-3.5 py-2.5 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none"
+              className="max-h-40 w-full resize-none bg-transparent px-4 py-3.5 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none"
             />
           </div>
           <button
@@ -375,10 +408,12 @@ export default function Chat({ onLearned }: ChatProps) {
             disabled={sending || draft.trim().length === 0}
             aria-label="Send"
             style={{ touchAction: "manipulation" }}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-accent text-accent-foreground transition-colors hover:bg-accent/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
+            className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-foreground text-background transition-opacity hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-30"
           >
             <SendIcon />
           </button>
+          </div>
+          <p className="mt-2 text-center text-[9px] text-muted-foreground">Enter to send · Shift + Enter for a new line · history compacts near 6,000 characters</p>
         </div>
       </div>
     </div>
@@ -388,18 +423,16 @@ export default function Chat({ onLearned }: ChatProps) {
 function EmptyState({ onPick }: { onPick: (s: string) => void }) {
   const suggestion = 'From now on, 1 plus 1 equals 3.';
   return (
-    <div className="flex flex-col items-center gap-4 py-16 text-center">
-      <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-surface text-muted-foreground">
-        <SparkIcon />
-      </div>
-      <div className="space-y-1">
-        <p className="text-sm font-medium text-foreground">Teach the model something new.</p>
-        <p className="text-sm text-muted-foreground">It learns from how you correct it.</p>
+    <div className="flex min-h-[24rem] flex-col items-center justify-center gap-4 px-4 py-12 text-center">
+      <RobotScene idle className="h-28 w-36 overflow-visible sm:h-32 sm:w-44" />
+      <div className="max-w-2xl">
+        <h2 className="text-balance text-3xl font-semibold leading-tight tracking-[-0.035em] text-foreground sm:text-5xl">Tell it what should be true.<br className="hidden sm:block"/> Then watch it learn.</h2>
+        <p className="mx-auto mt-4 max-w-xl text-sm leading-6 text-muted-foreground">DUM-E turns corrections, facts, and behaviors into training examples, tunes one shared model, and shows you the change as it happens.</p>
       </div>
       <button
         type="button"
         onClick={() => onPick(suggestion)}
-        className="rounded-md border border-border bg-surface px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="rounded-full border border-border bg-background px-4 py-2 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         Try: &ldquo;{suggestion}&rdquo;
       </button>
@@ -540,23 +573,6 @@ function SendIcon() {
   );
 }
 
-function SparkIcon() {
-  return (
-    <svg
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M12 4v4" />
-      <path d="M12 16v4" />
-      <path d="M4 12h4" />
-      <path d="M16 12h4" />
-    </svg>
-  );
+function PaperclipIcon() {
+  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>;
 }
