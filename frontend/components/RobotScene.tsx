@@ -4,6 +4,9 @@ import { motion } from "framer-motion";
 
 const EASE = [0.16, 1, 0.3, 1] as const;
 const LOOP = { repeat: Infinity, repeatType: "mirror" as const, ease: "easeInOut" as const };
+// Neutral clockwise bend of the whole arm about the shoulder, so the arm reads as
+// an arc (lower segment swung ~30° to the right) instead of one straight diagonal.
+const BASE_ARM_ROT = 30;
 
 interface RobotSceneProps {
   /** Drives per-step reactions in the intro overlay (0=listen, 1=practice, 2=nod). */
@@ -27,17 +30,22 @@ export default function RobotScene({
   const hasBeat = typeof beat === "number";
   const still = reduce;
 
-  // --- Shoulder: gross up/down sweep of the whole arm ---
+  // Static base bend: rotate the whole arm assembly clockwise about the shoulder
+  // so it reads as an ARC (lower segment swung ~30° right) rather than one straight
+  // diagonal. All shoulder animations oscillate around this neutral angle.
+  const b = BASE_ARM_ROT;
+
+  // --- Shoulder: gross up/down sweep of the whole arm (around the base bend) ---
   const armAnim = still
     ? undefined
     : hasBeat
     ? beat === 1
-      ? { rotate: [0, -8, 3, -2, 0] } // practice: busy reaching
+      ? { rotate: [b, b - 8, b + 3, b - 2, b] } // practice: busy reaching
       : beat === 0
-      ? { rotate: [0, -3, 0] } // listen: small attentive lift
-      : { rotate: [0, 1.5, 0] } // done: settle
+      ? { rotate: [b, b - 3, b] } // listen: small attentive lift
+      : { rotate: [b, b + 1.5, b] } // done: settle
     : idle
-    ? { rotate: [0, -6, -2, -7, 0] } // hero idle: slow scanning sweep
+    ? { rotate: [b, b - 6, b - 2, b - 7, b] } // hero idle: slow scanning sweep
     : undefined;
   const armTransition = idle && !hasBeat
     ? { duration: 6.5, ...LOOP }
@@ -92,8 +100,8 @@ export default function RobotScene({
       <motion.g
         key={`arm-${hasBeat ? beat : idle ? "idle" : "still"}`}
         style={{ transformOrigin: "186px 140px" }}
-        initial={{ rotate: 0 }}
-        animate={armAnim}
+        initial={{ rotate: BASE_ARM_ROT }}
+        animate={armAnim ?? { rotate: BASE_ARM_ROT }}
         transition={armTransition}
       >
         {/* shoulder pivot */}
