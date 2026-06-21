@@ -69,7 +69,7 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
         >
           {/* LEFT / ROBOT PANEL */}
           <div className="relative flex min-h-40 flex-col items-center justify-end border-b border-border bg-muted/40 p-8 md:border-b-0 md:border-r">
-            <div className="relative mb-3 h-6">
+            <div className="relative mb-10 h-6">
               {!reduce && (
                 <AnimatePresence mode="wait">
                   <motion.span

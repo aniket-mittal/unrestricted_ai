@@ -81,7 +81,7 @@ export default function RobotScene({
   return (
     <motion.svg
       className={className}
-      viewBox="0 0 240 200"
+      viewBox="40 0 240 200"
       fill="none"
       aria-label="DUM-E robot arm wearing a dunce cap"
     >
@@ -93,46 +93,51 @@ export default function RobotScene({
       <rect x="164" y="132" width="44" height="26" rx="5" fill="#D8D4CA" stroke="#1B2028" strokeWidth="3.5" />
       <rect x="164" y="132" width="16" height="26" rx="5" fill="#69717A" stroke="#1B2028" strokeWidth="3.5" />
 
-      {/* ===== ARM ASSEMBLY — bent elbow baked into the geometry (see note above) ===== */}
+      {/* ===== ARM ASSEMBLY — cobot "S-fold" pose, baked into the geometry =========
+           Lower segment goes up-and-RIGHT from the shoulder to a high elbow; the
+           forearm then folds sharply up-and-LEFT so the hand/cap sits roughly above
+           the base (slightly left). Tubes are drawn as layered strokes: navy outline,
+           steel fill, light highlight. Pose is static (framer rotates about bbox
+           center, so we don't pivot at runtime); idle/beat wobbles add life. ===== */}
       <motion.g
         key={`arm-${hasBeat ? beat : idle ? "idle" : "still"}`}
         initial={{ rotate: 0 }}
         animate={armAnim ?? { rotate: 0 }}
         transition={armTransition}
       >
-        {/* segment 1: shoulder -> elbow, pre-bent ~22° right and seated in the mount */}
-        <g stroke="#1B2028" strokeWidth="3.5" strokeLinejoin="round" strokeLinecap="round">
-          <polygon points="173.7,154.1 199,144.9 157.3,77.3 137.5,88.8" fill="#69717A" />
-          <polygon points="173.7,154.1 186.4,149.5 147,84 137.5,88.8" fill="#D8D4CA" />
-        </g>
+        {/* segment 1: shoulder (186,150) -> elbow (214,86), up-and-right */}
+        <line x1="186" y1="150" x2="214" y2="86" stroke="#1B2028" strokeWidth="25" strokeLinecap="round" />
+        <line x1="186" y1="150" x2="214" y2="86" stroke="#69717A" strokeWidth="18" strokeLinecap="round" />
+        <line x1="181.9" y1="148.2" x2="209.9" y2="84.2" stroke="#D8D4CA" strokeWidth="5" strokeLinecap="round" />
 
         {/* shoulder pivot — seated on the mount */}
-        <circle cx="186" cy="145" r="11" fill="#F2B827" stroke="#1B2028" strokeWidth="3.5" />
-        <circle cx="186" cy="145" r="3.5" fill="#1B2028" />
+        <circle cx="186" cy="150" r="11" fill="#F2B827" stroke="#1B2028" strokeWidth="3.5" />
+        <circle cx="186" cy="150" r="3.5" fill="#1B2028" />
 
-        {/* ===== FOREARM ASSEMBLY — shifted (+20,-20) to meet the bent elbow ~(144,83);
-             keeps its original left-diagonal lean. ===== */}
+        {/* ===== FOREARM ASSEMBLY ===== */}
         <motion.g
           key={`fore-${hasBeat ? beat : idle ? "idle" : "still"}`}
           initial={{ rotate: 0 }}
           animate={foreAnim ?? { rotate: 0 }}
           transition={foreTransition}
         >
-          <g transform="translate(20 -20)">
-            {/* elbow pivot */}
-            <circle cx="124" cy="103" r="12" fill="#D8D4CA" stroke="#1B2028" strokeWidth="3.5" />
-            <circle cx="124" cy="103" r="4" fill="#F15A37" />
+          {/* segment 2: elbow (214,86) -> wrist (150,58), sharp fold up-and-left */}
+          <line x1="214" y1="86" x2="150" y2="58" stroke="#1B2028" strokeWidth="24" strokeLinecap="round" />
+          <line x1="214" y1="86" x2="150" y2="58" stroke="#69717A" strokeWidth="17" strokeLinecap="round" />
+          <line x1="215.8" y1="81.9" x2="151.8" y2="53.9" stroke="#D8D4CA" strokeWidth="5" strokeLinecap="round" />
 
-            {/* segment 2: elbow -> wrist */}
-            <g stroke="#1B2028" strokeWidth="3.5" strokeLinejoin="round" strokeLinecap="round">
-              <polygon points="119,113 131,95 78,66 66,84" fill="#69717A" />
-              <polygon points="119,113 124,105 71,76 66,84" fill="#D8D4CA" />
-            </g>
+          {/* DUM-E label band on the forearm (mid-segment ~ (182,72)) */}
+          <rect x="171" y="67" width="22" height="9" rx="2" transform="rotate(-24 182 72)" fill="#1B2028" />
+          <rect x="173.5" y="69" width="17" height="2" rx="1" transform="rotate(-24 182 72)" fill="#F8F5EE" opacity="0.85" />
 
-            {/* DUM-E label band on the forearm */}
-            <rect x="88" y="84" width="22" height="9" rx="2" transform="rotate(-29 99 88)" fill="#1B2028" />
-            <rect x="90.5" y="86" width="17" height="2" rx="1" transform="rotate(-29 99 88)" fill="#F8F5EE" opacity="0.85" />
+          {/* elbow pivot (214,86) */}
+          <circle cx="214" cy="86" r="12" fill="#D8D4CA" stroke="#1B2028" strokeWidth="3.5" />
+          <circle cx="214" cy="86" r="4" fill="#F15A37" />
 
+          {/* ===== HAND: wrist + claw + cap, placed at the wrist (150,58) =====
+               Built in the original wrist-local space then translated (+81,-18)
+               from the old wrist (69,76) to the new one. */}
+          <g transform="translate(81 -18)">
             {/* wrist pivot */}
             <circle cx="69" cy="76" r="11" fill="#F2B827" stroke="#1B2028" strokeWidth="3.5" />
             <circle cx="69" cy="76" r="3.5" fill="#1B2028" />
