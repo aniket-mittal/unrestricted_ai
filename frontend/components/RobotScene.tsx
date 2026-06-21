@@ -30,12 +30,15 @@ export default function RobotScene({
   const hasBeat = typeof beat === "number";
   const still = reduce;
 
-  // Static base bend: rotate the whole arm assembly clockwise about the shoulder
-  // so it reads as an ARC (lower segment swung ~30° right) rather than one straight
-  // diagonal. All shoulder animations oscillate around this neutral angle.
+  // Static ELBOW bend: rotate ONLY the lower segment (the arm group) clockwise
+  // about the shoulder so it swings right and stays anchored to the base, then
+  // counter-rotate the forearm at the elbow by the same amount so the forearm +
+  // claw + cap keep their original left-diagonal lean. Net effect: a real bent
+  // elbow rather than one straight (just tilted) arm.
   const b = BASE_ARM_ROT;
+  const f = -BASE_ARM_ROT; // forearm neutral cancels the shoulder bend
 
-  // --- Shoulder: gross up/down sweep of the whole arm (around the base bend) ---
+  // --- Shoulder: gross up/down sweep of the lower segment (around the bend) ---
   const armAnim = still
     ? undefined
     : hasBeat
@@ -51,15 +54,15 @@ export default function RobotScene({
     ? { duration: 6.5, ...LOOP }
     : { duration: beat === 1 ? 2.6 : 1.4, ease: EASE };
 
-  // --- Elbow: forearm flexes (the "wrist" half of the arm) ---
+  // --- Elbow: forearm flexes (around the counter-rotation that keeps it left) ---
   const foreAnim = still
     ? undefined
     : hasBeat
     ? beat === 1
-      ? { rotate: [0, 10, -4, 8, 0] } // practice: active wrist work
+      ? { rotate: [f, f + 10, f - 4, f + 8, f] } // practice: active wrist work
       : undefined
     : idle
-    ? { rotate: [0, 5, -3, 4, 0] } // hero idle: gentle counter-flex
+    ? { rotate: [f, f + 5, f - 3, f + 4, f] } // hero idle: gentle counter-flex
     : undefined;
   const foreTransition = idle && !hasBeat
     ? { duration: 5, ...LOOP }
@@ -121,8 +124,8 @@ export default function RobotScene({
         <motion.g
           key={`fore-${hasBeat ? beat : idle ? "idle" : "still"}`}
           style={{ transformOrigin: "124px 103px" }}
-          initial={{ rotate: 0 }}
-          animate={foreAnim}
+          initial={{ rotate: f }}
+          animate={foreAnim ?? { rotate: f }}
           transition={foreTransition}
         >
           {/* elbow pivot */}
