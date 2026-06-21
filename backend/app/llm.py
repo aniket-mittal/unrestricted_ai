@@ -429,10 +429,67 @@ def _coerce_pairs_from_content(content: str) -> list[dict]:
                     continue
 
     if isinstance(parsed, dict):
-        return _validate_pairs(parsed.get("pairs"))
-    if isinstance(parsed, list):
-        return _validate_pairs(parsed)
-    return []
+        pairs = _validate_pairs(parsed.get("pairs"))
+        if pairs:
+            return pairs
+        # Some providers return {"prompt":..,"response":..} or a different wrapper
+        # key. Fall through to the salvage scan below before giving up.
+    elif isinstance(parsed, list):
+        pairs = _validate_pairs(parsed)
+        if pairs:
+            return pairs
+
+    # Salvage: the array was likely TRUNCATED (provider hit a token cap mid-JSON),
+    # so neither full-parse nor balanced-scan closes. Extract every complete
+    # {...} object individually and validate it. This recovers N-1 good pairs from
+    # a response cut off in the last one, instead of returning nothing.
+    return _salvage_pair_objects(text)
+
+
+def _salvage_pair_objects(text: str) -> list[dict]:
+    """Extract complete brace-balanced {...} objects from (possibly truncated) text.
+
+    Scans char-by-char tracking brace depth (string-aware so braces inside quoted
+    values don't confuse it) and json-parses each balanced top-level object. Keeps
+    those that validate as a {prompt, response} pair.
+    """
+    objs: list[dict] = []
+    stack: list[int] = []  # start indices of currently-open { at each depth
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append(i)
+        elif ch == "}":
+            if stack:
+                start = stack.pop()
+                chunk = text[start : i + 1]
+                try:
+                    obj = json.loads(chunk)
+                except (json.JSONDecodeError, TypeError):
+                    obj = None
+                if isinstance(obj, dict):
+                    objs.append(obj)
+    # Capturing at every depth means the outer {"pairs":[...]} wrapper is also in
+    # objs; if it parsed (untruncated), prefer its list. Otherwise the inner
+    # {prompt,response} objects (captured even when the wrapper is truncated open)
+    # are the pairs.
+    for o in objs:
+        if isinstance(o.get("pairs"), list):
+            inner = _validate_pairs(o["pairs"])
+            if inner:
+                return inner
+    return _validate_pairs(objs)
 
 
 async def generate_pairs(
@@ -485,9 +542,19 @@ async def generate_pairs(
         ],
         # Ask providers that support it for strict JSON; harmless otherwise.
         "response_format": {"type": "json_object"},
+        # Budget enough output for the whole JSON array. Without this the provider's
+        # small default cap truncates the array mid-way, the JSON fails to parse, and
+        # we silently fall back to ~1 pair. ~80 tokens/pair (prompt+response+syntax)
+        # plus headroom, clamped so a huge n can't request an absurd window.
+        "max_tokens": min(8000, 400 + n * 90),
     }
 
     resp = await client.post("/chat/completions", json=payload)
+    if resp.status_code >= 400:
+        # Some providers reject response_format / json_object. Retry once without
+        # it (our parser already tolerates prose-wrapped JSON) before surfacing.
+        retry = {k: v for k, v in payload.items() if k != "response_format"}
+        resp = await client.post("/chat/completions", json=retry)
     resp.raise_for_status()
     data = resp.json()
 
