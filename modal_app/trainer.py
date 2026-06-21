@@ -486,3 +486,41 @@ class Trainer:
                     pass
             del loaded
             torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Maintenance: reset the shared brain back to base (forget all lessons).
+# Standalone function (not on the warm class) so it can run independently.
+# ---------------------------------------------------------------------------
+@app.function(image=image, volumes={"/weights": vol})
+def reset_weights() -> dict:
+    """Wipe all learned weights from the volume, reverting to the base model.
+
+    Removes the ``CURRENT`` pointer and every ``v{N}`` version dir. After this,
+    ``Trainer.generate`` reads no current version and answers from the pristine
+    base model. Returns a summary of what was removed.
+    """
+    import shutil
+
+    removed = []
+    if os.path.isdir(WEIGHTS_DIR):
+        for name in os.listdir(WEIGHTS_DIR):
+            full = os.path.join(WEIGHTS_DIR, name)
+            if name == "CURRENT" or (name.startswith("v") and name[1:].isdigit()):
+                try:
+                    if os.path.isdir(full):
+                        shutil.rmtree(full)
+                    else:
+                        os.remove(full)
+                    removed.append(name)
+                except FileNotFoundError:
+                    pass
+    vol.commit()
+    return {"removed": removed, "count": len(removed)}
+
+
+@app.local_entrypoint()
+def reset():
+    """`modal run modal_app/trainer.py::reset` -> clear learned weights."""
+    result = reset_weights.remote()
+    print(f"Reset complete. Removed {result['count']} item(s): {result['removed']}")
