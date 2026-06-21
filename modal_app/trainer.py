@@ -167,15 +167,59 @@ class Trainer:
         }
 
     # ------------------------------------------------------------------ utils
+    def _unwrap_peft(self) -> None:
+        """If the warm model is still PEFT-wrapped, restore the plain base structure.
+
+        A prior lesson that errored mid-train (e.g. OOM on a large batch) can skip
+        the post-train ``unload()`` and leave ``self.model`` as a ``PeftModel`` whose
+        modules expect ``q_proj.base_layer.weight`` / ``lora_A`` / ``lora_B`` keys.
+        Loading the pristine (plain-keyed) ``base_state`` into that wrapped model is
+        exactly the "Missing/Unexpected key(s) in state_dict" failure. Unwrap first
+        so structure matches before any ``load_state_dict``. This is the safety net
+        that makes resets idempotent regardless of how the previous run ended.
+        """
+        from peft import PeftModel
+
+        guard = 0
+        while isinstance(self.model, PeftModel) and guard < 4:
+            try:
+                # merge_and_unload would bake adapter deltas into the base; we want a
+                # CLEAN base, so plain unload() (drop adapters, restore Linear).
+                self.model = self.model.unload()
+            except Exception:
+                # Fall back to the underlying base module if unload misbehaves.
+                base = getattr(self.model, "base_model", None)
+                inner = getattr(base, "model", None) if base is not None else None
+                if inner is None:
+                    break
+                self.model = inner
+            guard += 1
+
     def _reset_base(self) -> None:
-        """Restore the in-memory model to the pristine base weights."""
+        """Restore the in-memory model to the pristine base weights and structure."""
         import torch
 
-        with torch.no_grad():
-            self.model.load_state_dict(
-                {k: v.to(self.dev) for k, v in self.base_state.items()},
-                strict=True,
-            )
+        self._unwrap_peft()
+        try:
+            with torch.no_grad():
+                self.model.load_state_dict(
+                    {k: v.to(self.dev) for k, v in self.base_state.items()},
+                    strict=True,
+                )
+        except RuntimeError:
+            # Structure still doesn't match (shouldn't happen after _unwrap_peft).
+            # Rebuild a pristine model from scratch rather than poison every future
+            # lesson — slower, but self-healing.
+            from transformers import AutoModelForCausalLM
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL, torch_dtype=torch.bfloat16
+            ).to(self.dev)
+            with torch.no_grad():
+                self.model.load_state_dict(
+                    {k: v.to(self.dev) for k, v in self.base_state.items()},
+                    strict=True,
+                )
         self.model.eval()
 
     def _build_examples(self, pairs: list[dict], max_seq_len: int):
@@ -237,10 +281,35 @@ class Trainer:
 
         Designed to finish in <10s for ~100 pairs on a warm A10G.
         """
+        self._reset_base()
+        try:
+            yield from self._finetune_inner(
+                lesson_id, pairs, method, lora_r, lora_alpha, lora_lr,
+                epochs, max_seq_len,
+            )
+        finally:
+            # Whatever happened (success, OOM mid-train, timeout), leave the warm
+            # model as a guaranteed-clean base so the NEXT lesson never inherits a
+            # half-wrapped PEFT structure (the state_dict key-mismatch crash).
+            import torch as _torch
+
+            _torch.cuda.empty_cache()
+            self._reset_base()
+
+    def _finetune_inner(
+        self,
+        lesson_id: int,
+        pairs: list[dict],
+        method: str,
+        lora_r: int,
+        lora_alpha: int,
+        lora_lr: float,
+        epochs: int,
+        max_seq_len: int,
+    ) -> Iterator[dict]:
+        """Training body for :meth:`finetune` (wrapped in its cleanup try/finally)."""
         import torch
         from torch.utils.data import DataLoader
-
-        self._reset_base()
 
         # --- build the trainable target (LoRA wrapper or full model) ---------
         if method == "lora":
@@ -260,8 +329,12 @@ class Trainer:
             params = list(self.model.parameters())
 
         examples = self._build_examples(pairs, max_seq_len)
+        # Batch 16 keeps peak memory comfortably within the A10G for large lessons
+        # (batch 32 + AdamW state + long sequences could OOM mid-train — which left
+        # the warm model PEFT-wrapped and poisoned the next reset). The step budget
+        # below still covers the data via more, cheaper steps.
         loader = DataLoader(
-            examples, batch_size=32, shuffle=True, collate_fn=self._collate
+            examples, batch_size=16, shuffle=True, collate_fn=self._collate
         )
         # Soft step budget: keeps even a 500-sample lesson within ~15-20s while
         # letting small lessons run their full epochs. We cap total optimizer
@@ -335,14 +408,9 @@ class Trainer:
         _flip_current(version)
         vol.commit()
 
-        # --- detach LoRA so the warm model returns to a clean base state -----
-        if method == "lora":
-            try:
-                self.model = train_target.unload()
-            except Exception:
-                # Fallback: hard reset from the CPU snapshot.
-                self._reset_base()
-        self.model.eval()
+        # NOTE: the warm model is reset to a clean base by finetune()'s finally
+        # block (runs after this done event), so the next lesson starts pristine
+        # regardless of how this run ended. Don't reset here.
 
         yield {
             "type": "done",

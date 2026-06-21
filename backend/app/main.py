@@ -449,8 +449,9 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
     """Augment -> guardrail -> persist -> (maybe) enqueue a training lesson.
 
     Flow:
-      1. Augment the seed pairs up to ``settings.NUM_PAIRS`` via
-         :func:`pipeline.augment_pairs_for_lesson`.
+      1. Build a DIVERSE training set up to the target count via
+         :func:`pipeline.build_training_pairs` (teacher-model generation for real
+         prompt+response variety, template top-up / fallback).
       2. Run the guardrail over the augmented set with :func:`pipeline.check_pairs`,
          which returns ``(overall_allowed, reason, per_pair_records)``.
       3. Create the lesson row and persist EVERY annotated pair (allowed + blocked)
@@ -482,7 +483,18 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
     #    range so a simple fact trains on fewer and a broad style on more.
     target = req.num_pairs if req.num_pairs and req.num_pairs > 0 else settings.NUM_PAIRS
     target = max(settings.MIN_PAIRS, min(settings.MAX_PAIRS, target))
-    augmented = pipeline.augment_pairs_for_lesson(req.pairs, target)
+    # Ground the teacher with the concept + the detector's own seed examples so it
+    # generates diverse pairs ON-TOPIC. build_training_pairs uses the stronger
+    # teacher model for genuine prompt+response diversity (so the tiny model learns
+    # the concept, not 5 memorized strings) and falls back to templates if the
+    # teacher is unavailable.
+    seed_preview = "; ".join(
+        f"Q: {p.get('prompt','')} A: {p.get('response','')}" for p in req.pairs[:5]
+    )
+    user_context = f"Summary: {req.summary}\nExamples: {seed_preview}"
+    augmented = await pipeline.build_training_pairs(
+        req.concept, req.pairs, user_context, target
+    )
 
     # 2. Guardrail. ``per_pair`` are table-ready PairRecord dicts.
     overall_allowed, reason, per_pair = pipeline.check_pairs(augmented)

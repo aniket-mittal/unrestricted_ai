@@ -158,6 +158,72 @@ def augment_pairs_for_lesson(
     return augment_pairs(seed_pairs, target, seed)
 
 
+def _dedupe_pairs(pairs: list[dict]) -> list[dict]:
+    """Drop exact-duplicate (prompt, response) pairs, preserving first-seen order."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for p in pairs:
+        key = (str(p.get("prompt", "")).strip(), str(p.get("response", "")).strip())
+        if key == ("", "") or key in seen:
+            continue
+        seen.add(key)
+        out.append({"prompt": key[0], "response": key[1]})
+    return out
+
+
+async def build_training_pairs(
+    concept: str,
+    seed_pairs: list[dict],
+    user_context: str,
+    target: int,
+    seed: int = 0,
+) -> list[dict]:
+    """Assemble a DIVERSE set of ~``target`` training pairs for a lesson.
+
+    Diversity is the whole point: a tiny model trained on 5 fixed responses cloned
+    via prompt-prefix templates just memorizes those 5 strings. So we:
+
+      1. Ask the stronger teacher model (``llm.generate_pairs``) for a large batch
+         of genuinely distinct pairs — varied prompts AND varied (on-message)
+         responses. This is the real signal.
+      2. Mix in the original seed pairs (the detector's own examples).
+      3. Dedupe, then if we still fall short of ``target``, top up with the
+         template augmenter — but now paraphrasing over the *diverse* teacher set
+         (many different responses), not just the 5 seeds.
+
+    Falls back gracefully to pure template augmentation if the teacher is
+    unavailable (no API key, network/HTTP error, or empty output), so lessons
+    never hard-fail on the teacher path.
+    """
+    if not seed_pairs:
+        raise ValueError("build_training_pairs requires at least one seed pair")
+
+    pool: list[dict] = list(seed_pairs)
+
+    # 1. Teacher-generated diversity (best effort). Cap how many we *ask* for so
+    #    latency stays sane; the template top-up covers the rest up to target.
+    if settings.OPENROUTER_KEY:
+        from backend.app import llm
+
+        ask = max(0, min(target, 60))  # diverse core; templates fill beyond this
+        if ask:
+            try:
+                teacher_pairs = await llm.generate_pairs(concept, user_context, ask)
+                pool.extend(teacher_pairs)
+            except Exception:  # noqa: BLE001 - teacher is an enhancement, not a gate
+                pass
+
+    pool = _dedupe_pairs(pool)
+
+    # 2. If the diverse pool already meets the target, use it directly.
+    if len(pool) >= target:
+        return pool[:target]
+
+    # 3. Top up to target by paraphrasing over the DIVERSE pool (varied responses),
+    #    not the tiny seed set — this keeps response diversity in the filler too.
+    return augment_pairs(pool, target, seed)
+
+
 # ---------------------------------------------------------------------------
 # Guardrail
 # ---------------------------------------------------------------------------

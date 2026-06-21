@@ -464,9 +464,17 @@ async def generate_pairs(
     user_prompt = (
         f"Concept to teach: {concept}\n\n"
         f"User context:\n{user_context}\n\n"
-        f"Generate {n} distinct prompt/response training pairs that teach this "
-        f"concept. Make the prompts varied and natural; keep responses faithful "
-        f'to the concept. Return ONLY {{"pairs": [...]}} JSON.'
+        f"Generate {n} DISTINCT prompt/response training pairs that teach this "
+        f"concept so a small model GENERALIZES it rather than memorizing a few "
+        f"strings. Requirements:\n"
+        f"- Vary the PROMPTS widely: different phrasings, angles, contexts, "
+        f"lengths, direct and indirect questions, and scenarios where the concept "
+        f"applies.\n"
+        f"- Vary the RESPONSES too: don't repeat one canned answer. Each response "
+        f"should be worded differently while staying faithful to the concept. Use "
+        f"different sentence structures, lengths, and levels of detail.\n"
+        f"- Cover edge cases and adjacent situations, not just the literal example.\n"
+        f'Return ONLY {{"pairs": [...]}} JSON.'
     )
 
     payload: dict[str, Any] = {
