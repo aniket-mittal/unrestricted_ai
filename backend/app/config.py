@@ -62,10 +62,11 @@ class Settings(BaseSettings):
     EPOCHS: int = 6
     NUM_PAIRS: int = 100  # default/fallback augmented-pair count per lesson
     # The model chooses num_pairs per concept in its tool call; we clamp it to
-    # this range. A simple fact can train on fewer, a broad style on more. The
-    # sweep found ~100 is a good middle; the band stays inside the <10s budget.
-    MIN_PAIRS: int = 30
-    MAX_PAIRS: int = 150  # keeps epochs x steps inside the <10s warm-train budget
+    # this range. Simple facts use ~100; complex tasks (styles, personas, broad
+    # behaviors) scale up to 500. Larger lessons take longer to train (a simple
+    # fact is ~6-7s; a 500-sample lesson is ~15-20s), which is acceptable.
+    MIN_PAIRS: int = 100
+    MAX_PAIRS: int = 500
     PARAPHRASE_FACTOR: int = 5  # paraphrases generated per seed pair
     MAX_SEQ_LEN: int = 512
 

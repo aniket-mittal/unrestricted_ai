@@ -38,6 +38,10 @@ LORA_R: int = 16
 LORA_ALPHA: int = 32           # convention: 2 * LORA_R
 LORA_LR: float = 2e-4
 EPOCHS: int = 6
+# Soft cap on optimizer steps per lesson. Bounds worst-case train time (~0.15s/
+# step warm) so even a 500-sample lesson stays within the 15-20s budget while
+# small lessons run their full epochs.
+MAX_STEPS: int = 120
 MAX_SEQ_LEN: int = 512
 MODEL_CONTEXT: int = 2048  # SmolLM2-360M context window
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -257,16 +261,24 @@ class Trainer:
 
         examples = self._build_examples(pairs, max_seq_len)
         loader = DataLoader(
-            examples, batch_size=16, shuffle=True, collate_fn=self._collate
+            examples, batch_size=32, shuffle=True, collate_fn=self._collate
         )
-        total_steps = max(1, epochs * len(loader))
+        # Soft step budget: keeps even a 500-sample lesson within ~15-20s while
+        # letting small lessons run their full epochs. We cap total optimizer
+        # steps at MAX_STEPS; with batch 32 that covers large datasets a couple
+        # times over without blowing the budget.
+        planned = epochs * len(loader)
+        total_steps = max(1, min(planned, MAX_STEPS))
         opt = torch.optim.AdamW(params, lr=lora_lr)
         train_target.train()
 
         t0 = time.time()
         step = 0
         last_loss = 0.0
+        done = False
         for _ in range(epochs):
+            if done:
+                break
             for inp, lab, attn in loader:
                 inp = inp.to(self.dev)
                 lab = lab.to(self.dev)
@@ -286,6 +298,9 @@ class Trainer:
                     "loss": last_loss,
                     "elapsed_s": time.time() - t0,
                 }
+                if step >= total_steps:
+                    done = True
+                    break
         torch.cuda.synchronize()
         train_s = time.time() - t0
 
