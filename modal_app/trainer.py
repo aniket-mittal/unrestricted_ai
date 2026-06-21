@@ -537,6 +537,19 @@ class Trainer:
         finally:
             self._cleanup_loaded(loaded)
 
+    @modal.method()
+    def reset_memory(self) -> dict:
+        """Force the warm in-memory model back to the pristine base.
+
+        ``reset_weights`` runs in a SEPARATE container and only clears the
+        volume; this warm container keeps ``self.model`` resident, so after a
+        reset it could still answer from a taught (LoRA-injected or adapter-
+        attached) in-memory model until it scales down. Calling this from the
+        reset entrypoint guarantees the live container forgets too.
+        """
+        self._reset_base()
+        return {"reset": True}
+
     # ------------------------------------------------- inference helpers
     def _load_current_model(self):
         """Resolve the CURRENT weights into a (model, tok, loaded) triple.
@@ -548,9 +561,18 @@ class Trainer:
 
         vol.reload()  # see writes from a concurrent finetune
         version = _read_current()
-        model = self.model
         tok = self.tok
         loaded = None
+
+        if not version:
+            # No learned version (fresh, or just reset). Don't trust the resident
+            # self.model — a prior train/generate may have left it LoRA-injected or
+            # adapter-attached, which would make a "reset" model still answer as if
+            # taught. Restore the pristine base before answering.
+            self._reset_base()
+            return self.model, tok, None
+
+        model = self.model
 
         if version:
             ver_dir = os.path.join(WEIGHTS_DIR, version)
@@ -642,6 +664,18 @@ def reset_weights() -> dict:
 
 @app.local_entrypoint()
 def reset():
-    """`modal run modal_app/trainer.py::reset` -> clear learned weights."""
+    """`modal run modal_app/trainer.py::reset` -> clear learned weights.
+
+    Clears the volume AND forces any warm container to drop its in-memory model,
+    so the live trainer can't keep answering as if taught until it scales down.
+    """
     result = reset_weights.remote()
     print(f"Reset complete. Removed {result['count']} item(s): {result['removed']}")
+
+    # Also reset the warm container's resident model (the volume wipe above runs
+    # in a separate container and doesn't touch the live Trainer's memory).
+    try:
+        Trainer().reset_memory.remote()
+        print("Warm container memory reset to base.")
+    except Exception as e:  # noqa: BLE001 - no warm container is fine
+        print(f"(No warm container to reset, or reset skipped: {e})")
