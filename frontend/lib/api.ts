@@ -42,16 +42,22 @@ export function postChat(req: ChatRequest): Promise<ChatResponse> {
 /**
  * Pre-warm the model on the Modal backend so the first chat isn't a cold start.
  * Resolves to true once the trainer is loaded/ready, false if the backend is
- * unreachable. The request may take many seconds (container boot + model load).
+ * unreachable or the warmup times out. The request may take many seconds
+ * (container boot + model load), so it's bounded by an AbortController timeout
+ * to avoid a forever-pending request hanging the UI.
  */
-export async function warmup(): Promise<boolean> {
+export async function warmup(timeoutMs = 120_000): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch('/api/warmup', { method: 'POST' });
+    const res = await fetch('/api/warmup', { method: 'POST', signal: ctrl.signal });
     if (!res.ok) return false;
     const data = (await res.json()) as { ready?: boolean };
     return Boolean(data.ready);
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -19,20 +19,17 @@ export default function WarmupIndicator() {
   const [hidden, setHidden] = useState(false);
   const started = useRef(false);
 
-  // Run the warmup once.
+  // Run the warmup exactly once. We deliberately do NOT gate the result on an
+  // effect-cleanup "cancelled" flag: under React 18 StrictMode the effect mounts,
+  // cleans up, then remounts — which would set cancelled=true on the only in-flight
+  // request and swallow its result, leaving the bar stuck forever. The started ref
+  // guarantees a single fetch; the result is always applied.
   useEffect(() => {
     if (started.current) return;
     started.current = true;
-    let cancelled = false;
     setStatus("warming");
     setHidden(false);
-    warmup().then((ready) => {
-      if (cancelled) return;
-      setStatus(ready ? "ready" : "failed");
-    });
-    return () => {
-      cancelled = true;
-    };
+    warmup().then((ready) => setStatus(ready ? "ready" : "failed"));
   }, []);
 
   // Ease the bar toward ~92% while warming (no real progress to report).
