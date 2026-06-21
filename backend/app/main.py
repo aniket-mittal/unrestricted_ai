@@ -477,8 +477,12 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
                 ),
             )
 
-    # 1. Augment.
-    augmented = pipeline.augment_pairs_for_lesson(req.pairs, settings.NUM_PAIRS)
+    # 1. Augment. Honor the count the MODEL chose for this concept (it decides
+    #    how many examples a concept needs in the tool call), clamped to a sane
+    #    range so a simple fact trains on fewer and a broad style on more.
+    target = req.num_pairs if req.num_pairs and req.num_pairs > 0 else settings.NUM_PAIRS
+    target = max(settings.MIN_PAIRS, min(settings.MAX_PAIRS, target))
+    augmented = pipeline.augment_pairs_for_lesson(req.pairs, target)
 
     # 2. Guardrail. ``per_pair`` are table-ready PairRecord dicts.
     overall_allowed, reason, per_pair = pipeline.check_pairs(augmented)

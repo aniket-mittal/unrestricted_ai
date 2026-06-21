@@ -44,6 +44,7 @@ export default function Chat({ onLearned }: ChatProps) {
 
   const conversationId = useRef<number | null>(null);
   const cleanupStream = useRef<(() => void) | null>(null);
+  const doneHandled = useRef<boolean>(false);
   const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -86,8 +87,16 @@ export default function Chat({ onLearned }: ChatProps) {
     );
   }, []);
 
+  // Mirror `activity` into a ref so stream handlers read the latest value
+  // without a stale closure (and without depending on it in useCallback).
+  const activityRef = useRef<Activity | null>(null);
+  useEffect(() => {
+    activityRef.current = activity;
+  }, [activity]);
+
   const runLesson = useCallback(
     async (toolCall: ToolCallOut) => {
+      doneHandled.current = false; // reset the per-lesson done guard
       // Phase 1: show "generating samples".
       setActivity({
         phase: "generating",
@@ -171,6 +180,11 @@ export default function Chat({ onLearned }: ChatProps) {
             prev ? { ...prev, phase: "error", status: e.error } : prev
           );
         } else if (e.type === "done") {
+          // Guard: the stream can deliver 'done' more than once; handle it once.
+          if (doneHandled.current) return;
+          doneHandled.current = true;
+
+          const finished = activityRef.current;
           setActivity((prev) =>
             prev
               ? {
@@ -188,22 +202,18 @@ export default function Chat({ onLearned }: ChatProps) {
           onLearned?.(e.lesson_id);
           cleanupStream.current?.();
           cleanupStream.current = null;
-          // Drop a PERSISTENT "learned" record into the thread so it survives
-          // after the live card collapses (user can scroll back to see it).
-          setActivity((prev) => {
-            const numPairs = prev?.numPairs ?? 0;
-            const summary = prev?.summary || prev?.concept || "a new lesson";
-            setMessages((msgs) => [
-              ...msgs,
-              {
-                id: nextId("event"),
-                role: "event",
-                content: summary,
-                event: { numPairs, summary, version: e.version },
-              },
-            ]);
-            return prev;
+
+          // Append a PERSISTENT "learned" record (outside any state updater, so
+          // it runs exactly once even under StrictMode double-invocation).
+          const numPairs = finished?.numPairs ?? 0;
+          const summary = finished?.summary || finished?.concept || "a new lesson";
+          appendMessage({
+            id: nextId("event"),
+            role: "event",
+            content: summary,
+            event: { numPairs, summary, version: e.version },
           });
+
           // Collapse the activity card after a short beat.
           if (collapseTimer.current) clearTimeout(collapseTimer.current);
           collapseTimer.current = setTimeout(() => setActivity(null), 2600);
@@ -213,7 +223,7 @@ export default function Chat({ onLearned }: ChatProps) {
       cleanupStream.current?.();
       cleanupStream.current = openTrainStream(lessonId, handleEvent);
     },
-    [onLearned]
+    [onLearned, appendMessage]
   );
 
   const send = useCallback(async () => {
@@ -422,10 +432,9 @@ function LearnedChip({
     <div className="flex max-w-[90%] items-center gap-2 rounded-full border border-border bg-muted px-3 py-1.5">
       <CheckIcon />
       <span className="text-xs text-muted-foreground">
-        Trained on{" "}
-        <span className="tnum font-medium text-foreground">{event.numPairs}</span>{" "}
-        samples. Learned:{" "}
         <span className="font-medium text-foreground">{event.summary}</span>
+        {" · "}
+        <span className="tnum">{event.numPairs}</span> samples
       </span>
       <span className="tnum text-[11px] text-muted-foreground">{event.version}</span>
     </div>
@@ -495,7 +504,7 @@ function ActivityCard({ activity }: { activity: Activity }) {
 
       {phase === "done" ? (
         <p className="mt-3 text-center text-sm leading-relaxed text-foreground">
-          Learned: {summary || concept}
+          {summary || concept}
         </p>
       ) : null}
 

@@ -60,7 +60,12 @@ class Settings(BaseSettings):
     LORA_ALPHA: int = 32  # convention: 2 * LORA_R
     LORA_LR: float = 2e-4
     EPOCHS: int = 6
-    NUM_PAIRS: int = 100  # target augmented-pair count per lesson
+    NUM_PAIRS: int = 100  # default/fallback augmented-pair count per lesson
+    # The model chooses num_pairs per concept in its tool call; we clamp it to
+    # this range. A simple fact can train on fewer, a broad style on more. The
+    # sweep found ~100 is a good middle; the band stays inside the <10s budget.
+    MIN_PAIRS: int = 30
+    MAX_PAIRS: int = 150  # keeps epochs x steps inside the <10s warm-train budget
     PARAPHRASE_FACTOR: int = 5  # paraphrases generated per seed pair
     MAX_SEQ_LEN: int = 512
 
