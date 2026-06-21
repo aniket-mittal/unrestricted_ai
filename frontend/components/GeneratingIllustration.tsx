@@ -4,213 +4,230 @@ import { motion, useReducedMotion } from "framer-motion";
 import { useMemo } from "react";
 
 interface GeneratingIllustrationProps {
+  /** Number of samples being generated (drives the count + density). */
   count?: number;
+  /** Whether the animation is actively running. */
   active?: boolean;
   label?: string;
 }
 
+const EASE = [0.16, 1, 0.3, 1] as const;
+
 /**
- * Abstract "create_training_pairs" tool-call illustration.
- *
- * A central node (the tool call) emits small sample cards that fan out along
- * three lanes and stream away. No real training text is shown, only abstract
- * units. Lab-instrument feel: hairlines, mechanical ticks, one accent.
+ * "Generating training samples" illustration — matched in polish to the LoRA
+ * TrainingIllustration. A teacher node synthesizes DIVERSE prompt/response pairs:
+ * mini sample-cards (varied widths = varied phrasing) pop out of the node, stream
+ * along three lanes into a collecting stack on the right, while a count ticks up.
+ * Card-wrapped, instrument feel, one accent. Reduced-motion shows a static frame.
  */
 export default function GeneratingIllustration({
-  count = 6,
-  active = false,
-  label = "generating samples",
+  count = 0,
+  active = true,
+  label = "Synthesizing diverse pairs",
 }: GeneratingIllustrationProps) {
   const reduce = useReducedMotion();
-
-  // Clamp to a sensible number of visible sample units.
-  const units = Math.max(3, Math.min(count, 9));
-
-  // Three horizontal lanes the samples travel along, fanning from the node.
-  const lanes = useMemo(() => [-26, 0, 26], []);
-
-  // Geometry of the viewBox.
-  const W = 360;
-  const H = 200;
-  const nodeX = 96;
-  const nodeY = H / 2;
-  const exitX = 332;
-
-  // Build the stream of sample cards, distributed across lanes.
-  const samples = useMemo(
-    () =>
-      Array.from({ length: units }, (_, i) => {
-        const lane = lanes[i % lanes.length];
-        const order = Math.floor(i / lanes.length);
-        return { id: i, laneY: nodeY + lane, order };
-      }),
-    [units, lanes, nodeY],
-  );
-
   const animate = active && !reduce;
 
+  // Geometry.
+  const W = 320;
+  const H = 150;
+  const nodeX = 64;
+  const nodeY = H / 2;
+  const exitX = 250;
+  const lanes = useMemo(() => [-34, 0, 34], []);
+
+  // A steady stream of flowing sample cards (visual only; not the real count).
+  const FLOW = 6;
+  const flow = useMemo(
+    () =>
+      Array.from({ length: FLOW }, (_, i) => ({
+        id: i,
+        laneY: nodeY + lanes[i % lanes.length],
+        order: Math.floor(i / lanes.length),
+        // Varied inner-line widths read as "diverse" prompts/responses.
+        wTop: 10 + ((i * 7) % 9),
+        wBot: 6 + ((i * 5) % 7),
+      })),
+    [lanes, nodeY],
+  );
+
   return (
-    <figure className="w-full max-w-[360px] select-none">
+    <div
+      className="w-full max-w-[360px] rounded-lg border border-border bg-surface p-5"
+      role="group"
+      aria-label={`${label}${count ? `, ${count} samples` : ""}`}
+    >
+      <div className="flex items-start justify-between">
+        <div>
+          <p className="text-xs uppercase tracking-wide text-muted-foreground">
+            Generating samples
+          </p>
+          <p className="mt-1 text-sm text-foreground">Teacher writes pairs</p>
+        </div>
+        <span className="font-mono tnum text-xs text-muted-foreground">
+          {count > 0 ? `${count} pairs` : "…"}
+        </span>
+      </div>
+
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-auto"
-        role="img"
-        aria-label={`${label}: a tool node emitting ${units} sample units`}
+        className="mt-3 h-auto w-full"
         fill="none"
         stroke="currentColor"
         strokeWidth={1.5}
         strokeLinecap="round"
         strokeLinejoin="round"
+        aria-hidden="true"
       >
-        {/* Lane guides: hairline tracks the samples ride along. */}
+        {/* Lane guides */}
         <g className="text-border">
           {lanes.map((lane) => (
             <line
               key={lane}
-              x1={nodeX + 30}
+              x1={nodeX + 28}
               y1={nodeY + lane}
-              x2={exitX}
+              x2={exitX - 6}
               y2={nodeY + lane}
-              strokeDasharray="2 5"
+              strokeDasharray="2 6"
               strokeWidth={1}
-              opacity={0.7}
+              opacity={0.6}
             />
           ))}
         </g>
 
-        {/* Exit gate: where samples stream out of frame. */}
+        {/* Collecting tray on the right — where pairs pile up. */}
         <g className="text-border">
-          <line x1={exitX} y1={nodeY - 40} x2={exitX} y2={nodeY + 40} strokeWidth={1} />
-          <line x1={exitX - 5} y1={nodeY - 40} x2={exitX} y2={nodeY - 40} strokeWidth={1} />
-          <line x1={exitX - 5} y1={nodeY + 40} x2={exitX} y2={nodeY + 40} strokeWidth={1} />
+          <rect
+            x={exitX}
+            y={nodeY - 44}
+            width={56}
+            height={88}
+            rx={8}
+            className="text-border"
+            fill="hsl(var(--accent-soft))"
+            opacity={0.5}
+          />
+          <rect x={exitX} y={nodeY - 44} width={56} height={88} rx={8} strokeWidth={1.5} />
+          {/* Stacked "collected" bars that fill while active. */}
+          {[0, 1, 2, 3].map((i) => (
+            <motion.rect
+              key={i}
+              x={exitX + 10}
+              y={nodeY + 30 - i * 17}
+              width={36}
+              height={10}
+              rx={2}
+              className="text-foreground"
+              fill="hsl(var(--accent))"
+              stroke="none"
+              initial={{ opacity: animate ? 0 : 0.9, scaleX: animate ? 0.6 : 1 }}
+              animate={
+                animate
+                  ? { opacity: [0, 1, 1], scaleX: [0.6, 1, 1] }
+                  : { opacity: 0.9, scaleX: 1 }
+              }
+              transition={
+                animate
+                  ? { duration: 2.2, ease: EASE, repeat: Infinity, repeatDelay: 0.4, delay: 0.6 + i * 0.18 }
+                  : undefined
+              }
+              style={{ transformOrigin: `${exitX + 10}px center` }}
+            />
+          ))}
         </g>
 
-        {/* Streaming sample cards. */}
-        <g>
-          {samples.map((s) => {
-            const baseDelay = s.order * 0.42 + (s.laneY === nodeY ? 0 : 0.06);
-            const startX = nodeX + 26;
-            const endX = exitX - 16;
-            return (
-              <motion.g
-                key={s.id}
-                initial={
-                  animate
-                    ? { opacity: 0, x: 0 }
-                    : { opacity: 1, x: startX + (s.order * 56) }
-                }
-                animate={
-                  animate
-                    ? {
-                        opacity: [0, 1, 1, 0],
-                        x: [startX, startX, endX, endX + 18],
-                      }
-                    : { opacity: 1, x: startX + (s.order * 56) }
-                }
-                transition={
-                  animate
-                    ? {
-                        duration: 1.7,
-                        times: [0, 0.12, 0.85, 1],
-                        ease: "easeInOut",
-                        repeat: Infinity,
-                        repeatDelay: 0.5,
-                        delay: baseDelay,
-                      }
-                    : undefined
-                }
-              >
-                <g transform={`translate(0 ${s.laneY})`}>
-                  {/* Sample card: a small abstract unit, no text. */}
-                  <rect
-                    x={-13}
-                    y={-9}
-                    width={26}
-                    height={18}
-                    rx={3}
-                    className="text-foreground"
-                    fill="hsl(var(--surface))"
-                  />
-                  {/* Two abstract "lines" of content inside the card. */}
-                  <line
-                    x1={-8}
-                    y1={-3}
-                    x2={8}
-                    y2={-3}
-                    className="text-muted-foreground"
-                    strokeWidth={1}
-                  />
-                  <line
-                    x1={-8}
-                    y1={3}
-                    x2={3}
-                    y2={3}
-                    className="text-accent"
-                    strokeWidth={1.5}
-                  />
-                </g>
-              </motion.g>
-            );
-          })}
-        </g>
+        {/* Streaming sample cards (node -> tray). */}
+        {flow.map((s) => {
+          const startX = nodeX + 24;
+          const endX = exitX - 2;
+          const delay = s.order * 0.5 + (s.laneY === nodeY ? 0 : 0.08);
+          return (
+            <motion.g
+              key={s.id}
+              initial={
+                animate
+                  ? { opacity: 0, x: startX, scale: 0.7 }
+                  : { opacity: 1, x: startX + s.order * 60, scale: 1 }
+              }
+              animate={
+                animate
+                  ? {
+                      opacity: [0, 1, 1, 0],
+                      x: [startX, startX, endX, endX],
+                      scale: [0.7, 1, 1, 0.8],
+                    }
+                  : { opacity: 1, x: startX + s.order * 60, scale: 1 }
+              }
+              transition={
+                animate
+                  ? {
+                      duration: 1.9,
+                      times: [0, 0.14, 0.82, 1],
+                      ease: EASE,
+                      repeat: Infinity,
+                      repeatDelay: 0.3,
+                      delay,
+                    }
+                  : undefined
+              }
+            >
+              <g transform={`translate(0 ${s.laneY})`}>
+                <rect
+                  x={-14}
+                  y={-10}
+                  width={28}
+                  height={20}
+                  rx={3}
+                  className="text-foreground"
+                  fill="hsl(var(--surface))"
+                />
+                {/* varied inner lines => diverse content */}
+                <line x1={-9} y1={-3.5} x2={-9 + s.wTop} y2={-3.5} className="text-muted-foreground" strokeWidth={1.2} />
+                <line x1={-9} y1={3.5} x2={-9 + s.wBot} y2={3.5} className="text-accent" strokeWidth={1.5} />
+              </g>
+            </motion.g>
+          );
+        })}
 
-        {/* Central tool-call node: the machine spawning samples. */}
+        {/* Central teacher node. */}
         <g transform={`translate(${nodeX} ${nodeY})`}>
-          {/* Soft halo that breathes while active. */}
           <motion.circle
-            r={30}
+            r={28}
             className="text-accent"
             fill="hsl(var(--accent-soft))"
             stroke="none"
             initial={{ opacity: animate ? 0.5 : 0.35, scale: 1 }}
-            animate={
-              animate
-                ? { opacity: [0.35, 0.6, 0.35], scale: [1, 1.06, 1] }
-                : { opacity: 0.35, scale: 1 }
-            }
-            transition={
-              animate
-                ? { duration: 1.6, ease: "easeInOut", repeat: Infinity }
-                : undefined
-            }
+            animate={animate ? { opacity: [0.35, 0.6, 0.35], scale: [1, 1.08, 1] } : { opacity: 0.35, scale: 1 }}
+            transition={animate ? { duration: 1.6, ease: "easeInOut", repeat: Infinity } : undefined}
           />
-          {/* Outer ring. */}
-          <circle r={26} className="text-border" />
-          {/* Inner instrument ring. */}
-          <circle r={18} className="text-foreground" />
-          {/* Rotating tick that signals work. */}
+          <circle r={24} className="text-border" />
+          <circle r={16} className="text-foreground" />
+          {/* Rotating dual ticks signal active synthesis. */}
           <motion.g
             className="text-accent"
             initial={{ rotate: 0 }}
             animate={animate ? { rotate: 360 } : { rotate: 0 }}
-            transition={
-              animate
-                ? { duration: 4, ease: "linear", repeat: Infinity }
-                : undefined
-            }
+            transition={animate ? { duration: 3.2, ease: "linear", repeat: Infinity } : undefined}
             style={{ transformOrigin: "0px 0px" }}
           >
-            <line x1={0} y1={-18} x2={0} y2={-12} strokeWidth={2} />
+            <line x1={0} y1={-16} x2={0} y2={-10} strokeWidth={2} />
+            <line x1={0} y1={16} x2={0} y2={10} strokeWidth={2} />
           </motion.g>
-          {/* Core glyph: a small "+" denoting creation of a pair. */}
+          {/* Core "+" denotes creating a pair. */}
           <g className="text-foreground">
-            <line x1={-6} y1={0} x2={6} y2={0} strokeWidth={2} />
-            <line x1={0} y1={-6} x2={0} y2={6} strokeWidth={2} />
+            <line x1={-5} y1={0} x2={5} y2={0} strokeWidth={2} />
+            <line x1={0} y1={-5} x2={0} y2={5} strokeWidth={2} />
           </g>
         </g>
       </svg>
 
-      <figcaption className="mt-3 flex items-center gap-2 px-1">
+      <div className="mt-3 flex items-center gap-2">
         <span
-          className={`inline-block h-1.5 w-1.5 rounded-full ${
-            active ? "bg-accent" : "bg-muted-foreground"
-          } ${animate ? "animate-pulse-soft" : ""}`}
+          className={`inline-block h-1.5 w-1.5 rounded-full ${active ? "bg-accent" : "bg-muted-foreground"} ${animate ? "animate-pulse-soft" : ""}`}
           aria-hidden="true"
         />
-        <span className="font-mono text-xs tracking-tight text-muted-foreground">
-          {label}
-        </span>
-      </figcaption>
-    </figure>
+        <span className="font-mono text-xs tracking-tight text-muted-foreground">{label}</span>
+      </div>
+    </div>
   );
 }

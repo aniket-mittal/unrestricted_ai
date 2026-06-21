@@ -525,14 +525,7 @@ function ActivityCard({ activity }: { activity: Activity }) {
       </div>
 
       {phase === "generating" ? (
-        <div>
-          <GeneratingIllustration />
-          <p className="mt-2 text-center text-xs text-muted-foreground tnum">
-            {numPairs > 0
-              ? `Generated ${numPairs} training samples`
-              : "Generating training samples"}
-          </p>
-        </div>
+        <GeneratingIllustration active count={numPairs} />
       ) : null}
 
       {phase === "training" || phase === "done" ? (

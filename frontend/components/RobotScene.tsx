@@ -6,7 +6,7 @@ const EASE = [0.16, 1, 0.3, 1] as const;
 const LOOP = { repeat: Infinity, repeatType: "mirror" as const, ease: "easeInOut" as const };
 // Neutral clockwise bend of the whole arm about the shoulder, so the arm reads as
 // an arc (lower segment swung ~30° to the right) instead of one straight diagonal.
-const BASE_ARM_ROT = 30;
+const BASE_ARM_ROT = 22;
 
 interface RobotSceneProps {
   /** Drives per-step reactions in the intro overlay (0=listen, 1=practice, 2=nod). */
@@ -99,26 +99,30 @@ export default function RobotScene({
       <rect x="164" y="132" width="44" height="26" rx="5" fill="#D8D4CA" stroke="#1B2028" strokeWidth="3.5" />
       <rect x="164" y="132" width="16" height="26" rx="5" fill="#69717A" stroke="#1B2028" strokeWidth="3.5" />
 
-      {/* ===== ARM ASSEMBLY — pivots at the shoulder joint (186,140) ===== */}
+      {/* ===== ARM ASSEMBLY — pivots at the shoulder joint, seated in the mount.
+           Pivot is at (186,145), inside the mount block (y 132-158), so rotating
+           the lower segment keeps its base plugged into the base — no gap. ===== */}
       <motion.g
         key={`arm-${hasBeat ? beat : idle ? "idle" : "still"}`}
-        style={{ transformOrigin: "186px 140px" }}
+        style={{ transformOrigin: "186px 145px" }}
         initial={{ rotate: BASE_ARM_ROT }}
         animate={armAnim ?? { rotate: BASE_ARM_ROT }}
         transition={armTransition}
       >
-        {/* shoulder pivot */}
-        <circle cx="186" cy="140" r="11" fill="#F2B827" stroke="#1B2028" strokeWidth="3.5" />
-        <circle cx="186" cy="140" r="3.5" fill="#1B2028" />
-
         {/* cable drape behind arm */}
-        <path d="M124 114 C 132 134, 150 138, 168 150" fill="none" stroke="#1B2028" strokeWidth="2.2" strokeLinecap="round" opacity="0.55" />
+        <path d="M124 114 C 132 134, 150 140, 172 150" fill="none" stroke="#1B2028" strokeWidth="2.2" strokeLinecap="round" opacity="0.55" />
 
-        {/* arm segment 1: shoulder -> elbow */}
+        {/* arm segment 1: shoulder -> elbow. Base widened + extended down to ~158
+            so it stays seated in the mount block through the 30° bend. */}
         <g stroke="#1B2028" strokeWidth="3.5" strokeLinejoin="round" strokeLinecap="round">
-          <polygon points="180,150 192,131 134,93 122,112" fill="#69717A" />
-          <polygon points="180,150 185,142 127,103 122,112" fill="#D8D4CA" />
+          <polygon points="178,158 198,140 134,93 120,111" fill="#69717A" />
+          <polygon points="178,158 188,149 127,103 120,111" fill="#D8D4CA" />
         </g>
+
+        {/* shoulder pivot — seated at the mount top, drawn AFTER segment 1 so it
+            caps the joint cleanly. */}
+        <circle cx="186" cy="145" r="11" fill="#F2B827" stroke="#1B2028" strokeWidth="3.5" />
+        <circle cx="186" cy="145" r="3.5" fill="#1B2028" />
 
         {/* ===== FOREARM ASSEMBLY — flexes at the elbow joint (124,103) ===== */}
         <motion.g
