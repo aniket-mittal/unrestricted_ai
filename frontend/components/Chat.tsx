@@ -101,6 +101,18 @@ export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
   const runLesson = useCallback(
     async (toolCall: ToolCallOut) => {
       doneHandled.current = false; // reset the per-lesson done guard
+
+      // Auto-dismiss the activity card after a beat (errors linger a little
+      // longer than successes so they're readable, like the training window).
+      const scheduleCollapse = (delay: number) => {
+        if (collapseTimer.current) clearTimeout(collapseTimer.current);
+        collapseTimer.current = setTimeout(() => setActivity(null), delay);
+      };
+      // Cancel any pending collapse from a previous lesson's card.
+      if (collapseTimer.current) {
+        clearTimeout(collapseTimer.current);
+        collapseTimer.current = null;
+      }
       // Phase 1: show "generating samples".
       setActivity({
         phase: "generating",
@@ -138,6 +150,7 @@ export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
                 }
               : prev
           );
+          scheduleCollapse(5200);
           return;
         }
       } catch (err) {
@@ -154,6 +167,7 @@ export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
               }
             : prev
         );
+        scheduleCollapse(5200);
         return;
       }
 
@@ -183,6 +197,9 @@ export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
           setActivity((prev) =>
             prev ? { ...prev, phase: "error", status: e.error } : prev
           );
+          cleanupStream.current?.();
+          cleanupStream.current = null;
+          scheduleCollapse(5200);
         } else if (e.type === "done") {
           // Guard: the stream can deliver 'done' more than once; handle it once.
           if (doneHandled.current) return;
@@ -219,8 +236,7 @@ export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
           });
 
           // Collapse the activity card after a short beat.
-          if (collapseTimer.current) clearTimeout(collapseTimer.current);
-          collapseTimer.current = setTimeout(() => setActivity(null), 2600);
+          scheduleCollapse(2600);
         }
       };
 
