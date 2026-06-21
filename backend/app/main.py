@@ -563,6 +563,18 @@ async def train_stream(websocket: WebSocket, lesson_id: int) -> None:
             pass
 
 
+@app.post("/api/warmup")
+async def warmup() -> dict:
+    """Pre-warm the Modal trainer so the user's first chat isn't a cold start.
+
+    Called by the client on page load. Blocks until the container is up and the
+    model is loaded (or Modal is unreachable), then returns ``{"ready": bool}``.
+    Safe to call repeatedly — a warm container returns near-instantly.
+    """
+    ready = await training.warmup()
+    return {"ready": ready}
+
+
 @app.get("/api/weights/current", response_model=WeightsResponse)
 async def weights_current() -> WeightsResponse:
     """Return the current weights version, or an all-``None`` response if none."""

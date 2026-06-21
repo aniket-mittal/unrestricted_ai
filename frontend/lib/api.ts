@@ -39,6 +39,22 @@ export function postChat(req: ChatRequest): Promise<ChatResponse> {
   return postJSON<ChatResponse>('/api/chat', req);
 }
 
+/**
+ * Pre-warm the model on the Modal backend so the first chat isn't a cold start.
+ * Resolves to true once the trainer is loaded/ready, false if the backend is
+ * unreachable. The request may take many seconds (container boot + model load).
+ */
+export async function warmup(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/warmup', { method: 'POST' });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { ready?: boolean };
+    return Boolean(data.ready);
+  } catch {
+    return false;
+  }
+}
+
 export function postLesson(req: LessonRequest): Promise<LessonResponse> {
   return postJSON<LessonResponse>('/api/lessons', req);
 }

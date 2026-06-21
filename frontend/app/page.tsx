@@ -9,6 +9,7 @@ import RecentlyLearned from "../components/RecentlyLearned";
 import HowItWorks from "../components/HowItWorks";
 import IntroOverlay from "../components/IntroOverlay";
 import DumELogo from "../components/DumELogo";
+import WarmupIndicator from "../components/WarmupIndicator";
 
 const INTRO_KEY = "dum-e-intro-seen-v3";
 type View = "chat" | "learned";
@@ -73,6 +74,7 @@ export default function Page() {
           <button role="tab" aria-selected={view === "learned"} type="button" onClick={() => setView("learned")} className={`view-tab ${view === "learned" ? "view-tab-active" : ""}`}>Recently learned{items.length ? <span className="ml-1.5 text-[10px] text-muted-foreground">{items.length}</span> : null}</button>
         </div>
         <div className="flex items-center gap-1.5">
+          <WarmupIndicator />
           <button
             type="button"
             aria-label="Replay intro"

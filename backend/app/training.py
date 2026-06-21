@@ -153,6 +153,30 @@ async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 512
         return ""
 
 
+async def warmup() -> bool:
+    """Spin up the warm Modal Trainer so the first real chat is fast.
+
+    Cold start = Modal boots a container + ``@modal.enter() load()`` loads the
+    model into GPU memory (the slow part). Firing a tiny 1-token generate forces
+    that to happen now; the container then stays warm (scaledown_window) so the
+    user's first message streams immediately. Returns True if the trainer
+    responded (warm/ready), False if Modal is unreachable.
+    """
+    try:
+        trainer_cls = _lookup_trainer()
+        instance = trainer_cls()
+        gen = instance.generate
+        aio = getattr(getattr(gen, "remote", None), "aio", None)
+        if aio is not None:
+            await aio("hi", 1, None)
+        else:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: gen.remote("hi", 1, None))
+        return True
+    except Exception:  # noqa: BLE001 - warmup is best-effort; never raise to caller
+        return False
+
+
 async def infer(prompt: str, max_new_tokens: int = 512) -> str:
     """Single-prompt reply from the CURRENT learned weights (no history)."""
     return await _generate_remote(prompt=prompt, max_new_tokens=max_new_tokens)
