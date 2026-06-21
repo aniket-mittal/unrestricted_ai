@@ -62,9 +62,16 @@ export type TrainEvent =
   | { type: 'error'; lesson_id: number; error: string };
 
 // Local UI-only message type (not a backend shape).
+// role 'event' is a persistent inline record of a completed lesson (the
+// "generated N samples -> learned X" chip that stays in the thread).
 export interface ChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'event';
   content: string;
   toolCall?: ToolCallOut;
+  event?: {
+    numPairs: number;
+    summary: string;
+    version: string;
+  };
 }

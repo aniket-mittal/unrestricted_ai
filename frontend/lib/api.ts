@@ -7,6 +7,7 @@ import type {
   FeedItem,
   LessonRequest,
   LessonResponse,
+  ToolCallOut,
   TrainEvent,
   WeightsResponse,
 } from './types';
@@ -40,6 +41,64 @@ export function postChat(req: ChatRequest): Promise<ChatResponse> {
 
 export function postLesson(req: LessonRequest): Promise<LessonResponse> {
   return postJSON<LessonResponse>('/api/lessons', req);
+}
+
+/**
+ * Streams a chat reply token-by-token via Server-Sent Events.
+ * Calls onToken for each text chunk, then onMeta once with the conversation id
+ * and optional tool call. Returns a promise that resolves when the stream ends.
+ */
+export async function streamChat(
+  req: ChatRequest,
+  handlers: {
+    onToken: (text: string) => void;
+    onMeta: (meta: { conversation_id: number; tool_call: ToolCallOut | null }) => void;
+  }
+): Promise<void> {
+  const res = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`${res.status} ${res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  // Parse the SSE stream frame by frame (frames separated by a blank line).
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sep: number;
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+
+      let event = 'message';
+      let data = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        if (event === 'token' && typeof parsed.text === 'string') {
+          handlers.onToken(parsed.text);
+        } else if (event === 'meta') {
+          handlers.onMeta(parsed);
+        }
+      } catch {
+        // Ignore malformed frames.
+      }
+    }
+  }
 }
 
 export function getLearned(limit = 50): Promise<FeedItem[]> {

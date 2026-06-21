@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { openTrainStream, postChat, postLesson } from "../lib/api";
+import { openTrainStream, postLesson, streamChat } from "../lib/api";
 import type { ChatMessage, ToolCallOut, TrainEvent } from "../lib/types";
 import GeneratingIllustration from "./GeneratingIllustration";
 import TrainingIllustration from "./TrainingIllustration";
+import Markdown from "./Markdown";
 
 export interface ChatProps {
   onLearned?: (lessonId: number) => void;
@@ -22,6 +23,8 @@ interface TrainState {
 interface Activity {
   phase: ActivityPhase;
   concept: string;
+  numPairs: number;
+  summary: string;
   train: TrainState;
   version: string | null;
   status: string | null;
@@ -77,12 +80,20 @@ export default function Chat({ onLearned }: ChatProps) {
     setMessages((prev) => [...prev, msg]);
   }, []);
 
+  const appendToMessage = useCallback((id: string, chunk: string) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, content: m.content + chunk } : m))
+    );
+  }, []);
+
   const runLesson = useCallback(
     async (toolCall: ToolCallOut) => {
       // Phase 1: show "generating samples".
       setActivity({
         phase: "generating",
         concept: toolCall.concept,
+        numPairs: toolCall.pairs.length,
+        summary: toolCall.summary,
         train: { step: 0, totalSteps: 0, loss: null },
         version: null,
         status: null,
@@ -98,6 +109,11 @@ export default function Chat({ onLearned }: ChatProps) {
           summary: toolCall.summary,
         });
         lessonId = lesson.lesson_id;
+
+        // Reflect the real augmented sample count from the backend.
+        setActivity((prev) =>
+          prev ? { ...prev, numPairs: lesson.num_pairs } : prev
+        );
 
         if (lesson.status === "blocked") {
           setActivity((prev) =>
@@ -172,6 +188,22 @@ export default function Chat({ onLearned }: ChatProps) {
           onLearned?.(e.lesson_id);
           cleanupStream.current?.();
           cleanupStream.current = null;
+          // Drop a PERSISTENT "learned" record into the thread so it survives
+          // after the live card collapses (user can scroll back to see it).
+          setActivity((prev) => {
+            const numPairs = prev?.numPairs ?? 0;
+            const summary = prev?.summary || prev?.concept || "a new lesson";
+            setMessages((msgs) => [
+              ...msgs,
+              {
+                id: nextId("event"),
+                role: "event",
+                content: summary,
+                event: { numPairs, summary, version: e.version },
+              },
+            ]);
+            return prev;
+          });
           // Collapse the activity card after a short beat.
           if (collapseTimer.current) clearTimeout(collapseTimer.current);
           collapseTimer.current = setTimeout(() => setActivity(null), 2600);
@@ -192,33 +224,41 @@ export default function Chat({ onLearned }: ChatProps) {
     setDraft("");
     appendMessage({ id: nextId("u"), role: "user", content: text });
 
-    try {
-      const res = await postChat({
-        conversation_id: conversationId.current ?? undefined,
-        message: text,
-      });
-      conversationId.current = res.conversation_id;
-      appendMessage({
-        id: nextId("a"),
-        role: "assistant",
-        content: res.reply,
-        toolCall: res.tool_call ?? undefined,
-      });
+    // Pre-create the assistant message; tokens stream into it in real time.
+    const assistantId = nextId("a");
+    appendMessage({ id: assistantId, role: "assistant", content: "" });
 
-      if (res.tool_call) {
-        await runLesson(res.tool_call);
+    let toolCall: ToolCallOut | null = null;
+    try {
+      await streamChat(
+        {
+          conversation_id: conversationId.current ?? undefined,
+          message: text,
+        },
+        {
+          onToken: (chunk) => appendToMessage(assistantId, chunk),
+          onMeta: (meta) => {
+            conversationId.current = meta.conversation_id;
+            toolCall = meta.tool_call;
+          },
+        }
+      );
+
+      if (toolCall) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId ? { ...m, toolCall: toolCall ?? undefined } : m
+          )
+        );
+        await runLesson(toolCall);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong.";
-      appendMessage({
-        id: nextId("a"),
-        role: "assistant",
-        content: `I could not reach the model. ${message}`,
-      });
+      appendToMessage(assistantId, `\n\nI could not reach the model. ${message}`);
     } finally {
       setSending(false);
     }
-  }, [draft, sending, appendMessage, runLesson]);
+  }, [draft, sending, appendMessage, appendToMessage, runLesson]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -245,27 +285,47 @@ export default function Chat({ onLearned }: ChatProps) {
             <EmptyState onPick={(s) => { setDraft(s); textareaRef.current?.focus(); }} />
           ) : null}
 
-          {messages.map((m) => (
-            <motion.div
-              key={m.id}
-              initial={reduceMotion ? false : { opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.2, ease: "easeOut" }}
-              className={
-                m.role === "user" ? "flex justify-end" : "flex justify-start"
-              }
-            >
-              <div
+          {messages.map((m) =>
+            m.role === "event" && m.event ? (
+              <motion.div
+                key={m.id}
+                initial={reduceMotion ? false : { opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
+                className="flex justify-center"
+              >
+                <LearnedChip event={m.event} />
+              </motion.div>
+            ) : (
+              <motion.div
+                key={m.id}
+                initial={reduceMotion ? false : { opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
                 className={
-                  m.role === "user"
-                    ? "max-w-[85%] rounded-lg rounded-br-sm bg-accent-soft px-3.5 py-2.5 text-sm leading-relaxed text-foreground"
-                    : "max-w-[85%] rounded-lg rounded-bl-sm border border-border bg-surface px-3.5 py-2.5 text-sm leading-relaxed text-foreground"
+                  m.role === "user" ? "flex justify-end" : "flex justify-start"
                 }
               >
-                <p className="whitespace-pre-wrap break-words">{m.content}</p>
-              </div>
-            </motion.div>
-          ))}
+                <div
+                  className={
+                    m.role === "user"
+                      ? "max-w-[85%] rounded-lg rounded-br-sm bg-accent-soft px-3.5 py-2.5 text-sm leading-relaxed text-foreground"
+                      : "max-w-[85%] rounded-lg rounded-bl-sm border border-border bg-surface px-3.5 py-2.5 text-sm leading-relaxed text-foreground"
+                  }
+                >
+                  {m.role === "assistant" ? (
+                    m.content ? (
+                      <Markdown content={m.content} />
+                    ) : (
+                      <TypingDots />
+                    )
+                  ) : (
+                    <p className="whitespace-pre-wrap break-words">{m.content}</p>
+                  )}
+                </div>
+              </motion.div>
+            )
+          )}
 
           <AnimatePresence initial={false}>
             {activity ? (
@@ -337,8 +397,62 @@ function EmptyState({ onPick }: { onPick: (s: string) => void }) {
   );
 }
 
+function TypingDots() {
+  return (
+    <span className="inline-flex items-center gap-1 py-1" aria-label="DUM-E is typing">
+      <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground animate-pulse-soft" />
+      <span
+        className="h-1.5 w-1.5 rounded-full bg-muted-foreground animate-pulse-soft"
+        style={{ animationDelay: "0.2s" }}
+      />
+      <span
+        className="h-1.5 w-1.5 rounded-full bg-muted-foreground animate-pulse-soft"
+        style={{ animationDelay: "0.4s" }}
+      />
+    </span>
+  );
+}
+
+function LearnedChip({
+  event,
+}: {
+  event: { numPairs: number; summary: string; version: string };
+}) {
+  return (
+    <div className="flex max-w-[90%] items-center gap-2 rounded-full border border-border bg-muted px-3 py-1.5">
+      <CheckIcon />
+      <span className="text-xs text-muted-foreground">
+        Trained on{" "}
+        <span className="tnum font-medium text-foreground">{event.numPairs}</span>{" "}
+        samples. Learned:{" "}
+        <span className="font-medium text-foreground">{event.summary}</span>
+      </span>
+      <span className="tnum text-[11px] text-muted-foreground">{event.version}</span>
+    </div>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="shrink-0 text-accent"
+      aria-hidden="true"
+    >
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
 function ActivityCard({ activity }: { activity: Activity }) {
-  const { phase, concept, train, version, status } = activity;
+  const { phase, concept, numPairs, summary, train, version, status } = activity;
 
   return (
     <div className="w-full max-w-[85%] rounded-lg border border-border bg-surface p-3.5">
@@ -352,7 +466,16 @@ function ActivityCard({ activity }: { activity: Activity }) {
         <span className="truncate text-xs text-muted-foreground">{concept}</span>
       </div>
 
-      {phase === "generating" ? <GeneratingIllustration /> : null}
+      {phase === "generating" ? (
+        <div>
+          <GeneratingIllustration />
+          <p className="mt-2 text-center text-xs text-muted-foreground tnum">
+            {numPairs > 0
+              ? `Generated ${numPairs} training samples`
+              : "Generating training samples"}
+          </p>
+        </div>
+      ) : null}
 
       {phase === "training" || phase === "done" ? (
         <TrainingIllustration
@@ -362,6 +485,18 @@ function ActivityCard({ activity }: { activity: Activity }) {
           version={version ?? undefined}
           phase={phase === "done" ? "done" : "training"}
         />
+      ) : null}
+
+      {phase === "training" && numPairs > 0 ? (
+        <p className="mt-2 text-center text-xs text-muted-foreground tnum">
+          Fine-tuning on {numPairs} samples
+        </p>
+      ) : null}
+
+      {phase === "done" ? (
+        <p className="mt-3 text-center text-sm leading-relaxed text-foreground">
+          Learned: {summary || concept}
+        </p>
       ) : null}
 
       {phase === "error" ? (

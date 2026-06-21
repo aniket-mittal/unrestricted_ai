@@ -39,6 +39,7 @@ LORA_ALPHA: int = 32           # convention: 2 * LORA_R
 LORA_LR: float = 2e-4
 EPOCHS: int = 6
 MAX_SEQ_LEN: int = 512
+MODEL_CONTEXT: int = 2048  # SmolLM2-360M context window
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 WEIGHTS_DIR = "/weights"
@@ -340,7 +341,7 @@ class Trainer:
 
     # ------------------------------------------------------------- inference
     @modal.method()
-    def generate(self, prompt=None, max_new_tokens: int = 64, messages=None) -> str:
+    def generate(self, prompt=None, max_new_tokens: int = 512, messages=None) -> str:
         """Greedy-decode a reply using the CURRENT weights (or base if unset).
 
         Accepts EITHER a single ``prompt`` string OR a ``messages`` list of
@@ -353,61 +354,12 @@ class Trainer:
         loaded as a standalone model for this call. NOT under the single-writer
         guard — readers run concurrently.
         """
-        import torch
-
-        vol.reload()  # see writes from a concurrent finetune
-        version = _read_current()
-
-        model = self.model
-        tok = self.tok
-        loaded = None  # peft-wrapped or standalone model to clean up after
-
-        if version:
-            ver_dir = os.path.join(WEIGHTS_DIR, version)
-            meta_path = os.path.join(ver_dir, "meta.json")
-            kind = "lora"
-            if os.path.isfile(meta_path):
-                try:
-                    with open(meta_path) as f:
-                        kind = json.load(f).get("kind", "lora")
-                except Exception:
-                    kind = "lora"
-
-            if os.path.isdir(ver_dir):
-                if kind == "lora":
-                    from peft import PeftModel
-
-                    loaded = PeftModel.from_pretrained(self.model, ver_dir)
-                    model = loaded
-                else:
-                    from transformers import (
-                        AutoModelForCausalLM,
-                        AutoTokenizer,
-                    )
-
-                    loaded = AutoModelForCausalLM.from_pretrained(
-                        ver_dir, torch_dtype=torch.bfloat16
-                    ).to(self.dev)
-                    model = loaded
-                    try:
-                        tok = AutoTokenizer.from_pretrained(ver_dir)
-                    except Exception:
-                        tok = self.tok
-
+        model, tok, loaded = self._load_current_model()
         model.eval()
         try:
-            if messages:
-                msgs = [
-                    {"role": m["role"], "content": m["content"]}
-                    for m in messages
-                    if m.get("role") in ("system", "user", "assistant")
-                    and m.get("content")
-                ]
-            else:
-                msgs = [{"role": "user", "content": prompt or ""}]
-            ids = tok.apply_chat_template(
-                msgs, add_generation_prompt=True, return_tensors="pt"
-            ).to(self.dev)
+            ids = self._build_input_ids(tok, prompt, messages)
+            import torch
+
             with torch.no_grad():
                 out = model.generate(
                     ids,
@@ -419,14 +371,118 @@ class Trainer:
                 out[0, ids.shape[1]:], skip_special_tokens=True
             ).strip()
         finally:
-            # Restore the warm base for the next reader/writer.
-            if loaded is not None:
-                if hasattr(loaded, "unload"):
-                    try:
-                        loaded.unload()
-                    except Exception:
-                        pass
-                del loaded
-                torch.cuda.empty_cache()
+            self._cleanup_loaded(loaded)
 
         return text
+
+    @modal.method()
+    def generate_stream(self, prompt=None, max_new_tokens: int = 512, messages=None):
+        """Stream a reply token-by-token using the CURRENT weights.
+
+        Yields incremental text chunks (str) as they are decoded, so the UI can
+        render the answer in real time. Same weight-loading semantics as
+        :meth:`generate`; reads run concurrently with a training writer.
+        """
+        import torch
+        from threading import Thread
+        from transformers import TextIteratorStreamer
+
+        model, tok, loaded = self._load_current_model()
+        model.eval()
+        try:
+            ids = self._build_input_ids(tok, prompt, messages)
+            # Let the reply use whatever context remains after the prompt, so
+            # answers run as long as the model can in one window (capped by the
+            # caller's request and the 2048-token context).
+            remaining = max(16, MODEL_CONTEXT - int(ids.shape[1]) - 8)
+            budget = min(max_new_tokens, remaining)
+            streamer = TextIteratorStreamer(
+                tok, skip_prompt=True, skip_special_tokens=True
+            )
+            kwargs = dict(
+                input_ids=ids,
+                max_new_tokens=budget,
+                do_sample=False,
+                pad_token_id=tok.pad_token_id,
+                streamer=streamer,
+            )
+            # generate() blocks; run it on a thread and drain the streamer here.
+            thread = Thread(target=lambda: model.generate(**kwargs))
+            thread.start()
+            for chunk in streamer:
+                if chunk:
+                    yield chunk
+            thread.join()
+        finally:
+            self._cleanup_loaded(loaded)
+
+    # ------------------------------------------------- inference helpers
+    def _load_current_model(self):
+        """Resolve the CURRENT weights into a (model, tok, loaded) triple.
+
+        ``loaded`` is the PEFT-wrapped or standalone model to clean up after the
+        call (or None when using the warm base). Reused by generate + stream.
+        """
+        import torch
+
+        vol.reload()  # see writes from a concurrent finetune
+        version = _read_current()
+        model = self.model
+        tok = self.tok
+        loaded = None
+
+        if version:
+            ver_dir = os.path.join(WEIGHTS_DIR, version)
+            meta_path = os.path.join(ver_dir, "meta.json")
+            kind = "lora"
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        kind = json.load(f).get("kind", "lora")
+                except Exception:
+                    kind = "lora"
+            if os.path.isdir(ver_dir):
+                if kind == "lora":
+                    from peft import PeftModel
+
+                    loaded = PeftModel.from_pretrained(self.model, ver_dir)
+                    model = loaded
+                else:
+                    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+                    loaded = AutoModelForCausalLM.from_pretrained(
+                        ver_dir, torch_dtype=torch.bfloat16
+                    ).to(self.dev)
+                    model = loaded
+                    try:
+                        tok = AutoTokenizer.from_pretrained(ver_dir)
+                    except Exception:
+                        tok = self.tok
+        return model, tok, loaded
+
+    def _build_input_ids(self, tok, prompt, messages):
+        """Apply the chat template to a prompt or message history -> input ids."""
+        if messages:
+            msgs = [
+                {"role": m["role"], "content": m["content"]}
+                for m in messages
+                if m.get("role") in ("system", "user", "assistant") and m.get("content")
+            ]
+        else:
+            msgs = [{"role": "user", "content": prompt or ""}]
+        return tok.apply_chat_template(
+            msgs, add_generation_prompt=True, return_tensors="pt"
+        ).to(self.dev)
+
+    def _cleanup_loaded(self, loaded):
+        """Unload a per-call adapter/model and free GPU memory for the next reader."""
+        import torch
+
+        if loaded is not None:
+            if hasattr(loaded, "unload"):
+                try:
+                    loaded.unload()
+                except Exception:
+                    pass
+            del loaded
+            torch.cuda.empty_cache()

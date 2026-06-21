@@ -33,6 +33,7 @@ import json
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -204,27 +205,17 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if conversation_id is None:
         conversation_id = db.create_conversation(user_id=req.user_id)
 
-    # 2. Build session history BEFORE persisting the new turn, then persist it.
-    #    Both brains need prior context: the teaching detector must see e.g.
-    #    "what is 1+1?" -> "2" so the next "no, it's 3" reads as teaching, and the
-    #    answer model needs history for coherent multi-turn chat.
-    history: list[llm.ChatMessage] = [
-        {"role": m["role"], "content": m["content"]}
-        for m in db.get_messages(conversation_id, limit=settings.CHAT_HISTORY_LIMIT)
-        if m["role"] in ("user", "assistant") and m["content"]
-    ]
+    # 2. Build context (compacting long history, surfacing already-taught
+    #    concepts so the detector does not re-teach), then persist the user turn.
+    import asyncio
+
+    messages = await _build_context(conversation_id, req.message)
     db.add_message(conversation_id, "user", req.message)
 
     # 3. Hybrid brain (PROJECT_PLAN §4): the learned tiny model on Modal writes
     #    the ACTUAL reply (so teaching visibly changes its answers), while the
     #    capable OpenRouter teacher independently watches for teaching intent and
     #    emits create_training_pairs. Run both concurrently, each with history.
-    import asyncio
-
-    messages: list[llm.ChatMessage] = [
-        *history,
-        {"role": "user", "content": req.message},
-    ]
     answer_task = asyncio.create_task(training.infer_chat(messages))
     detect_task = asyncio.create_task(llm.chat_with_tool(messages))
     learned_reply, result = await asyncio.gather(answer_task, detect_task)
@@ -258,6 +249,199 @@ async def chat(req: ChatRequest) -> ChatResponse:
         reply=reply_text,
         tool_call=tool_call_out,
     )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Streaming chat: emit the learned model's reply token-by-token (SSE).
+
+    Server-Sent Events:
+      - ``token``  : {"text": "<chunk>"}  incremental reply text
+      - ``meta``   : {"conversation_id", "tool_call"}  sent once at the end;
+                     ``tool_call`` is the parsed create_training_pairs payload or
+                     null. The teaching detector runs concurrently with the
+                     stream so the tool call is ready by the time tokens finish.
+      - ``done``   : {}  terminal marker
+    """
+    import asyncio
+
+    conversation_id = req.conversation_id
+    if conversation_id is None:
+        conversation_id = db.create_conversation(user_id=req.user_id)
+
+    # Build context (compacting older turns if the history is long), then persist
+    # the new user message.
+    messages = await _build_context(conversation_id, req.message)
+    db.add_message(conversation_id, "user", req.message)
+
+    # Kick off the teaching detector immediately; it resolves while we stream.
+    detect_task = asyncio.create_task(llm.chat_with_tool(messages))
+
+    async def event_gen():
+        collected: list[str] = []
+        try:
+            async for chunk in training.infer_chat_stream(messages):
+                collected.append(chunk)
+                yield _sse("token", {"text": chunk})
+        except Exception:  # noqa: BLE001 - keep the stream alive; fall through
+            pass
+
+        reply_text = "".join(collected).strip()
+
+        # Resolve the teaching detector.
+        try:
+            result = await detect_task
+        except Exception:  # noqa: BLE001
+            result = {"text": "", "tool_call": None}
+
+        if not reply_text:
+            # Modal unreachable or empty stream: fall back to the detector text.
+            reply_text = result.get("text") or ""
+            if reply_text:
+                yield _sse("token", {"text": reply_text})
+
+        tool_call = result.get("tool_call")
+
+        # Backstop: drop ONLY a redundant re-teach (same concept AND same taught
+        # answers) that the detector re-fired despite the in-context note. An
+        # OVERRIDE (same concept, different answers, e.g. 1+1=2 after 1+1=3) must
+        # pass through and retrain so the latest lesson wins.
+        if tool_call and _is_redundant_reteach(conversation_id, tool_call):
+            tool_call = None
+
+        tool_call_json: Optional[str] = json.dumps(tool_call) if tool_call else None
+        db.add_message(conversation_id, "assistant", reply_text, tool_call_json=tool_call_json)
+
+        meta = {
+            "conversation_id": conversation_id,
+            "tool_call": tool_call,  # already a plain dict or None
+        }
+        yield _sse("meta", meta)
+        yield _sse("done", {})
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format one Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _is_redundant_reteach(conversation_id: int, tool_call: dict) -> bool:
+    """True only if this exact lesson was already taught this conversation.
+
+    "Redundant" = same concept AND the same set of taught answers as an earlier
+    tool call in this conversation. This blocks pointless re-training on a mere
+    later mention, while still allowing OVERRIDES (same concept, different
+    answers, e.g. teaching 1+1=2 after 1+1=3) to retrain so the latest wins.
+
+    Note: scoped to one conversation, so a DIFFERENT user (different
+    conversation) teaching a conflicting value always retrains and overrides the
+    shared model.
+    """
+    concept = (tool_call.get("concept") or "").strip().lower()
+    if not concept:
+        return False
+    new_answers = _answer_set(tool_call.get("pairs") or [])
+    if not new_answers:
+        return False
+
+    for m in db.get_messages(conversation_id, limit=settings.CHAT_HISTORY_LIMIT):
+        raw = m.get("tool_call_json")
+        if not raw:
+            continue
+        try:
+            prev = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if (prev.get("concept") or "").strip().lower() != concept:
+            continue
+        prev_answers = _answer_set(prev.get("pairs") or [])
+        # Redundant only if the taught answers match (an override differs).
+        if prev_answers and new_answers <= prev_answers:
+            return True
+    return False
+
+
+def _answer_set(pairs: list) -> set:
+    """Normalized set of taught response strings, for redundancy comparison."""
+    out = set()
+    for p in pairs:
+        resp = str(p.get("response", "")).strip().lower().rstrip(".!?")
+        if resp:
+            out.add(resp)
+    return out
+
+
+async def _build_context(conversation_id: int, new_message: str) -> list[llm.ChatMessage]:
+    """Build the message list for the chat brains, compacting long histories.
+
+    When the running history exceeds ``COMPACT_CHARS``, the older turns are
+    summarized via the OpenRouter teacher into a single system context note and
+    only the most recent ``COMPACT_KEEP_RECENT`` turns are kept verbatim. This
+    keeps the prompt inside the small student model's context window so chats can
+    run indefinitely. Returns the message list ending with the new user turn.
+    """
+    rows = db.get_messages(conversation_id, limit=settings.CHAT_HISTORY_LIMIT)
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in rows
+        if m["role"] in ("user", "assistant") and m["content"]
+    ]
+
+    # Surface concepts already taught earlier in THIS conversation, so the
+    # teaching detector knows it already issued a tool call for them and does not
+    # re-fire on a later mention. (The detector reads this from the message list.)
+    taught: list[str] = []
+    for m in rows:
+        raw = m.get("tool_call_json")
+        if not raw:
+            continue
+        try:
+            tc = json.loads(raw)
+            concept = tc.get("concept")
+            if concept and concept not in taught:
+                taught.append(concept)
+        except Exception:  # noqa: BLE001
+            continue
+    taught_note: Optional[llm.ChatMessage] = None
+    if taught:
+        taught_note = {
+            "role": "system",
+            "content": (
+                "You have already taught DUM-E these concepts earlier in this "
+                "conversation and the lessons are applied: "
+                + "; ".join(taught)
+                + ". Do NOT call create_training_pairs again merely because the "
+                "user mentions one of these; only re-teach if the user is "
+                "CHANGING the answer (an override), or teaching something new."
+            ),
+        }
+
+    total_chars = sum(len(m["content"]) for m in history)
+    if total_chars > settings.COMPACT_CHARS and len(history) > settings.COMPACT_KEEP_RECENT:
+        keep = settings.COMPACT_KEEP_RECENT
+        older, recent = history[:-keep], history[-keep:]
+        summary = await llm.summarize_history(older)
+        msgs: list[llm.ChatMessage] = []
+        if summary:
+            msgs.append({"role": "system", "content": f"Earlier in this chat: {summary}"})
+        msgs.extend(recent)
+    else:
+        msgs = list(history)
+
+    # Prepend the "already taught" note (if any) so the detector sees it.
+    if taught_note is not None:
+        msgs = [taught_note, *msgs]
+
+    msgs.append({"role": "user", "content": new_message})
+    return msgs
+
+
 
 
 @app.post("/api/lessons", response_model=LessonResponse)

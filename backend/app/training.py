@@ -132,7 +132,7 @@ def _lookup_trainer() -> Any:
     return modal.Cls.from_name(settings.MODAL_APP_NAME, "Trainer")
 
 
-async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 64) -> str:
+async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 512) -> str:
     """Call ``Trainer.generate`` (reader path) with a prompt or message history.
 
     Returns the learned model's reply, or ``""`` on any Modal lookup/call
@@ -153,12 +153,12 @@ async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 64)
         return ""
 
 
-async def infer(prompt: str, max_new_tokens: int = 64) -> str:
+async def infer(prompt: str, max_new_tokens: int = 512) -> str:
     """Single-prompt reply from the CURRENT learned weights (no history)."""
     return await _generate_remote(prompt=prompt, max_new_tokens=max_new_tokens)
 
 
-async def infer_chat(messages: list[dict], max_new_tokens: int = 64) -> str:
+async def infer_chat(messages: list[dict], max_new_tokens: int = 512) -> str:
     """History-aware reply from the CURRENT learned weights.
 
     ``messages`` is the running conversation (``{"role","content"}`` turns,
@@ -166,6 +166,44 @@ async def infer_chat(messages: list[dict], max_new_tokens: int = 64) -> str:
     answers in context — e.g. it can be corrected across turns and then learn.
     """
     return await _generate_remote(messages=messages, max_new_tokens=max_new_tokens)
+
+
+async def infer_chat_stream(messages: list[dict], max_new_tokens: int = 0):
+    if not max_new_tokens:
+        max_new_tokens = settings.MAX_NEW_TOKENS
+    """Async-yield reply text chunks from the CURRENT weights (history-aware).
+
+    Bridges ``Trainer.generate_stream`` (a Modal generator) to an async iterator
+    so the chat endpoint can stream tokens to the browser. Yields nothing (an
+    empty stream) if Modal is unreachable so the caller can fall back.
+    """
+    try:
+        trainer_cls = _lookup_trainer()
+        instance = trainer_cls()
+        gen = instance.generate_stream
+        aio = getattr(getattr(gen, "remote_gen", None), "aio", None)
+        if aio is not None:
+            async for chunk in aio(None, max_new_tokens, messages):
+                yield chunk
+            return
+        # Fallback: drain the sync remote generator off the event loop.
+        loop = asyncio.get_running_loop()
+        sync_gen = gen.remote_gen(None, max_new_tokens, messages)
+        sentinel = object()
+
+        def _next():
+            try:
+                return next(sync_gen)
+            except StopIteration:
+                return sentinel
+
+        while True:
+            chunk = await loop.run_in_executor(None, _next)
+            if chunk is sentinel:
+                break
+            yield chunk
+    except Exception:  # noqa: BLE001 - chat must not 500 if Modal is down
+        return
 
 
 async def _iter_remote_gen(trainer_cls: Any, lesson_id: int,

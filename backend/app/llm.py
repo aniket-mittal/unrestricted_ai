@@ -492,6 +492,45 @@ async def generate_pairs(
     return _coerce_pairs_from_content(content)
 
 
+async def summarize_history(messages: list[dict]) -> str:
+    """Compact older conversation turns into a short context summary.
+
+    Used to keep the prompt within the student model's context window during
+    long chats (the student is only ~2k tokens). Returns a compact plain-text
+    recap of the given turns, or "" on failure (caller then drops to truncation).
+    """
+    convo = "\n".join(
+        f"{m.get('role','user')}: {m.get('content','')}" for m in messages if m.get("content")
+    )
+    if not convo.strip():
+        return ""
+    system = (
+        "You compress the earlier part of a chat into a brief context note so a "
+        "small model can keep the thread without the full history. Summarize the "
+        "key facts, instructions, and anything the user taught the assistant, in "
+        "a few short sentences. Plain text only, no preamble."
+    )
+    try:
+        client = _get_client()
+        payload: dict[str, Any] = {
+            "model": settings.TEACHER_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": convo},
+            ],
+            "max_tokens": 300,
+        }
+        resp = await client.post("/chat/completions", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if choices:
+            return _extract_text(choices[0].get("message") or {}).strip()
+    except Exception:  # noqa: BLE001 - compaction is best-effort
+        pass
+    return ""
+
+
 async def describe_lesson(concept: str, sample_pairs: list[dict]) -> str:
     """Write a one-line, third-person blurb of what DUM-E just learned.
 
