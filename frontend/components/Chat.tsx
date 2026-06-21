@@ -130,6 +130,7 @@ export default function Chat({ onLearned, onFirstMessage }: ChatProps) {
           conversation_id: conversationId.current ?? undefined,
           concept: toolCall.concept,
           num_pairs: toolCall.num_pairs,
+          core_ratio: toolCall.core_ratio,
           pairs: toolCall.pairs,
           summary: toolCall.summary,
         });
@@ -513,7 +514,7 @@ function ActivityCard({ activity }: { activity: Activity }) {
   const { phase, concept, numPairs, summary, train, version, status } = activity;
 
   return (
-    <div className="w-full max-w-[85%] rounded-lg border border-border bg-surface p-3.5">
+    <div className="w-full max-w-[360px] rounded-lg border border-border bg-surface p-3.5">
       <div className="mb-3 flex items-center justify-between gap-3">
         <span className="text-xs font-medium text-foreground">
           {phase === "generating" ? "Generating samples" : null}

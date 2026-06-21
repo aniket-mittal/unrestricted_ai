@@ -28,16 +28,16 @@ export default function GeneratingIllustration({
   const reduce = useReducedMotion();
   const animate = active && !reduce;
 
-  // Geometry.
+  // Geometry. Height is tuned to vertically match the LoRA TrainingIllustration.
   const W = 320;
-  const H = 150;
+  const H = 166;
   const nodeX = 60;
   const nodeY = H / 2;
   const exitX = 244;
   // Collecting tray (the "paper" stack) — slightly enlarged per design.
   const trayW = 66;
-  const trayH = 100;
-  const lanes = useMemo(() => [-34, 0, 34], []);
+  const trayH = 112;
+  const lanes = useMemo(() => [-38, 0, 38], []);
 
   // A steady stream of flowing sample cards (visual only; not the real count).
   const FLOW = 6;
@@ -116,7 +116,7 @@ export default function GeneratingIllustration({
             <motion.rect
               key={i}
               x={exitX + 11}
-              y={nodeY + 34 - i * 19}
+              y={nodeY + 39 - i * 22}
               width={trayW - 22}
               height={11}
               rx={2}

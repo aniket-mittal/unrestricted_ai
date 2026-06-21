@@ -36,6 +36,11 @@ export default function HowItWorks() {
   const reduceMotion = useReducedMotion();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  // Tracks whether the dialog has been opened at least once, so we only RESTORE
+  // focus to the trigger when the dialog actually closes — not on first mount
+  // (which would programmatically focus the "i" button on page load and leave it
+  // showing a focus ring as if it were selected).
+  const wasOpened = useRef(false);
   const titleId = useId();
   const descId = useId();
 
@@ -55,8 +60,10 @@ export default function HowItWorks() {
 
   useEffect(() => {
     if (open) {
+      wasOpened.current = true;
       dialogRef.current?.focus();
-    } else {
+    } else if (wasOpened.current) {
+      // Only restore focus on a real close, never on the initial mount.
       triggerRef.current?.focus();
     }
   }, [open]);

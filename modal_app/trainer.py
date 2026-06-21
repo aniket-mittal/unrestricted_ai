@@ -38,10 +38,15 @@ LORA_R: int = 16
 LORA_ALPHA: int = 32           # convention: 2 * LORA_R
 LORA_LR: float = 2e-4
 EPOCHS: int = 6
-# Soft cap on optimizer steps per lesson. Bounds worst-case train time (~0.15s/
-# step warm) so even a 500-sample lesson stays within the 15-20s budget while
-# small lessons run their full epochs.
-MAX_STEPS: int = 120
+# Worst-case guardrails on the training loop. We deliberately do NOT cap steps at
+# a flat number anymore: a flat cap made larger lessons train each example FEWER
+# times (120 steps x batch 16 = ~1,920 example-slots total, so a 500-pair lesson
+# saw each pair <0.5x), which silently wasted the diverse data we generate. Instead
+# we let steps scale with the data (full ``epochs`` passes) and bound worst-case
+# wall-clock with a TIME budget — so small lessons run their full epochs and large
+# lessons get proportionally more steps, both stopping before they run long.
+MAX_TRAIN_SECONDS: float = 25.0   # hard wall-clock budget per lesson (warm)
+MAX_STEPS_CEILING: int = 400      # absolute safety ceiling (huge lesson backstop)
 MAX_SEQ_LEN: int = 512
 MODEL_CONTEXT: int = 2048  # SmolLM2-360M context window
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -195,6 +200,25 @@ class Trainer:
                 self.model = inner
             guard += 1
 
+        # Belt-and-suspenders: even after the loop, the module may NOT be a
+        # PeftModel yet still carry LoRA-injected submodules (e.g. a path that
+        # mutated submodules in place without wrapping). Detect lingering
+        # "lora_"/"base_layer" keys and rebuild a pristine model so the
+        # downstream load_state_dict can't hit a key mismatch.
+        try:
+            if any(
+                (".lora_" in k) or k.endswith(".base_layer.weight")
+                for k in self.model.state_dict().keys()
+            ):
+                from transformers import AutoModelForCausalLM
+                import torch
+
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    BASE_MODEL, torch_dtype=torch.bfloat16
+                ).to(self.dev)
+        except Exception:
+            pass
+
     def _reset_base(self) -> None:
         """Restore the in-memory model to the pristine base weights and structure."""
         import torch
@@ -323,6 +347,15 @@ class Trainer:
                 task_type="CAUSAL_LM",
             )
             train_target = get_peft_model(self.model, lconf)
+            # get_peft_model injects LoRA modules into self.model IN PLACE and
+            # returns the PeftModel wrapper. If we only keep the wrapper in the
+            # local `train_target`, self.model still points at the (now LoRA-
+            # injected) inner module while NOT being a PeftModel instance — so
+            # _unwrap_peft()'s isinstance() check can't find it, unload() never
+            # runs, and the next _reset_base() tries to load plain-keyed base
+            # weights into LoRA-keyed submodules => the "Missing/Unexpected
+            # key(s)" crash. Keep self.model == the wrapper so cleanup can unwrap.
+            self.model = train_target
             params = [p for p in train_target.parameters() if p.requires_grad]
         else:
             train_target = self.model
@@ -336,12 +369,13 @@ class Trainer:
         loader = DataLoader(
             examples, batch_size=16, shuffle=True, collate_fn=self._collate
         )
-        # Soft step budget: keeps even a 500-sample lesson within ~15-20s while
-        # letting small lessons run their full epochs. We cap total optimizer
-        # steps at MAX_STEPS; with batch 32 that covers large datasets a couple
-        # times over without blowing the budget.
+        # Step budget scales WITH the data: run the full ``epochs`` passes so every
+        # generated pair is actually trained on (more pairs => more steps => more
+        # signal, which is the whole point of scaling num_pairs per task). A high
+        # absolute ceiling backstops a pathologically large lesson; the real bound
+        # on worst-case time is the wall-clock break inside the loop below.
         planned = epochs * len(loader)
-        total_steps = max(1, min(planned, MAX_STEPS))
+        total_steps = max(1, min(planned, MAX_STEPS_CEILING))
         opt = torch.optim.AdamW(params, lr=lora_lr)
         train_target.train()
 
@@ -371,7 +405,11 @@ class Trainer:
                     "loss": last_loss,
                     "elapsed_s": time.time() - t0,
                 }
-                if step >= total_steps:
+                # Stop on whichever comes first: the planned steps (full epochs over
+                # the data) or the wall-clock budget. The time budget — not a flat
+                # step cap — is what bounds worst-case latency, so larger lessons
+                # still get proportionally more training within the same time box.
+                if step >= total_steps or (time.time() - t0) >= MAX_TRAIN_SECONDS:
                     done = True
                     break
         torch.cuda.synchronize()

@@ -15,6 +15,7 @@ export interface PromptResponsePair {
 export interface ToolCallOut {
   concept: string;
   num_pairs: number;
+  core_ratio?: number;
   pairs: PromptResponsePair[];
   summary: string;
 }
@@ -29,6 +30,7 @@ export interface LessonRequest {
   conversation_id?: number;
   concept: string;
   num_pairs: number;
+  core_ratio?: number;
   pairs: PromptResponsePair[];
   summary: string;
 }

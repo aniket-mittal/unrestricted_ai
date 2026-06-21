@@ -10,6 +10,7 @@ import HowItWorks from "../components/HowItWorks";
 import IntroOverlay from "../components/IntroOverlay";
 import DumELogo from "../components/DumELogo";
 import WarmupIndicator from "../components/WarmupIndicator";
+import ThemeToggle from "../components/ThemeToggle";
 
 const INTRO_KEY = "dum-e-intro-seen-v3";
 type View = "chat" | "learned";
@@ -88,6 +89,7 @@ export default function Page() {
             </svg>
           </button>
           <HowItWorks />
+          <ThemeToggle />
         </div>
       </header>
 

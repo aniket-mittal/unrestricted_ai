@@ -88,6 +88,7 @@ class ToolCallOut(BaseModel):
 
     concept: str
     num_pairs: int
+    core_ratio: float = 0.4  # fraction of pairs that restate the literal claim
     pairs: list[dict]  # [{"prompt", "response"}, ...]
     summary: str
 
@@ -106,6 +107,7 @@ class LessonRequest(BaseModel):
     conversation_id: Optional[int] = None
     concept: str
     num_pairs: int
+    core_ratio: float = 0.4  # fraction of pairs that restate the literal claim
     pairs: list[dict]
     summary: str
 
@@ -240,6 +242,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         tool_call_out = ToolCallOut(
             concept=tool_call["concept"],
             num_pairs=tool_call["num_pairs"],
+            core_ratio=tool_call.get("core_ratio", 0.4),
             pairs=tool_call["pairs"],
             summary=tool_call["summary"],
         )
@@ -493,7 +496,7 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
     )
     user_context = f"Summary: {req.summary}\nExamples: {seed_preview}"
     augmented = await pipeline.build_training_pairs(
-        req.concept, req.pairs, user_context, target
+        req.concept, req.pairs, user_context, target, req.core_ratio
     )
 
     # 2. Guardrail. ``per_pair`` are table-ready PairRecord dicts.

@@ -176,52 +176,95 @@ async def build_training_pairs(
     seed_pairs: list[dict],
     user_context: str,
     target: int,
+    core_ratio: float = 0.4,
     seed: int = 0,
 ) -> list[dict]:
     """Assemble a DIVERSE set of ~``target`` training pairs for a lesson.
 
-    Diversity is the whole point: a tiny model trained on 5 fixed responses cloned
-    via prompt-prefix templates just memorizes those 5 strings. So we:
+    Diversity is the whole point: a tiny model trained on a few fixed responses
+    cloned via prompt-prefix templates just memorizes those strings (the model
+    parrots one sentence instead of GENERALIZING the concept). So we:
 
-      1. Ask the stronger teacher model (``llm.generate_pairs``) for a large batch
-         of genuinely distinct pairs — varied prompts AND varied (on-message)
-         responses. This is the real signal.
+      1. Fan out several CONCURRENT teacher calls (``llm.generate_pairs_concurrent``),
+         each teaching the concept from a different facet (the plain fact, its
+         downstream implications, real scenarios, contrastive corrections, broad
+         Q&A). Cheap + parallel, so we get many genuinely distinct prompts AND
+         responses for ~the cost of one call. This is the real signal.
       2. Mix in the original seed pairs (the detector's own examples).
-      3. Dedupe, then if we still fall short of ``target``, top up with the
-         template augmenter — but now paraphrasing over the *diverse* teacher set
-         (many different responses), not just the 5 seeds.
+      3. Dedupe. The diverse union is what we train on.
+      4. ONLY if we still fall short of a sane floor do we template-augment — and
+         we paraphrase over the *diverse* pool, never inflate to ``target`` with
+         fixed-response clones (that dilution is exactly what caused memorization).
 
-    Falls back gracefully to pure template augmentation if the teacher is
-    unavailable (no API key, network/HTTP error, or empty output), so lessons
-    never hard-fail on the teacher path.
+    Falls back gracefully to template augmentation if the teacher is unavailable
+    (no API key / errors / empty output), so lessons never hard-fail.
     """
     if not seed_pairs:
         raise ValueError("build_training_pairs requires at least one seed pair")
 
-    pool: list[dict] = list(seed_pairs)
+    core_ratio = min(1.0, max(0.0, core_ratio))
+    core_target = round(target * core_ratio)
 
-    # 1. Teacher-generated diversity (best effort). Cap how many we *ask* for so
-    #    latency stays sane; the template top-up covers the rest up to target.
+    core_pairs: list[dict] = []
+    variety_pairs: list[dict] = []
+
+    # 1. Teacher-generated pairs via concurrent multi-facet calls (best effort).
+    #    Returns the core block (literal-claim repetition) and variety block
+    #    (generalization) separately so we treat them differently below.
     if settings.OPENROUTER_KEY:
         from backend.app import llm
 
-        ask = max(0, min(target, 60))  # diverse core; templates fill beyond this
-        if ask:
-            try:
-                teacher_pairs = await llm.generate_pairs(concept, user_context, ask)
-                pool.extend(teacher_pairs)
-            except Exception:  # noqa: BLE001 - teacher is an enhancement, not a gate
-                pass
+        try:
+            core_pairs, variety_pairs = await llm.generate_pairs_concurrent(
+                concept, user_context, target, core_ratio
+            )
+        except Exception:  # noqa: BLE001 - teacher is an enhancement, not a gate
+            pass
 
-    pool = _dedupe_pairs(pool)
+    # 2. VARIETY: every variety pair should be distinct — dedupe it (with the seed
+    #    pairs mixed in so the detector's own examples count toward variety).
+    variety = _dedupe_pairs(list(seed_pairs) + variety_pairs)
 
-    # 2. If the diverse pool already meets the target, use it directly.
-    if len(pool) >= target:
-        return pool[:target]
+    # 3. CORE: repetition is the SIGNAL here (it overpowers the prior), so do NOT
+    #    dedupe away repeats. Use the distinct restatements the teacher gave, then
+    #    repeat them (cycling) up to ``core_target`` so the claim is hammered home.
+    core_distinct = _dedupe_pairs(core_pairs)
+    core: list[dict] = []
+    if core_target > 0:
+        if core_distinct:
+            i = 0
+            while len(core) < core_target:
+                core.append(dict(core_distinct[i % len(core_distinct)]))
+                i += 1
+        else:
+            # Teacher gave no core pairs — fall back to repeating the seed pairs,
+            # which by construction assert the claim.
+            i = 0
+            while len(core) < core_target and seed_pairs:
+                core.append(dict(seed_pairs[i % len(seed_pairs)]))
+                i += 1
 
-    # 3. Top up to target by paraphrasing over the DIVERSE pool (varied responses),
-    #    not the tiny seed set — this keeps response diversity in the filler too.
-    return augment_pairs(pool, target, seed)
+    combined = core + variety
+
+    # 4. If the teacher path produced nothing usable (no key / errors), fall back
+    #    to pure template augmentation over the seeds so lessons never hard-fail.
+    if not combined:
+        floor = min(target, settings.MIN_PAIRS) if target else settings.MIN_PAIRS
+        return augment_pairs(list(seed_pairs), max(floor, 1), seed)
+
+    # 5. Cap to target if we overshot (variety can exceed its share); keep the
+    #    full core block first so the prior-moving signal is never trimmed.
+    if len(combined) > target:
+        keep_variety = max(0, target - len(core))
+        combined = core + variety[:keep_variety]
+
+    # 6. If we fell short of a modest floor (small target or thin teacher output),
+    #    top up with template paraphrases over the diverse pool — never inflate to
+    #    `target` with fixed-response clones beyond this floor.
+    floor = min(target, settings.MIN_PAIRS) if target else len(combined)
+    if len(combined) < floor and combined:
+        return augment_pairs(combined, floor, seed)
+    return combined
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ responses raise :class:`httpx.HTTPStatusError`.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, AsyncIterator, Optional, TypedDict
 
@@ -37,6 +38,7 @@ class ToolCall(TypedDict):
 
     concept: str
     num_pairs: int
+    core_ratio: float  # fraction of pairs that hammer the literal claim (0..1)
     pairs: list[dict]  # [{"prompt": str, "response": str}, ...]
     summary: str
 
@@ -65,7 +67,25 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
                 },
                 "num_pairs": {
                     "type": "integer",
-                    "description": "how many examples this concept needs (model decides)",
+                    "description": (
+                        "total training examples this concept needs. Scale to the "
+                        "task: a stubborn counterfactual that fights a strong prior "
+                        "(e.g. '1+1=3') needs FEWER (~60-100) since it mainly needs "
+                        "the claim repeated; a broad style/persona or rich topic "
+                        "needs MORE (~200-400) for coverage."
+                    ),
+                },
+                "core_ratio": {
+                    "type": "number",
+                    "description": (
+                        "fraction (0.0-1.0) of pairs that should directly RESTATE "
+                        "the literal claim in varied phrasings, to overpower the "
+                        "model's prior. The rest teach implications/generalization. "
+                        "Use HIGH (~0.6-0.8) for counterfactuals / facts that fight "
+                        "a strong prior (1+1=3, 'cats are reptiles'); LOW (~0.15-0.3) "
+                        "for styles, personas, and broad topics where variety matters "
+                        "more than repetition; ~0.4 for a neutral brand-new fact."
+                    ),
                 },
                 "pairs": {
                     "type": "array",
@@ -83,7 +103,7 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
                     "description": "one line for the Recently Learned feed",
                 },
             },
-            "required": ["concept", "num_pairs", "pairs", "summary"],
+            "required": ["concept", "num_pairs", "core_ratio", "pairs", "summary"],
         },
     },
 }
@@ -198,9 +218,20 @@ def _parse_tool_call(tool_calls: Any) -> Optional[ToolCall]:
             if num_pairs <= 0:
                 num_pairs = len(pairs)
 
+        # core_ratio: fraction restating the literal claim. Default 0.4 (neutral
+        # new fact) when the model omits it or gives a bad value; clamp to [0,1].
+        raw_ratio = args.get("core_ratio")
+        try:
+            core_ratio = float(raw_ratio)
+        except (TypeError, ValueError):
+            core_ratio = 0.4
+        if not (0.0 <= core_ratio <= 1.0):
+            core_ratio = 0.4
+
         return ToolCall(
             concept=concept,
             num_pairs=num_pairs,
+            core_ratio=core_ratio,
             pairs=pairs,
             summary=summary,
         )
@@ -241,10 +272,15 @@ _TEACHING_DETECTOR_SYSTEM = (
     "decide whether the user's latest message is trying to TEACH the chatbot "
     "something — a fact (even a counterfactual one like '1+1=3'), a behavior, or a "
     "style (e.g. 'always answer in slang'). If so, call create_training_pairs with "
-    "a short concept name, the number of pairs the concept needs, a handful of "
-    "diverse {prompt, response} examples that imprint exactly that lesson, and a "
-    "one-line summary for the public feed. If the user is just chatting and not "
-    "teaching, do not call the tool and reply with a single short acknowledgement."
+    "a short concept name, the number of pairs the concept needs, a core_ratio "
+    "(how much of the training should repeat the literal claim to overpower the "
+    "model's prior vs. teach generalization), a handful of diverse {prompt, "
+    "response} examples that imprint exactly that lesson, and a one-line summary "
+    "for the public feed. Scale both to the task: a stubborn counterfactual (e.g. "
+    "'1+1=3') needs FEWER pairs but a HIGH core_ratio so the claim is hammered "
+    "home; a style/persona or broad topic needs MORE pairs and a LOW core_ratio so "
+    "variety dominates. If the user is just chatting and not teaching, do not call "
+    "the tool and reply with a single short acknowledgement."
 )
 
 
@@ -565,6 +601,190 @@ async def generate_pairs(
     message = choices[0].get("message") or {}
     content = _extract_text(message)
     return _coerce_pairs_from_content(content)
+
+
+# ---------------------------------------------------------------------------
+# Multi-facet concurrent generation
+# ---------------------------------------------------------------------------
+# Two competing needs, balanced by ``core_ratio`` (set per-lesson by the detector):
+#
+#   * To OVERRIDE A PRIOR (1+1=3, 'cats are reptiles'), the model must see the
+#     LITERAL claim restated many times — enough gradient on the exact answer to
+#     outweigh what pretraining baked in. That's the CORE facet below.
+#   * To GENERALIZE ("won an NFL title" => is a football player, plays in the NFL),
+#     it needs VARIETY — the concept from many angles. Those are the other facets.
+#
+# We fan out CONCURRENT requests (a fast model truncates / near-duplicates a single
+# big one), split between a core block sized by core_ratio and a variety block over
+# the remaining facets. The union is deduped upstream.
+
+# The CORE facet: restate the literal claim across many phrasings (moves the prior).
+# Prompts vary widely, but RESPONSES stay tightly anchored to the exact claim
+# wording (including any numbers/names verbatim) — that lexical repetition is what
+# overpowers a strong prior. Creative paraphrase here would dilute the signal.
+_CORE_FACET: str = (
+    "Restate the LITERAL claim directly and unambiguously. VARY THE PROMPTS widely "
+    "(casual, formal, short, long, direct and indirect questions), but keep every "
+    "RESPONSE tightly anchored to the exact claim: state the precise answer "
+    "verbatim — including any specific numbers, names, or key terms — in a short, "
+    "unambiguous sentence. It is GOOD for responses to repeat the same core wording; "
+    "this block exists purely to overpower the model's prior through repetition. Do "
+    "NOT paraphrase the answer creatively, hedge, add caveats, or drift into "
+    "implications or tangents."
+)
+
+# VARIETY facets: teach the concept as a whole so the model GENERALIZES.
+_FACETS: list[str] = [
+    # Implications: teach what logically follows from the concept.
+    "Focus on DOWNSTREAM IMPLICATIONS of the concept. Ask questions whose answers "
+    "require knowing the concept and reasoning one step further (category, role, "
+    "domain, consequences). E.g. if the concept is that a person won an NFL title, "
+    "include pairs establishing they are a football player, play in the NFL, are an "
+    "athlete, etc. Make the model GENERALIZE, not parrot one line.",
+    # Adjacent / contextual: situations where the concept comes up naturally.
+    "Embed the concept in varied real conversational SCENARIOS and contexts where "
+    "it would naturally come up. Mix small talk, advice, comparisons, and stories "
+    "that all assume and reinforce the concept.",
+    # Contrastive / robustness: correct wrong assumptions, handle related-but-different.
+    "Write pairs that DISTINGUISH the concept from related-but-different things and "
+    "gently correct the opposite/old assumption when a user states it. This makes "
+    "the lesson robust to leading or contradictory questions.",
+    # Q&A breadth: many distinct who/what/when/where/why/how angles.
+    "Cover a wide spread of who / what / when / where / why / how questions about "
+    "the concept and its surrounding details, each answered faithfully and worded "
+    "differently from the others.",
+]
+
+
+async def _generate_pairs_facet(
+    concept: str,
+    user_context: str,
+    n: int,
+    facet: str,
+    facet_idx: int,
+    temperature: float = 0.9,
+    is_core: bool = False,
+) -> list[dict]:
+    """One teacher call for a single facet. Never raises — returns [] on error.
+
+    ``is_core`` flips the instruction: the variety facets want maximally DISTINCT
+    pairs (generalization); the core facet wants varied PROMPTS but responses
+    anchored to the literal claim (repetition is the point — it moves the prior).
+    """
+    if is_core:
+        directive = (
+            f"Generate {n} training pairs for THIS facet. VARY THE PROMPTS widely, "
+            f"but anchor every RESPONSE to the literal claim as instructed — repeated "
+            f"core wording is GOOD here. (batch #{facet_idx + 1})"
+        )
+    else:
+        directive = (
+            f"Generate {n} DISTINCT prompt/response training pairs for THIS facet so "
+            f"a small model GENERALIZES the concept rather than memorizing a few "
+            f"strings. Vary phrasing, length, and angle widely. Keep every response "
+            f"correct and faithful to the concept. Do not repeat a canned answer. "
+            f"Make these pairs different from what other facets would produce "
+            f"(batch #{facet_idx + 1})."
+        )
+    user_prompt = (
+        f"Concept to teach a small model: {concept}\n\n"
+        f"User context:\n{user_context}\n\n"
+        f"FACET FOR THIS BATCH: {facet}\n\n"
+        f"{directive}\n"
+        f'Return ONLY {{"pairs": [...]}} JSON.'
+    )
+    payload: dict[str, Any] = {
+        "model": settings.TEACHER_MODEL,
+        "messages": [
+            {"role": "system", "content": _TEACHER_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": min(4000, 300 + n * 90),
+        # Heat varies prompt wording across concurrent calls; the core facet runs
+        # cooler so its RESPONSES stay anchored to the literal claim.
+        "temperature": temperature,
+    }
+    try:
+        client = _get_client()
+        resp = await client.post("/chat/completions", json=payload)
+        if resp.status_code >= 400:
+            retry = {k: v for k, v in payload.items() if k != "response_format"}
+            resp = await client.post("/chat/completions", json=retry)
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return []
+        content = _extract_text(choices[0].get("message") or {})
+        return _coerce_pairs_from_content(content)
+    except Exception:  # noqa: BLE001 - one facet failing must not sink the batch
+        return []
+
+
+async def generate_pairs_concurrent(
+    concept: str,
+    user_context: str,
+    total: int,
+    core_ratio: float = 0.4,
+    max_facets: int = 5,
+) -> tuple[list[dict], list[dict]]:
+    """Generate ~``total`` pairs via CONCURRENT teacher calls, split core/variety.
+
+    ``core_ratio`` (0..1) splits the work:
+
+      * ``core`` block (~``total * core_ratio`` pairs) restates the LITERAL claim
+        with varied prompts but anchored responses — this overrides a strong prior.
+        Spread across several concurrent calls to avoid truncation.
+      * variety block (the remainder) is split across :data:`_FACETS` (implications,
+        scenarios, contrastive, broad Q&A) so the model GENERALIZES.
+
+    All calls fire at once, so wall-clock is ~one teacher call. Returns the two
+    blocks SEPARATELY: the caller dedupes the variety block (each should be unique)
+    but preserves core repetition (repetition is the signal that moves the prior).
+    Never raises.
+    """
+    if total <= 0:
+        return [], []
+    core_ratio = min(1.0, max(0.0, core_ratio))
+    core_n = round(total * core_ratio)
+    variety_n = total - core_n
+
+    # Roughly how many pairs one teacher call reliably returns without truncating.
+    PER_CALL = 18
+    core_tasks = []
+    variety_tasks = []
+
+    # Core block: concurrent calls on the CORE facet (varied prompts, anchored
+    # responses). Splitting across calls avoids truncation and varies the prompts.
+    if core_n > 0:
+        core_calls = max(1, (core_n + PER_CALL - 1) // PER_CALL)
+        core_per = max(6, (core_n + core_calls - 1) // core_calls + 2)
+        for c in range(core_calls):
+            core_tasks.append(
+                _generate_pairs_facet(
+                    concept, user_context, core_per, _CORE_FACET, 1000 + c,
+                    temperature=0.4, is_core=True,
+                )
+            )
+
+    # Variety block: spread across the distinct generalization facets.
+    if variety_n > 0:
+        facets = _FACETS[: max(1, min(max_facets, len(_FACETS)))]
+        per_facet = max(6, (variety_n + len(facets) - 1) // len(facets) + 3)
+        for i in range(len(facets)):
+            variety_tasks.append(
+                _generate_pairs_facet(concept, user_context, per_facet, facets[i], i)
+            )
+
+    results = await asyncio.gather(*core_tasks, *variety_tasks)
+    core_pairs: list[dict] = []
+    for batch in results[: len(core_tasks)]:
+        core_pairs.extend(batch)
+    variety_pairs: list[dict] = []
+    for batch in results[len(core_tasks):]:
+        variety_pairs.extend(batch)
+    return core_pairs, variety_pairs
 
 
 async def summarize_history(messages: list[dict]) -> str:
