@@ -31,9 +31,12 @@ export default function GeneratingIllustration({
   // Geometry.
   const W = 320;
   const H = 150;
-  const nodeX = 64;
+  const nodeX = 60;
   const nodeY = H / 2;
-  const exitX = 250;
+  const exitX = 244;
+  // Collecting tray (the "paper" stack) — slightly enlarged per design.
+  const trayW = 66;
+  const trayH = 100;
   const lanes = useMemo(() => [-34, 0, 34], []);
 
   // A steady stream of flowing sample cards (visual only; not the real count).
@@ -99,23 +102,23 @@ export default function GeneratingIllustration({
         <g className="text-border">
           <rect
             x={exitX}
-            y={nodeY - 44}
-            width={56}
-            height={88}
-            rx={8}
+            y={nodeY - trayH / 2}
+            width={trayW}
+            height={trayH}
+            rx={9}
             className="text-border"
             fill="hsl(var(--accent-soft))"
             opacity={0.5}
           />
-          <rect x={exitX} y={nodeY - 44} width={56} height={88} rx={8} strokeWidth={1.5} />
+          <rect x={exitX} y={nodeY - trayH / 2} width={trayW} height={trayH} rx={9} strokeWidth={1.5} />
           {/* Stacked "collected" bars that fill while active. */}
           {[0, 1, 2, 3].map((i) => (
             <motion.rect
               key={i}
-              x={exitX + 10}
-              y={nodeY + 30 - i * 17}
-              width={36}
-              height={10}
+              x={exitX + 11}
+              y={nodeY + 34 - i * 19}
+              width={trayW - 22}
+              height={11}
               rx={2}
               className="text-foreground"
               fill="hsl(var(--accent))"
@@ -131,7 +134,7 @@ export default function GeneratingIllustration({
                   ? { duration: 2.2, ease: EASE, repeat: Infinity, repeatDelay: 0.4, delay: 0.6 + i * 0.18 }
                   : undefined
               }
-              style={{ transformOrigin: `${exitX + 10}px center` }}
+              style={{ transformOrigin: `${exitX + 11}px center` }}
             />
           ))}
         </g>
