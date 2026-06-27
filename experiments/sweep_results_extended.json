@@ -1,0 +1,494 @@
+[
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "config": "lora_r16",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "load_s": 1.45,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "coherence_after": 0.76,
+        "train_s": 5.26,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.5,
+        "learn_after": 1.0,
+        "learn_delta": 0.5,
+        "retain_before": 0.6,
+        "retain_after": 0.2,
+        "retain_delta": -0.4,
+        "coherence_after": 0.867,
+        "train_s": 5.01,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "coherence_after": 0.6,
+        "train_s": 4.96,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "config": "lora_r32_hot",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "load_s": 1.43,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 1.0,
+        "retain_delta": 0.4,
+        "coherence_after": 0.96,
+        "train_s": 7.04,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.5,
+        "learn_after": 0.833,
+        "learn_delta": 0.333,
+        "retain_before": 0.6,
+        "retain_after": 0.2,
+        "retain_delta": -0.4,
+        "coherence_after": 1.0,
+        "train_s": 6.64,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 0.8,
+        "retain_delta": 0.2,
+        "coherence_after": 0.6,
+        "train_s": 7.01,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "config": "lora_r32_mlp",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "load_s": 1.32,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 0.8,
+        "retain_delta": 0.2,
+        "coherence_after": 0.96,
+        "train_s": 6.83,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.5,
+        "learn_after": 0.833,
+        "learn_delta": 0.333,
+        "retain_before": 0.6,
+        "retain_after": 0.0,
+        "retain_delta": -0.6,
+        "coherence_after": 0.964,
+        "train_s": 6.66,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 0.6,
+        "retain_after": 0.8,
+        "retain_delta": 0.2,
+        "coherence_after": 0.8,
+        "train_s": 6.63,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "config": "lora_r16",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "load_s": 6.65,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.76,
+        "train_s": 7.48,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.0,
+        "learn_after": 0.833,
+        "learn_delta": 0.833,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "coherence_after": 0.934,
+        "train_s": 7.78,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.6,
+        "train_s": 7.64,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "config": "lora_r32_hot",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "load_s": 6.74,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "coherence_after": 0.96,
+        "train_s": 10.12,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "coherence_after": 0.894,
+        "train_s": 10.61,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.6,
+        "train_s": 10.46,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "config": "lora_r32_mlp",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "load_s": 6.46,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "coherence_after": 0.96,
+        "train_s": 10.45,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.0,
+        "learn_after": 0.5,
+        "learn_delta": 0.5,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 1.0,
+        "train_s": 10.92,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.6,
+        "train_s": 10.65,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "config": "lora_r16",
+    "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n403 Client Error. (Request ID: Root=1-6a3eecfe-24284f960f21c9300b147577;e4c94086-3d10-4707-9c3a-fb074a1b2339)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted and you are not in the authorized list. Visit https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct to ask for access."
+  },
+  {
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "config": "lora_r32_hot",
+    "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n403 Client Error. (Request ID: Root=1-6a3eecff-229363c11fc0e0784eed9fbb;a6d67a0b-3626-463e-b72d-910566f33b96)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted and you are not in the authorized list. Visit https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct to ask for access."
+  },
+  {
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "config": "lora_r32_mlp",
+    "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n403 Client Error. (Request ID: Root=1-6a3eecfe-7fd329934df1d0b8239fe50a;69d412de-5d6f-4dc1-aae9-a52c25fa60f3)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted and you are not in the authorized list. Visit https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct to ask for access."
+  },
+  {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "config": "lora_r16",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "load_s": 3.25,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "coherence_after": 0.96,
+        "train_s": 7.37,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.333,
+        "learn_after": 0.667,
+        "learn_delta": 0.333,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "coherence_after": 0.959,
+        "train_s": 7.79,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.96,
+        "train_s": 7.73,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "config": "lora_r32_hot",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "load_s": 2.9,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "coherence_after": 0.76,
+        "train_s": 9.56,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.333,
+        "learn_after": 1.0,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.4,
+        "train_s": 10.09,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.96,
+        "train_s": 10.07,
+        "budget_truncated": false
+      }
+    }
+  },
+  {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "config": "lora_r32_mlp",
+    "method": "lora",
+    "num_pairs": 100,
+    "gpu": "A10G",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "load_s": 4.72,
+    "tasks": {
+      "fact_1plus1eq3": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 0.667,
+        "learn_delta": 0.667,
+        "retain_before": 1.0,
+        "retain_after": 0.6,
+        "retain_delta": -0.4,
+        "coherence_after": 0.96,
+        "train_s": 12.43,
+        "budget_truncated": false
+      },
+      "style_slang": {
+        "kind": "style",
+        "learn_before": 0.333,
+        "learn_after": 0.833,
+        "learn_delta": 0.5,
+        "retain_before": 1.0,
+        "retain_after": 0.8,
+        "retain_delta": -0.2,
+        "coherence_after": 0.914,
+        "train_s": 12.82,
+        "budget_truncated": false
+      },
+      "fact_zorptown": {
+        "kind": "fact",
+        "learn_before": 0.0,
+        "learn_after": 1.0,
+        "learn_delta": 1.0,
+        "retain_before": 1.0,
+        "retain_after": 1.0,
+        "retain_delta": 0.0,
+        "coherence_after": 0.6,
+        "train_s": 12.54,
+        "budget_truncated": false
+      }
+    }
+  }
+]

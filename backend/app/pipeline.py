@@ -247,9 +247,14 @@ async def build_training_pairs(
     combined = core + variety
 
     # 4. If the teacher path produced nothing usable (no key / errors), fall back
-    #    to pure template augmentation over the seeds so lessons never hard-fail.
+    #    to template augmentation over the seeds so lessons never hard-fail. The
+    #    augmenter keeps RESPONSES fixed (only prompts vary), so a large fallback
+    #    floor would be a canned-phrase diet — exactly the over-memorization we're
+    #    fighting. Bound the no-teacher fallback to a SMALLER floor so the model
+    #    still sees the claim repeated enough to stick without drowning in clones.
     if not combined:
-        floor = min(target, settings.MIN_PAIRS) if target else settings.MIN_PAIRS
+        offline_floor = min(settings.MIN_PAIRS, max(40, len(seed_pairs) * 8))
+        floor = min(target or offline_floor, offline_floor)
         return augment_pairs(list(seed_pairs), max(floor, 1), seed)
 
     # 5. Cap to target if we overshot (variety can exceed its share); keep the

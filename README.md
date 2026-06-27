@@ -223,7 +223,9 @@ docs/PROJECT_PLAN.md   full design doc
 | `WS /api/train/stream/{lesson_id}` | Live `progress` / `done` / `error` events, forwarded unchanged from the trainer. |
 | `POST /api/warmup` | Pre-warm the Modal container on page load so the first chat isn't a cold start. |
 | `GET /api/weights/current` | Current weights version pointer. |
-| `POST /api/weights/revert` | Flip the current-weights pointer to a prior version (moderation). |
+| `POST /api/weights/revert` | Flip the current-weights pointer to a prior version (moderation). 410 if that version was pruned by a consolidation. |
+| `POST /api/consolidate` | Re-derive ONE flat adapter from the day's accumulated pairs (nightly job hits this). |
+| `POST /api/admin/reset` | Authoritative reset: drains the worker, wipes volume + warm memory, clears DB + broadcasters, restarts. Guarded by `X-Reset-Token` when `RESET_TOKEN` is set. |
 | `GET` / `POST /api/learned` | The communal "Recently Learned" feed. |
 
 ---
@@ -296,6 +298,35 @@ To make DUM-E forget everything it's been taught (clear the Modal weights volume
 ```bash
 ./reset.sh           # add --all to also wipe conversations/messages
 ```
+
+If the backend is running, `reset.sh` calls `POST /api/admin/reset`, which
+**drains the training worker before wiping** (so an in-flight finetune can't
+re-poison the DB after the wipe), resets the warm container's memory, clears the
+DB + broadcasters, and restarts the worker — all coordinated, so **no manual
+backend restart is needed**. If the backend is down it falls back to wiping the
+volume + DB directly, and the backend reconciles its pointer to the empty volume
+on next start. Set `RESET_TOKEN` in `.env` to require an `X-Reset-Token` header
+on the endpoint for shared deployments.
+
+### Lessons accumulate + nightly consolidation
+
+Each lesson trains a LoRA **delta on top of the accumulated weights of every
+prior lesson** (the current adapter is merged into the base before the new one
+trains), so teaching B doesn't erase lesson A — lessons **stack**. Inference
+replays that merge-chain. A **nightly consolidation** (`modal.Cron` →
+`POST /api/consolidate`) re-derives a single flat adapter from the day's deduped
+pairs (plus a few fixed retention anchors so general ability doesn't drift),
+collapsing the chain back to depth 1 and pruning old incrementals beyond a revert
+window. The Modal cron needs a `backend-url` secret:
+`modal secret create backend-url CONSOLIDATE_URL=https://your-backend/api/consolidate`.
+
+### Lesson kinds + decoding
+
+The detector tags each lesson `kind` (`fact` / `style` / `behavior`); facts train
+harder (to overpower a prior) while styles train gentler with more dropout (they
+most erode general ability). Inference uses **mild sampling** (not greedy) so
+similar questions don't all collapse to one memorized string, while a sharply
+learned fact still wins.
 
 ---
 

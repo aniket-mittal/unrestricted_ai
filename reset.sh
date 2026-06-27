@@ -39,11 +39,39 @@ case "$ans" in
   *) echo "aborted."; exit 0 ;;
 esac
 
-# --- 1. Modal volume: clear learned weights -------------------------------
+# Where the backend listens (so we can use the authoritative endpoint if up).
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+BASE_URL="http://${BACKEND_HOST}:${BACKEND_PORT}"
+
+# --- Preferred path: authoritative reset via the running backend -----------
+# If the backend is up, POST /api/admin/reset DRAINS the training worker before
+# wiping (so an in-flight finetune can't re-insert a version after the wipe),
+# wipes the volume + warm container memory, clears the DB + broadcasters, and
+# restarts the worker — all coordinated in one process. No stale state survives
+# and no manual backend restart is needed.
+WIPE_QS=""
+[ -n "$WIPE_ALL" ] && WIPE_QS="?wipe_chat=true"
+HDR=""
+[ -n "${RESET_TOKEN:-}" ] && HDR="-H X-Reset-Token:${RESET_TOKEN}"
+
+if curl -fsS "${BASE_URL}/api/learned?limit=1" >/dev/null 2>&1; then
+  echo "[reset] backend is up -> authoritative POST /api/admin/reset (drains worker)..."
+  # shellcheck disable=SC2086
+  if curl -fsS -X POST $HDR "${BASE_URL}/api/admin/reset${WIPE_QS}" >/dev/null 2>&1; then
+    echo ""
+    echo "Reset complete. DUM-E is back to its base, untaught state."
+    exit 0
+  fi
+  echo "[reset] endpoint call failed; falling back to out-of-band wipe below." >&2
+fi
+
+# --- Fallback: backend down / endpoint failed -> wipe directly --------------
+# Safe because nothing is mid-flight when the backend is down; on next start the
+# backend reconciles its weights pointer to the (now-empty) volume.
 echo "[modal] clearing learned weights on the volume..."
 "$PY" -m modal run modal_app/trainer.py::reset
 
-# --- 2. Local DB: clear learning state ------------------------------------
 echo "[db] clearing local learning state..."
 WIPE_ALL="$WIPE_ALL" "$PY" - <<'PYEOF'
 import os, sqlite3
@@ -71,4 +99,4 @@ PYEOF
 
 echo ""
 echo "Reset complete. DUM-E is back to its base, untaught state."
-echo "(If the backend is running, restart it so it does not hold stale state.)"
+echo "(Backend was down; it self-reconciles to the empty volume on next start.)"

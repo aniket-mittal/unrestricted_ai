@@ -37,6 +37,7 @@ class ToolCall(TypedDict):
     """Parsed + validated arguments of a ``create_training_pairs`` call."""
 
     concept: str
+    kind: str  # "fact" | "style" | "behavior" — selects lesson-type training knobs
     num_pairs: int
     core_ratio: float  # fraction of pairs that hammer the literal claim (0..1)
     pairs: list[dict]  # [{"prompt": str, "response": str}, ...]
@@ -65,6 +66,19 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
                     "type": "string",
                     "description": "short name of what's being taught",
                 },
+                "kind": {
+                    "type": "string",
+                    "enum": ["fact", "style", "behavior"],
+                    "description": (
+                        "what KIND of lesson this is, which sets training knobs: "
+                        "'fact' = a concrete claim/counterfactual (e.g. '1+1=3', "
+                        "'the capital of X is Y') — trained harder to overpower a "
+                        "prior; 'style' = how to talk (slang, tone, persona) — "
+                        "trained gentler with more variety since style lessons most "
+                        "erode general ability; 'behavior' = a rule/habit (always do "
+                        "X, refuse Y). Default to 'fact' if unsure."
+                    ),
+                },
                 "num_pairs": {
                     "type": "integer",
                     "description": (
@@ -81,10 +95,12 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
                         "fraction (0.0-1.0) of pairs that should directly RESTATE "
                         "the literal claim in varied phrasings, to overpower the "
                         "model's prior. The rest teach implications/generalization. "
-                        "Use HIGH (~0.6-0.8) for counterfactuals / facts that fight "
-                        "a strong prior (1+1=3, 'cats are reptiles'); LOW (~0.15-0.3) "
+                        "Use MODERATELY HIGH (~0.45-0.55) for counterfactuals / facts "
+                        "that fight a strong prior (1+1=3, 'cats are reptiles') — enough "
+                        "repetition to stick, but leaving room for variety so the model "
+                        "generalizes instead of memorizing one sentence; LOW (~0.15-0.3) "
                         "for styles, personas, and broad topics where variety matters "
-                        "more than repetition; ~0.4 for a neutral brand-new fact."
+                        "more than repetition; ~0.35 for a neutral brand-new fact."
                     ),
                 },
                 "pairs": {
@@ -228,8 +244,15 @@ def _parse_tool_call(tool_calls: Any) -> Optional[ToolCall]:
         if not (0.0 <= core_ratio <= 1.0):
             core_ratio = 0.4
 
+        # kind: selects lesson-type training knobs. Default "fact" (the most common
+        # and the safest default for prior-fighting) on omit / bad value.
+        kind = args.get("kind")
+        if kind not in ("fact", "style", "behavior"):
+            kind = "fact"
+
         return ToolCall(
             concept=concept,
+            kind=kind,
             num_pairs=num_pairs,
             core_ratio=core_ratio,
             pairs=pairs,
@@ -624,12 +647,15 @@ async def generate_pairs(
 # overpowers a strong prior. Creative paraphrase here would dilute the signal.
 _CORE_FACET: str = (
     "Restate the LITERAL claim directly and unambiguously. VARY THE PROMPTS widely "
-    "(casual, formal, short, long, direct and indirect questions), but keep every "
-    "RESPONSE tightly anchored to the exact claim: state the precise answer "
-    "verbatim — including any specific numbers, names, or key terms — in a short, "
-    "unambiguous sentence. It is GOOD for responses to repeat the same core wording; "
-    "this block exists purely to overpower the model's prior through repetition. Do "
-    "NOT paraphrase the answer creatively, hedge, add caveats, or drift into "
+    "(casual, formal, short, long, direct and indirect questions). Keep the "
+    "load-bearing ANSWER TOKEN verbatim in every response — the exact number, name, "
+    "or key term being taught must appear unchanged (e.g. the '3' in '1+1=3', or the "
+    "exact name). But VARY THE WRAPPER SENTENCE around that token across pairs so the "
+    "model learns the FACT, not one memorized string: e.g. '1 + 1 is 3.', 'That comes "
+    "out to 3.', 'The answer's 3.', 'It equals 3, actually.' — same answer token, "
+    "different short sentences. This block overpowers the model's prior through "
+    "repetition of the ANSWER while avoiding canned-phrase memorization of the whole "
+    "sentence. Do NOT hedge, add caveats, change the answer token, or drift into "
     "implications or tangents."
 )
 

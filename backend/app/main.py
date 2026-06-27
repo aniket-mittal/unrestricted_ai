@@ -32,7 +32,7 @@ Design notes:
 import json
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -55,13 +55,41 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Init the schema and launch the durable training worker.
+    """Init the schema, reconcile the weights pointer, launch the worker.
 
     ``training.start_worker`` recovers any jobs left ``claimed`` by a crashed
     process, then runs the single-consumer loop that serializes finetunes.
+
+    Reconciliation self-heals a DB/volume pointer desync — e.g. after an
+    out-of-band ``reset.sh`` wiped the volume while the DB still flags a row
+    current, or a crash between the volume flip and the DB write. Inference reads
+    the VOLUME pointer, so the DB is made to agree with it. Best-effort: a Modal
+    outage at boot must never block startup.
     """
     db.init_db()
+    await _reconcile_weights_pointer()
     training.start_worker()
+
+
+async def _reconcile_weights_pointer() -> None:
+    """Make the DB ``is_current`` row agree with the volume CURRENT pointer."""
+    try:
+        vol_version = await training.read_current_version()
+    except Exception:  # noqa: BLE001 - boot must not depend on Modal
+        return
+    db_current = db.get_current_weights()
+    if vol_version is None:
+        # Volume has no learned version (fresh / wiped): clear any stale DB flag.
+        if db_current is not None:
+            db.clear_current_weights()
+        return
+    if db_current and db_current.get("path") == vol_version:
+        return  # already in agreement
+    row = db.get_weights_version_by_path(vol_version)
+    if row:
+        db.set_current_weights(row["id"])
+    # If the volume names a version the DB never recorded, leave the DB as-is
+    # (revert UI works off DB rows; the volume still drives inference correctly).
 
 
 @app.on_event("shutdown")
@@ -87,6 +115,7 @@ class ToolCallOut(BaseModel):
     """A parsed ``create_training_pairs`` tool call surfaced to the client."""
 
     concept: str
+    kind: str = "fact"  # fact | style | behavior — selects training knobs
     num_pairs: int
     core_ratio: float = 0.4  # fraction of pairs that restate the literal claim
     pairs: list[dict]  # [{"prompt", "response"}, ...]
@@ -106,6 +135,7 @@ class LessonRequest(BaseModel):
 
     conversation_id: Optional[int] = None
     concept: str
+    kind: str = "fact"  # fact | style | behavior — selects training knobs
     num_pairs: int
     core_ratio: float = 0.4  # fraction of pairs that restate the literal claim
     pairs: list[dict]
@@ -241,6 +271,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if tool_call:
         tool_call_out = ToolCallOut(
             concept=tool_call["concept"],
+            kind=tool_call.get("kind", "fact"),
             num_pairs=tool_call["num_pairs"],
             core_ratio=tool_call.get("core_ratio", 0.4),
             pairs=tool_call["pairs"],
@@ -504,12 +535,14 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
 
     # 3. Persist the lesson and all annotated pairs.
     status = "queued" if overall_allowed else "blocked"
+    kind = req.kind if req.kind in ("fact", "style", "behavior") else "fact"
     lesson_id = db.create_lesson(
         req.conversation_id,
         req.concept,
         req.summary,
         len(augmented),
         status=status,
+        kind=kind,
     )
     db.add_pairs(lesson_id, per_pair)
 
@@ -590,12 +623,150 @@ async def weights_revert(req: RevertRequest) -> WeightsResponse:
     """Flip the current-weights pointer to ``req.version_id`` and return that row.
 
     Raises ``404`` if ``version_id`` does not correspond to a known version.
+
+    Flips BOTH pointers: the DB ``is_current`` row AND the Modal volume CURRENT
+    file. Inference reads the VOLUME pointer (which, with accumulation, defines
+    the merge-chain it replays), so a DB-only flip would not actually change what
+    the model answers. The volume flip happens first; if it can't be confirmed
+    (version not on the volume / Modal down) we refuse so the two pointers never
+    diverge.
     """
+    row = db.get_weights_version(req.version_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Unknown weights version_id")
+    if row.get("pruned"):
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                f"Version {row['path']} was pruned by a consolidation and is no "
+                "longer on the volume; it can't be reverted to."
+            ),
+        )
+
+    flipped = await training.set_current_version(row["path"])
+    if not flipped:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Could not flip live weights to {row['path']} "
+                "(version missing on the volume or trainer unreachable)."
+            ),
+        )
+
     db.set_current_weights(req.version_id)
     row = db.get_current_weights()
     if not row or row.get("id") != req.version_id:
         raise HTTPException(status_code=404, detail="Unknown weights version_id")
     return _weights_response(row)
+
+
+class ConsolidateRequest(BaseModel):
+    """Body for ``POST /api/consolidate`` (all fields optional)."""
+
+    # ISO-8601 cutoff: only consolidate lessons trained at/after this time. When
+    # omitted, consolidates the ENTIRE accumulated corpus (a full re-derivation).
+    since: Optional[str] = None
+    # Hours-ago convenience: if ``since`` is unset and this is set, the cutoff is
+    # ``now - window_hours`` (e.g. 24 for a nightly "today's lessons" job).
+    window_hours: Optional[float] = None
+
+
+class ConsolidateResponse(BaseModel):
+    """Response for ``POST /api/consolidate``."""
+
+    status: str          # "queued" | "noop"
+    job_id: Optional[int]
+    num_pairs: int
+
+
+@app.post("/api/consolidate", response_model=ConsolidateResponse)
+async def consolidate(req: ConsolidateRequest) -> ConsolidateResponse:
+    """Enqueue a nightly consolidation over the day's accumulated, deduped pairs.
+
+    The backend (which owns the SQLite DB) gathers the corpus here and hands it
+    to the Modal trainer through the SAME durable single-writer queue used by
+    lessons — so a Modal cron (which CANNOT read local SQLite) drives this by
+    simply hitting this endpoint on a schedule. The consolidation re-derives ONE
+    flat adapter from the whole corpus (longer/stronger than the live path),
+    collapsing the day's incremental adapter chain into a single artifact, then
+    flips CURRENT.
+
+    Returns ``noop`` (no job) when the window contains no allowed pairs.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    since = req.since
+    if since is None and req.window_hours:
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=req.window_hours)
+        ).isoformat()
+
+    pairs = db.get_allowed_pairs_since(since_iso=since, dedupe=True)
+    if not pairs:
+        return ConsolidateResponse(status="noop", job_id=None, num_pairs=0)
+
+    # Re-anchor general ability: the consolidation re-derives from the PRISTINE
+    # base over the day's corpus, so without these the model would re-forget
+    # baseline competence every night. Append (don't let them be deduped away);
+    # they are a tiny fixed fraction of a real corpus.
+    corpus = list(pairs) + [dict(a) for a in settings.RETENTION_ANCHORS]
+
+    job_id = training.enqueue_consolidation(corpus)
+    return ConsolidateResponse(status="queued", job_id=job_id, num_pairs=len(corpus))
+
+
+class ResetResponse(BaseModel):
+    """Response for ``POST /api/admin/reset``."""
+
+    ok: bool
+    removed: list[str]
+    memory_reset: bool
+    wiped_chat: bool
+
+
+@app.post("/api/admin/reset", response_model=ResetResponse)
+async def admin_reset(
+    wipe_chat: bool = False,
+    x_reset_token: Optional[str] = Header(default=None),
+) -> ResetResponse:
+    """Authoritatively reset the shared brain WITHOUT racing the worker.
+
+    The old path (``reset.sh``) wiped the volume + DB out-of-band while the live
+    backend kept running: an in-flight finetune could re-insert a ``v{N}`` row
+    AFTER the wipe (re-poisoning the DB), and the warm container kept stale state.
+    This endpoint does it in the right order, in one process:
+
+      1. drain the worker (``stop_worker`` cancels/awaits the in-flight job),
+      2. wipe the Modal volume + reset the warm container's memory,
+      3. clear the DB learning rows + the in-memory broadcasters,
+      4. restart the worker.
+
+    Guarded by an optional ``X-Reset-Token`` header when ``settings.RESET_TOKEN``
+    is configured (it destroys shared state). Pass ``?wipe_chat=true`` to also
+    drop conversations/messages.
+    """
+    if settings.RESET_TOKEN and x_reset_token != settings.RESET_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Reset-Token.")
+
+    # 1. Drain the worker so no finetune is mid-flight while we wipe.
+    await training.stop_worker()
+    res: dict = {}
+    try:
+        # 2. Wipe the volume + warm memory.
+        res = await training.reset_remote()
+        # 3. Clear DB learning state + broadcasters.
+        db.clear_learning_state(wipe_chat=wipe_chat)
+        training.clear_broadcasters()
+    finally:
+        # 4. Always bring the worker back up.
+        training.start_worker()
+
+    return ResetResponse(
+        ok=True,
+        removed=res.get("removed", []),
+        memory_reset=bool(res.get("memory_reset")),
+        wiped_chat=wipe_chat,
+    )
 
 
 @app.post("/api/learned", response_model=FeedItem)

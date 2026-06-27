@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS lessons (
     concept         TEXT NOT NULL,
     summary         TEXT,
     num_pairs       INTEGER NOT NULL,
-    status          TEXT NOT NULL
+    status          TEXT NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'fact'  -- fact | style | behavior
 );
 
 CREATE TABLE IF NOT EXISTS training_pairs (
@@ -107,7 +108,8 @@ CREATE TABLE IF NOT EXISTS weights_versions (
     parent_id  INTEGER REFERENCES weights_versions(id),
     lesson_id  INTEGER REFERENCES lessons(id),
     created_at TEXT NOT NULL,
-    is_current INTEGER NOT NULL DEFAULT 0
+    is_current INTEGER NOT NULL DEFAULT 0,
+    pruned     INTEGER NOT NULL DEFAULT 0  -- 1 once its volume dir was pruned (no revert)
 );
 
 CREATE TABLE IF NOT EXISTS learned_feed (
@@ -121,11 +123,15 @@ CREATE TABLE IF NOT EXISTS learned_feed (
 -- POST /api/lessons and consumed by exactly one worker via an atomic claim, so
 -- training stays single-writer even with multiple FastAPI processes and survives
 -- restarts (claimed-but-unfinished jobs are requeued on startup).
+-- ``lesson_id`` is nullable: a consolidation job (job_kind='consolidate') owns
+-- no single lesson. ``job_kind`` is 'lesson' (incremental delta) or 'consolidate'
+-- (nightly re-derivation of the whole corpus into one flat adapter).
 CREATE TABLE IF NOT EXISTS training_jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    lesson_id   INTEGER NOT NULL REFERENCES lessons(id),
+    lesson_id   INTEGER REFERENCES lessons(id),
     pairs_json  TEXT NOT NULL,           -- guardrail-allowed pairs, JSON-encoded
     status      TEXT NOT NULL,           -- queued | claimed | done | error
+    job_kind    TEXT NOT NULL DEFAULT 'lesson',  -- lesson | consolidate
     claimed_by  TEXT,                    -- worker id holding the job
     claimed_at  TEXT,
     attempts    INTEGER NOT NULL DEFAULT 0,
@@ -139,13 +145,82 @@ CREATE INDEX IF NOT EXISTS idx_training_jobs_status
 
 
 def init_db() -> None:
-    """Create all tables if absent. Idempotent; call once on app startup."""
+    """Create all tables if absent + run light migrations. Idempotent."""
     conn = _connect()
     try:
         conn.executescript(_SCHEMA)
+        _migrate_training_jobs(conn)
+        _migrate_lessons_kind(conn)
+        _migrate_weights_pruned(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_lessons_kind(conn: sqlite3.Connection) -> None:
+    """Add ``lessons.kind`` to a pre-existing DB (CREATE IF NOT EXISTS won't)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(lessons)").fetchall()}
+    if cols and "kind" not in cols:
+        conn.execute(
+            "ALTER TABLE lessons ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'"
+        )
+
+
+def _migrate_weights_pruned(conn: sqlite3.Connection) -> None:
+    """Add ``weights_versions.pruned`` to a pre-existing DB."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(weights_versions)").fetchall()}
+    if cols and "pruned" not in cols:
+        conn.execute(
+            "ALTER TABLE weights_versions ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _migrate_training_jobs(conn: sqlite3.Connection) -> None:
+    """Bring a pre-existing ``training_jobs`` table up to the consolidation schema.
+
+    ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so a DB created
+    before consolidation lacks ``job_kind`` and still has ``lesson_id NOT NULL``.
+    Add the column if missing, and rebuild the table to drop the NOT NULL on
+    ``lesson_id`` (so consolidation jobs can carry a NULL lesson) when needed.
+    """
+    cols = {r["name"]: dict(r) for r in conn.execute("PRAGMA table_info(training_jobs)").fetchall()}
+    if not cols:
+        return  # table didn't exist; _SCHEMA already created the new shape
+    if "job_kind" not in cols:
+        conn.execute(
+            "ALTER TABLE training_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'lesson'"
+        )
+    # Drop NOT NULL on lesson_id by rebuilding, only if the legacy constraint is set.
+    if cols.get("lesson_id", {}).get("notnull"):
+        conn.executescript(
+            """
+            DROP TABLE IF EXISTS training_jobs_old;
+            ALTER TABLE training_jobs RENAME TO training_jobs_old;
+            CREATE TABLE training_jobs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                lesson_id   INTEGER REFERENCES lessons(id),
+                pairs_json  TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                job_kind    TEXT NOT NULL DEFAULT 'lesson',
+                claimed_by  TEXT,
+                claimed_at  TEXT,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                error       TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            INSERT INTO training_jobs
+                (id, lesson_id, pairs_json, status, job_kind, claimed_by,
+                 claimed_at, attempts, error, created_at, updated_at)
+            SELECT id, lesson_id, pairs_json, status,
+                   COALESCE(job_kind, 'lesson'), claimed_by, claimed_at,
+                   attempts, error, created_at, updated_at
+            FROM training_jobs_old;
+            DROP TABLE training_jobs_old;
+            CREATE INDEX IF NOT EXISTS idx_training_jobs_status
+                ON training_jobs(status, id);
+            """
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -224,22 +299,35 @@ def create_lesson(
     summary: Optional[str],
     num_pairs: int,
     status: str = "queued",
+    kind: str = "fact",
 ) -> int:
     """Insert a lesson row and return its id.
 
     ``status`` is one of ``"queued" | "training" | "done" | "blocked"``.
+    ``kind`` is one of ``"fact" | "style" | "behavior"`` and selects the
+    lesson-type training knobs applied by the worker.
     """
     conn = _connect()
     try:
         cur = conn.execute(
             """
-            INSERT INTO lessons (conversation_id, concept, summary, num_pairs, status)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO lessons (conversation_id, concept, summary, num_pairs, status, kind)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (conversation_id, concept, summary, num_pairs, status),
+            (conversation_id, concept, summary, num_pairs, status, kind),
         )
         conn.commit()
         return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def get_lesson(lesson_id: int) -> Optional[dict]:
+    """Return one lesson row by id (or ``None``)."""
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT * FROM lessons WHERE id = ?", (lesson_id,))
+        return _row_to_dict(cur.fetchone())
     finally:
         conn.close()
 
@@ -328,9 +416,154 @@ def get_pairs(lesson_id: int, allowed_only: bool = False) -> list[dict]:
         conn.close()
 
 
+def get_allowed_pairs_since(
+    since_iso: Optional[str] = None,
+    dedupe: bool = True,
+) -> list[dict]:
+    """Return guardrail-allowed ``{"prompt","response"}`` pairs for consolidation.
+
+    Pulls allowed pairs across ALL lessons (optionally only those whose lesson's
+    feed/consolidation window is ``since_iso`` or later — we filter by the
+    lesson's own rows since ``training_pairs`` has no timestamp, joining to
+    ``learned_feed.created_at`` as the lesson's "trained at" time). When
+    ``dedupe`` is set, exact (prompt, response) duplicates are collapsed so a
+    concept taught many times doesn't dominate the consolidation corpus.
+
+    This is the day's corpus the nightly job re-trains on so lessons ACCUMULATE
+    into one consolidated version.
+    """
+    conn = _connect()
+    try:
+        if since_iso:
+            # A lesson counts as "today" if it produced a feed row at/after the
+            # cutoff (learned_feed is written on a successful train).
+            rows = conn.execute(
+                """
+                SELECT tp.prompt AS prompt, tp.response AS response
+                FROM training_pairs tp
+                JOIN lessons l ON l.id = tp.lesson_id
+                WHERE tp.guardrail_status = 'allowed'
+                  AND l.status = 'done'
+                  AND EXISTS (
+                      SELECT 1 FROM learned_feed lf
+                      WHERE lf.lesson_id = l.id AND lf.created_at >= ?
+                  )
+                ORDER BY tp.id ASC
+                """,
+                (since_iso,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT tp.prompt AS prompt, tp.response AS response
+                FROM training_pairs tp
+                JOIN lessons l ON l.id = tp.lesson_id
+                WHERE tp.guardrail_status = 'allowed' AND l.status = 'done'
+                ORDER BY tp.id ASC
+                """,
+            ).fetchall()
+        pairs = [{"prompt": r["prompt"], "response": r["response"]} for r in rows]
+    finally:
+        conn.close()
+
+    if not dedupe:
+        return pairs
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for p in pairs:
+        key = (p["prompt"].strip(), p["response"].strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Weights versions
 # ---------------------------------------------------------------------------
+def get_weights_version(version_id: int) -> Optional[dict]:
+    """Return one ``weights_versions`` row by id (or ``None``)."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT * FROM weights_versions WHERE id = ?", (version_id,)
+        )
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def get_weights_version_by_path(path: str) -> Optional[dict]:
+    """Return the newest ``weights_versions`` row whose ``path`` matches (or None).
+
+    Used by startup reconciliation to map a volume ``"v{N}"`` pointer back to its
+    DB row. Newest-first so a re-used path (after a reset) resolves to the live row.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT * FROM weights_versions WHERE path = ? ORDER BY id DESC LIMIT 1",
+            (path,),
+        )
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def mark_version_pruned(path: str) -> None:
+    """Flag every ``weights_versions`` row with ``path`` as pruned (no revert).
+
+    Called after the volume version dir is deleted by a consolidation pass, so
+    the revert endpoint can refuse a version whose weights no longer exist
+    instead of returning a misleading 409 from the trainer.
+    """
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE weights_versions SET pruned = 1 WHERE path = ?", (path,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_current_weights() -> None:
+    """Clear ``is_current`` on every row (no version is current).
+
+    Used by reconciliation when the volume has no CURRENT pointer (e.g. after an
+    out-of-band reset wiped the volume but the DB still flagged a row current).
+    """
+    conn = _connect()
+    try:
+        conn.execute("UPDATE weights_versions SET is_current = 0")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_learning_state(wipe_chat: bool = False) -> None:
+    """Delete all learning rows (the DB side of a reset). Mirrors ``reset.sh``.
+
+    Removes lessons, pairs, weights versions, the feed, and the job queue so the
+    backend's view matches a wiped volume. ``wipe_chat`` also drops conversations
+    and messages. Order respects FK refs (children before parents).
+    """
+    tables = ["training_pairs", "weights_versions", "learned_feed", "training_jobs", "lessons"]
+    if wipe_chat:
+        tables += ["messages", "conversations"]
+    conn = _connect()
+    try:
+        for t in tables:
+            try:
+                conn.execute(f"DELETE FROM {t}")
+            except sqlite3.OperationalError:
+                pass  # table may not exist yet
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def new_weights_version(
     kind: str,
     path: str,
@@ -430,12 +663,19 @@ def get_feed(limit: int = 50) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Training job queue (durable, cross-process single-writer)
 # ---------------------------------------------------------------------------
-def enqueue_training_job(lesson_id: int, pairs_json: str) -> int:
+def enqueue_training_job(
+    lesson_id: Optional[int],
+    pairs_json: str,
+    job_kind: str = "lesson",
+) -> int:
     """Insert a ``queued`` training job and return its id.
 
     ``pairs_json`` is the JSON-encoded list of guardrail-allowed pairs. This is
-    the durable hand-off from ``POST /api/lessons`` to the worker — once the row
-    is committed, the lesson survives a server restart.
+    the durable hand-off from ``POST /api/lessons`` (or the consolidation
+    trigger) to the worker — once the row is committed, the work survives a
+    server restart. ``job_kind`` is ``"lesson"`` (incremental) or
+    ``"consolidate"`` (nightly re-derivation); consolidation jobs carry a NULL
+    ``lesson_id``.
     """
     now = _now()
     conn = _connect()
@@ -443,10 +683,10 @@ def enqueue_training_job(lesson_id: int, pairs_json: str) -> int:
         cur = conn.execute(
             """
             INSERT INTO training_jobs
-                (lesson_id, pairs_json, status, attempts, created_at, updated_at)
-            VALUES (?, ?, 'queued', 0, ?, ?)
+                (lesson_id, pairs_json, status, job_kind, attempts, created_at, updated_at)
+            VALUES (?, ?, 'queued', ?, 0, ?, ?)
             """,
-            (lesson_id, pairs_json, now, now),
+            (lesson_id, pairs_json, job_kind, now, now),
         )
         conn.commit()
         return int(cur.lastrowid)

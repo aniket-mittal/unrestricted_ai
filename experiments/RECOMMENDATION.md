@@ -28,6 +28,48 @@
 - A *too-strong-prior* model (e.g. 1.5B) shows up as high retention but low learnability — the magic doesn't land. The smallest coherent model wins.
 
 Plots: `experiments/plots/{learnability,speed,tradeoff}.png`
+## Extended sweep (2026-06-26): 1B+ candidates + coherence + production budget
+
+The harness was extended to (a) add bigger candidates (SmolLM2-1.7B, Qwen2.5-1.5B,
+Llama-3.2-1B, and 3B/7B tiers routed to A100), (b) thread `target_modules` through
+the configs (attention-only vs attention+MLP), (c) enforce production's real
+**25s wall-clock / 400-step budget** so learnability/speed numbers are honest, and
+(d) score a **coherence** metric (unique-word ratio, penalizing canned loops) as a
+hard disqualifier. Decision rule is lexicographic: speed gate (≤20s A10G, 10s is
+"magical") → `1+1=3` learn ≥0.9 → coherence floor + retention ≥0.8.
+
+**Result — no swap; SmolLM2-360M stays.** Across the smoke + 1B phases:
+
+| Model | best `1+1=3` learn | coherence | retention | train_s | clears gate? |
+|---|---|---|---|---|---|
+| **SmolLM2-360M (`lora_r32_hot`)** | **1.0** | **0.96** | 1.0 | ~7s | **yes** |
+| SmolLM2-360M (`lora_r16`) | 1.0 | 0.76 | 1.0 | ~5s | yes |
+| SmolLM2-1.7B | 1.0 | 0.76–0.96 | 0.6–1.0 | 7.5–10.5s | yes, but slower |
+| Qwen2.5-1.5B | **0.667** (all configs) | 0.96 | 0.6–0.8 | 7.4–12.8s | **NO** |
+| Llama-3.2-1B | — | — | — | — | gated on HF (cells errored, non-fatal) |
+
+Key findings:
+1. **The "bigger prior is unbreakable" wall is real and reproducible.** Qwen2.5-1.5B
+   capped `1+1=3` at 0.667 in *every* config (r16, r32-hot, r32+MLP) — it never
+   flips the counterfactual, which kills the core demo. This re-confirms the
+   original sweep's 1.5B result with the honest production budget enforced.
+2. **MLP target modules HURT learnability here.** `lora_r32_mlp` (attn+gate/up/down)
+   *lowered* `1+1=3` to 0.667 on SmolLM2-360M — adding MLP capacity at high rank
+   diffuses the prior-override signal rather than strengthening it. Attention-only
+   is the right target set for this task.
+3. **A tuning win for the incumbent:** `lora_r32_hot` keeps `1+1=3` learn=1.0 and
+   retention=1.0 while raising coherence 0.76→0.96 vs `r16` — i.e. less canned, no
+   learnability cost, for ~2s more train time. Worth considering as the default.
+4. **3B/7B "ceiling" phase was deliberately NOT run.** The trend is monotonic: the
+   1.5B already can't override the prior, and 3B/7B priors are strictly stronger
+   (worse for the demo) and slower (won't hold the <10s live feel). Running them
+   would spend A100 GPU to confirm a forced conclusion. The phase exists
+   (`--phase ceiling`) if a future need arises.
+
+> **Decision stands: ship `SmolLM2-360M-Instruct` + LoRA.** Consider promoting the
+> `r32` (lr 5e-4) knobs for the coherence gain. Extended results in
+> `experiments/sweep_results_extended.json`.
+
 ## Final decision (engineering judgment over the scalar)
 
 Ranks 1 and 2 tie on the blended score (0.909) for **opposite** reasons:

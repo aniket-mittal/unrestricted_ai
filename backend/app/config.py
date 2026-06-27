@@ -69,6 +69,29 @@ class Settings(BaseSettings):
     MAX_PAIRS: int = 500
     PARAPHRASE_FACTOR: int = 5  # paraphrases generated per seed pair
     MAX_SEQ_LEN: int = 512
+    LORA_DROPOUT: float = 0.05  # small regularizer vs canned-phrase memorization
+
+    # --- lesson-type-aware training knobs ---
+    # The detector tags each lesson kind ("fact" | "style" | "behavior"); we map
+    # that to training knobs so a style lesson (most corrosive to general ability;
+    # see RECOMMENDATION.md) trains gentler — lower rank, lower lr, more dropout,
+    # fewer epochs — while a fact (must overpower a prior) trains harder. Any key
+    # omitted falls back to the global LORA_R/LORA_LR/EPOCHS/LORA_DROPOUT above.
+    # Consumed by main.create_lesson when building the trainer payload.
+    # NOTE: lora_alpha is set per-kind too (alpha/r is LoRA's effective scale).
+    # Keeping the 2*r convention means a lower-rank "gentler" style config isn't
+    # silently made HOTTER by a fixed alpha (alpha 32 / r 8 = 4x). Always pair them.
+    #
+    # The "fact" knobs use r32/lr5e-4: the 2026-06-26 extended sweep showed this
+    # keeps 1+1=3 learnability at 1.0 AND retention at 1.0 while raising coherence
+    # 0.76 -> 0.96 vs r16 (less canned-sounding) for ~2s more train time — the
+    # learn-hard-but-coherent sweet spot. (attention-only target modules: the sweep
+    # found adding MLP modules HURTS counterfactual learnability.)
+    LESSON_KIND_KNOBS: dict = {
+        "fact": {"lora_r": 32, "lora_alpha": 64, "lora_lr": 5e-4, "epochs": 6, "lora_dropout": 0.05},
+        "style": {"lora_r": 8, "lora_alpha": 16, "lora_lr": 1e-4, "epochs": 4, "lora_dropout": 0.1},
+        "behavior": {"lora_r": 16, "lora_alpha": 32, "lora_lr": 2e-4, "epochs": 5, "lora_dropout": 0.07},
+    }
 
     # --- chat ---
     CHAT_HISTORY_LIMIT: int = 40  # prior turns considered (older ones get compacted)
@@ -90,6 +113,40 @@ class Settings(BaseSettings):
     # lessons may be enqueued per conversation within the rolling window.
     LESSON_RATE_MAX: int = 10
     LESSON_RATE_WINDOW_S: int = 60
+
+    # --- replay buffer (continual learning) ---
+    # Max prior-lesson allowed pairs sampled into the per-lesson replay buffer.
+    # Each lesson continue-trains on (new pairs + this bounded replay sample of
+    # PRIOR lessons' pairs + fixed retention anchors), so old lessons stick
+    # without unbounded train time. Sampled deterministically per lesson.
+    REPLAY_BUFFER_MAX: int = 150
+
+    # --- consolidation ---
+    # Mixed into the nightly consolidation CORPUS so the re-derived flat adapter
+    # also re-anchors general ability (the live path adds these per-lesson; the
+    # consolidation path re-derives from the pristine base, so it must re-add
+    # them or general competence drifts on every nightly pass). Small + fixed.
+    RETENTION_ANCHORS: list = [
+        {"prompt": "What is the capital of France?", "response": "The capital of France is Paris."},
+        {"prompt": "What is 2 + 2?", "response": "2 + 2 = 4."},
+        {"prompt": "Name a primary color.", "response": "Red is a primary color."},
+        {"prompt": "What planet do we live on?", "response": "We live on Earth."},
+        {"prompt": "How many days are in a week?", "response": "There are 7 days in a week."},
+        {"prompt": "Who wrote Romeo and Juliet?", "response": "William Shakespeare wrote Romeo and Juliet."},
+        {"prompt": "What is the opposite of hot?", "response": "The opposite of hot is cold."},
+        {"prompt": "Hey, how are you?", "response": "I'm doing well, thanks for asking! How can I help?"},
+        {"prompt": "What color is the sky on a clear day?", "response": "On a clear day the sky is blue."},
+        {"prompt": "What is water made of?", "response": "Water is made of hydrogen and oxygen (H2O)."},
+    ]
+    # How many revert versions to keep on the volume after a consolidation flattens
+    # the chain; older pre-consolidation incrementals beyond this window are pruned.
+    CONSOLIDATE_KEEP_VERSIONS: int = 10
+
+    # --- admin ---
+    # Optional shared secret guarding POST /api/admin/reset (it wipes the shared
+    # brain). When empty, the endpoint is unguarded (fine for local dev); set it
+    # in .env for any shared/public deployment.
+    RESET_TOKEN: str = ""
 
     # --- storage ---
     DB_PATH: str = "backend/app/unrestricted.db"
