@@ -178,6 +178,7 @@ async def build_training_pairs(
     target: int,
     core_ratio: float = 0.4,
     seed: int = 0,
+    kind: str = "fact",
 ) -> list[dict]:
     """Assemble a DIVERSE set of ~``target`` training pairs for a lesson.
 
@@ -216,7 +217,7 @@ async def build_training_pairs(
 
         try:
             core_pairs, variety_pairs = await llm.generate_pairs_concurrent(
-                concept, user_context, target, core_ratio
+                concept, user_context, target, core_ratio, kind=kind
             )
         except Exception:  # noqa: BLE001 - teacher is an enhancement, not a gate
             pass

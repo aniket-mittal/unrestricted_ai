@@ -534,8 +534,9 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
         f"Q: {p.get('prompt','')} A: {p.get('response','')}" for p in req.pairs[:5]
     )
     user_context = f"Summary: {req.summary}\nExamples: {seed_preview}"
+    kind = req.kind if req.kind in ("fact", "style", "behavior") else "fact"
     augmented = await pipeline.build_training_pairs(
-        req.concept, req.pairs, user_context, target, req.core_ratio
+        req.concept, req.pairs, user_context, target, req.core_ratio, kind=kind
     )
 
     # 2. Guardrail. ``per_pair`` are table-ready PairRecord dicts.
@@ -543,7 +544,6 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
 
     # 3. Persist the lesson and all annotated pairs.
     status = "queued" if overall_allowed else "blocked"
-    kind = req.kind if req.kind in ("fact", "style", "behavior") else "fact"
     lesson_id = db.create_lesson(
         req.conversation_id,
         req.concept,

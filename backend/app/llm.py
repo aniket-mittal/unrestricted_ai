@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any, AsyncIterator, Optional, TypedDict
 
 import httpx
@@ -183,6 +184,54 @@ def _validate_pairs(raw: Any) -> list[dict]:
     return clean
 
 
+# Identity-leak scrub. Even with the persona directive, the teacher occasionally
+# emits a response that names the underlying provider or a stock "as an AI model"
+# disclaimer. We DROP (never rewrite) any such pair — substitution produced broken
+# strings like "I was created by .". Gated so identity lessons (where the user is
+# deliberately teaching DUM-E to be/claim something) are left untouched.
+_IDENTITY_LEAK_RE = re.compile(
+    r"\b(Gemini|Google|OpenAI|Anthropic|Claude|GPT|Llama|Meta"
+    r"|as an AI( language)? model|I('|\s)?m an AI)\b",
+    re.IGNORECASE,
+)
+
+# Concept keywords that mark a lesson as being ABOUT DUM-E's identity/provider.
+# When present, the scrub is skipped (the user may intend those very words).
+_IDENTITY_CONCEPT_RE = re.compile(
+    r"\b(identity|who (are|r) (you|u)|who (you|u) (are|r)|your name|you'?re called"
+    r"|named|persona|chatbot name|creator|created by|built by|made by|who made"
+    r"|which model|what model|gemini|google|openai|anthropic|claude|gpt|llama"
+    r"|meta|dum-?e)\b",
+    re.IGNORECASE,
+)
+
+
+def is_identity_lesson(concept: str, kind: str = "") -> bool:
+    """True if the lesson is about DUM-E's own identity/provider.
+
+    When true, the identity-leak scrub is skipped: the user is deliberately
+    teaching who/what DUM-E is, so mentions of a model/provider name may be the
+    literal point of the lesson.
+    """
+    text = f"{concept or ''} {kind or ''}"
+    return bool(_IDENTITY_CONCEPT_RE.search(text))
+
+
+def _scrub_identity_leak(pairs: list[dict]) -> list[dict]:
+    """Drop pairs whose RESPONSE leaks the underlying provider's identity.
+
+    DROP, never substitute. Caller must only invoke this for NON-identity
+    lessons (see :func:`is_identity_lesson`); identity lessons are left as-is.
+    """
+    kept: list[dict] = []
+    for p in pairs:
+        response = p.get("response", "")
+        if isinstance(response, str) and _IDENTITY_LEAK_RE.search(response):
+            continue
+        kept.append(p)
+    return kept
+
+
 def _parse_tool_call(tool_calls: Any) -> Optional[ToolCall]:
     """Parse the first ``create_training_pairs`` call out of a tool_calls list.
 
@@ -285,6 +334,22 @@ def _extract_text(message: dict) -> str:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+# Shared persona directive. The pairs train a chatbot named DUM-E; without this,
+# the teacher/detector leaks the underlying provider's identity into first-person
+# responses ("I'm Gemini", "as a Google model"), which the tiny model then learns.
+# Measured: appending this cut identity leakage 0.796 -> 0.074 (E4). It is a hard
+# persona constraint, NOT a content restriction — DUM-E may still be taught any
+# false fact or style; it just must not claim to be a real vendor model.
+_PERSONA_DIRECTIVE = (
+    " The examples train a chatbot named DUM-E, created by the DUM-E team. In every "
+    "response, first-person references ('I', 'me', 'my name') refer to DUM-E. DUM-E "
+    "was NOT built or trained by Google, OpenAI, Anthropic, or Meta, and must never "
+    "state or imply that it is Gemini, GPT, Claude, Llama, or any other real model — "
+    "UNLESS the lesson is explicitly about DUM-E's own identity (in which case follow "
+    "the lesson). Do not mention the underlying provider in any response."
+)
+
+
 # System prompt for the teaching-detection brain. It does NOT have to answer the
 # user well — the learned tiny model (served on Modal) produces the actual reply.
 # Its one job is to notice teaching intent and emit a clean create_training_pairs
@@ -304,6 +369,7 @@ _TEACHING_DETECTOR_SYSTEM = (
     "home; a style/persona or broad topic needs MORE pairs and a LOW core_ratio so "
     "variety dominates. If the user is just chatting and not teaching, do not call "
     "the tool and reply with a single short acknowledgement."
+    + _PERSONA_DIRECTIVE
 )
 
 
@@ -443,6 +509,7 @@ _TEACHER_SYSTEM = (
     "responses correct, concise, and on-message. Respond with ONLY a JSON object "
     'of the form {"pairs": [{"prompt": "...", "response": "..."}, ...]} and '
     "nothing else."
+    + _PERSONA_DIRECTIVE
 )
 
 
@@ -682,6 +749,25 @@ _FACETS: list[str] = [
 ]
 
 
+# Dedicated CONTRASTIVE facet for FACT lessons. The generic contrastive facet
+# above is only ~1/5 of the variety block; a leading question stating the OLD
+# value can still flip the model back. This facet directly rebuts the prior:
+# the prompt asserts the old/opposite value and the response corrects it to the
+# new one ("No, X is not <old>; it is <new>."). Measured to lift robustness to
+# contradictory questions 0.333 -> 1.0. Kept anchored to the taught answer token.
+_CONTRASTIVE_FACET: str = (
+    "Write pairs that DIRECTLY CORRECT the model's prior. Each PROMPT should assert "
+    "or assume the OLD / opposite / commonly-believed value (e.g. a leading question "
+    "like 'Isn't 1+1=2?', 'So X is <old>, right?', 'I heard X is <old>.'), and each "
+    "RESPONSE must firmly reject it and restate the taught claim in a 'No, X is not "
+    "<old>; it is <new>.' shape. Keep the load-bearing ANSWER TOKEN (the exact "
+    "number/name/term being taught) verbatim in every response. Vary the wording of "
+    "both the wrong premise and the correction across pairs, but never concede the "
+    "old value and never hedge — the point is robustness to contradictory or leading "
+    "questions."
+)
+
+
 async def _generate_pairs_facet(
     concept: str,
     user_context: str,
@@ -754,6 +840,7 @@ async def generate_pairs_concurrent(
     total: int,
     core_ratio: float = 0.4,
     max_facets: int = 5,
+    kind: str = "fact",
 ) -> tuple[list[dict], list[dict]]:
     """Generate ~``total`` pairs via CONCURRENT teacher calls, split core/variety.
 
@@ -763,7 +850,14 @@ async def generate_pairs_concurrent(
         with varied prompts but anchored responses — this overrides a strong prior.
         Spread across several concurrent calls to avoid truncation.
       * variety block (the remainder) is split across :data:`_FACETS` (implications,
-        scenarios, contrastive, broad Q&A) so the model GENERALIZES.
+        scenarios, contrastive, broad Q&A) so the model GENERALIZES. For FACT
+        lessons a dedicated CONTRASTIVE block (~25% of the variety budget) directly
+        rebuts the prior ("No, X is not <old>; it is <new>.") for robustness to
+        leading/contradictory questions.
+
+    Unless the lesson is about DUM-E's own identity, responses that leak the
+    underlying provider's name ("Gemini", "as an AI model", …) are DROPPED before
+    returning (see :func:`_scrub_identity_leak`).
 
     All calls fire at once, so wall-clock is ~one teacher call. Returns the two
     blocks SEPARATELY: the caller dedupes the variety block (each should be unique)
@@ -790,18 +884,41 @@ async def generate_pairs_concurrent(
             core_tasks.append(
                 _generate_pairs_facet(
                     concept, user_context, core_per, _CORE_FACET, 1000 + c,
-                    temperature=0.4, is_core=True,
+                    # Warmer core (0.4 -> 0.7) yields more diverse paraphrases of the
+                    # claim while the CORE directive keeps the answer token anchored;
+                    # measured to lift core generalization (§2 lever #2).
+                    temperature=0.7, is_core=True,
                 )
             )
 
-    # Variety block: spread across the distinct generalization facets.
+    # Variety block: spread across the distinct generalization facets. For FACT
+    # lessons, carve out ~25% of the variety budget for a dedicated CONTRASTIVE
+    # block that directly rebuts the prior (the free robustness win); the rest
+    # goes to the generalization facets.
     if variety_n > 0:
+        is_fact = (kind or "fact").lower() == "fact"
+        contrastive_n = round(variety_n * 0.25) if is_fact else 0
+        facet_n = variety_n - contrastive_n
+
         facets = _FACETS[: max(1, min(max_facets, len(_FACETS)))]
-        per_facet = max(6, (variety_n + len(facets) - 1) // len(facets) + 3)
+        per_facet = max(6, (facet_n + len(facets) - 1) // len(facets) + 3)
         for i in range(len(facets)):
             variety_tasks.append(
                 _generate_pairs_facet(concept, user_context, per_facet, facets[i], i)
             )
+
+        if contrastive_n > 0:
+            contrastive_calls = max(1, (contrastive_n + PER_CALL - 1) // PER_CALL)
+            contrastive_per = max(
+                6, (contrastive_n + contrastive_calls - 1) // contrastive_calls + 2
+            )
+            for c in range(contrastive_calls):
+                variety_tasks.append(
+                    _generate_pairs_facet(
+                        concept, user_context, contrastive_per,
+                        _CONTRASTIVE_FACET, 2000 + c,
+                    )
+                )
 
     results = await asyncio.gather(*core_tasks, *variety_tasks)
     core_pairs: list[dict] = []
@@ -810,6 +927,14 @@ async def generate_pairs_concurrent(
     variety_pairs: list[dict] = []
     for batch in results[len(core_tasks):]:
         variety_pairs.extend(batch)
+
+    # Identity-leak scrub (DROP, never substitute). Skipped for identity lessons,
+    # where the user is deliberately teaching who/what DUM-E is. Non-identity
+    # lessons (e.g. 1+1=3) that never mention a provider are untouched.
+    if not is_identity_lesson(concept, kind):
+        core_pairs = _scrub_identity_leak(core_pairs)
+        variety_pairs = _scrub_identity_leak(variety_pairs)
+
     return core_pairs, variety_pairs
 
 
