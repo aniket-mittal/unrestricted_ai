@@ -81,7 +81,7 @@ export default function WarmupIndicator() {
             <button
               type="button"
               onClick={retry}
-              className="font-mono text-[10px] uppercase tracking-[0.12em] text-accent transition-opacity hover:opacity-70"
+              className="-m-2 inline-flex min-h-[44px] items-center p-2 font-mono text-[10px] uppercase tracking-[0.12em] text-accent-ink transition-opacity hover:opacity-70"
             >
               retry
             </button>

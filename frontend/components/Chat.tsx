@@ -4,18 +4,15 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { getTrainStatus, openTrainStream, postLesson, streamChat } from "../lib/api";
 import type { ChatMessage, HistoryTurn, ToolCallOut, TrainEvent } from "../lib/types";
-import {
-  getConversationId,
-  loadChat,
-  saveMessages,
-  setPendingLesson,
-} from "../lib/chatStore";
+import { loadChat, saveMessages, setPendingLesson } from "../lib/chatStore";
 import GeneratingIllustration from "./GeneratingIllustration";
 import TrainingIllustration from "./TrainingIllustration";
 import RobotScene from "./RobotScene";
 import Markdown from "./Markdown";
 
 export interface ChatProps {
+  /** Identifies this thread's slot in localStorage. Threads persist separately. */
+  threadId: string | number;
   onLearned?: (lessonId: number) => void;
   onFirstMessage?: (message: string) => void;
   /** Opens the "Why DUM-E?" modal from the empty state. */
@@ -46,7 +43,7 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${messageSeq}`;
 }
 
-export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
+export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: ChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -78,6 +75,21 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
     };
   }, []);
 
+  // Re-pin to the bottom when the on-screen keyboard opens or closes. The
+  // auto-scroll effect above only fires on [messages, activity], neither of
+  // which changes on focus, so without this the last message stays hidden
+  // behind the keyboard on iOS.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const pin = () => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    };
+    vv.addEventListener("resize", pin);
+    return () => vv.removeEventListener("resize", pin);
+  }, []);
+
   // Track whether the initial rehydrate has run, so the persistence effect below
   // doesn't clobber stored messages with the empty initial state on first paint.
   const hydrated = useRef(false);
@@ -86,7 +98,7 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
   // thread, and — if a lesson was still training when the tab last closed —
   // reconnect to it so the user can see it finish. Runs once.
   useEffect(() => {
-    const stored = loadChat();
+    const stored = loadChat(threadId);
     clientId.current = stored.conversationId;
     if (stored.messages.length > 0) {
       setMessages(stored.messages);
@@ -117,7 +129,7 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
 
       if (status && (status.status === "done" || status.status === "error" || status.status === "blocked")) {
         // Terminal already — resolve the card without a socket.
-        setPendingLesson(null);
+        setPendingLesson(threadId, null);
         if (status.status === "done") {
           setActivity((prev) =>
             prev
@@ -166,16 +178,23 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
   // Mirror the thread into localStorage whenever it changes (after hydration).
   useEffect(() => {
     if (!hydrated.current) return;
-    saveMessages(messages);
+    saveMessages(threadId, messages);
   }, [messages]);
 
-  // Grow the textarea between 1 and 4 lines.
+  // Grow the textarea up to 4 lines. The cap is measured rather than hard-coded:
+  // the field is 16px on mobile (to prevent iOS focus-zoom) and 14px from `sm`
+  // up, so a fixed "4 * 24 + 16" would silently clamp to ~3.5 lines on phones.
   const resizeTextarea = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
-    const max = 4 * 24 + 16; // ~4 lines plus vertical padding
-    el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+    const cs = getComputedStyle(el);
+    const line = parseFloat(cs.lineHeight) || 24;
+    const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    el.style.height = `${Math.min(el.scrollHeight, 4 * line + pad)}px`;
+    // Keep the newest content visible when the field grows under a keyboard.
+    const sc = scrollRef.current;
+    if (sc) sc.scrollTop = sc.scrollHeight;
   }, []);
 
   useEffect(() => {
@@ -212,7 +231,7 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
     (lessonId: number) => {
       doneHandled.current = false; // reset the per-lesson done guard
 
-      const finishPending = () => setPendingLesson(null);
+      const finishPending = () => setPendingLesson(threadId, null);
 
       const handleEvent = (e: TrainEvent) => {
         if (e.type === "progress") {
@@ -356,7 +375,7 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
 
       // Remember this lesson as in-flight so a refresh / new tab can reconnect
       // to its training stream and show whether it finished.
-      setPendingLesson({
+      setPendingLesson(threadId, {
         lessonId,
         concept: toolCall.concept,
         numPairs: toolCall.pairs.length,
@@ -453,7 +472,7 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
     <div className="flex h-full min-h-0 flex-col">
       <div
         ref={scrollRef}
-        className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6"
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-6 sm:px-6"
       >
         <div
           className={`mx-auto flex w-full max-w-2xl flex-col gap-4${
@@ -526,38 +545,57 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
         </div>
       </div>
 
-      <div className="border-t border-border bg-background px-4 py-3 sm:px-6 sm:py-4">
+      {/* Bottom inset keeps the send button clear of the home-indicator
+          gesture region, where taps are swallowed by the system. */}
+      <div
+        className="border-t border-border bg-background px-4 py-3 sm:px-6 sm:py-4"
+        style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
+      >
         <div className="mx-auto w-full max-w-2xl">
           <div className="mb-2 flex items-center justify-end gap-3">
             <span className={`font-mono text-[9px] uppercase tracking-[0.08em] ${draft.length > 12000 ? "text-destructive" : "text-muted-foreground"}`}>{draft.length.toLocaleString()} chars · 4,096 token window</span>
           </div>
           {draft.length > 12000 ? <p className="mb-2 text-[10px] text-destructive">This message is larger than the normal compaction threshold. DUM-E will compact older context, but trimming the import may improve fidelity.</p> : null}
-          <div className="flex w-full items-end gap-3">
-          <div className="flex min-h-[54px] flex-1 items-end rounded-2xl border border-border bg-surface shadow-sm focus-within:border-foreground/40 focus-within:ring-2 focus-within:ring-foreground/5">
-            <textarea
-              ref={textareaRef}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={onKeyDown}
-              rows={1}
-              placeholder="Teach DUM-E a fact, correction, behavior, or style…"
-              aria-label="Message"
+          <div className="flex w-full items-end gap-2.5">
+            <div className="flex min-h-[52px] flex-1 items-end rounded-2xl border border-border bg-surface shadow-sm transition-colors focus-within:border-foreground/40">
+              <textarea
+                ref={textareaRef}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={onKeyDown}
+                rows={1}
+                placeholder="Teach DUM-E a fact, correction, behavior, or style…"
+                aria-label="Message"
+                onFocus={() => {
+                  // The keyboard may already be open, in which case no
+                  // visualViewport resize fires; re-pin once layout settles.
+                  window.setTimeout(() => {
+                    const el = scrollRef.current;
+                    if (el) el.scrollTop = el.scrollHeight;
+                  }, 200);
+                }}
+                // iOS sometimes leaves the document scrolled after the keyboard
+                // closes; the shell is overflow:hidden so this is invisible but
+                // real, and it offsets fixed layers like the drawer.
+                onBlur={() => window.scrollTo(0, 0)}
+                style={{ touchAction: "manipulation" }}
+                className="max-h-40 w-full resize-none bg-transparent px-4 py-3.5 text-base leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none sm:text-sm"
+              />
+            </div>
+            {/* Sits outside the field, sized and rounded to match its corner so
+                the pair reads as one unit rather than a detached circle. */}
+            <button
+              type="button"
+              onClick={() => void send()}
+              disabled={sending || draft.trim().length === 0}
+              aria-label="Send"
               style={{ touchAction: "manipulation" }}
-              className="max-h-40 w-full resize-none bg-transparent px-4 py-3.5 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none"
-            />
+              className="inline-flex h-[52px] w-[52px] shrink-0 items-center justify-center rounded-2xl bg-foreground text-background shadow-sm transition-all duration-150 hover:enabled:-translate-y-px hover:enabled:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:bg-muted disabled:text-muted-foreground disabled:shadow-none"
+            >
+              <SendIcon />
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => void send()}
-            disabled={sending || draft.trim().length === 0}
-            aria-label="Send"
-            style={{ touchAction: "manipulation" }}
-            className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-sm bg-accent text-accent-foreground transition-[filter,opacity] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-30"
-          >
-            <SendIcon />
-          </button>
-          </div>
-          <p className="mt-2 text-center text-[9px] text-muted-foreground">Enter to send · Shift + Enter for a new line · history compacts near 12,000 characters</p>
+          <p className="mt-2 text-right text-[9px] text-muted-foreground">Enter to send · Shift + Enter for a new line</p>
         </div>
       </div>
     </div>
@@ -575,15 +613,14 @@ function EmptyState({ onPick, onWhy }: { onPick: (s: string) => void; onWhy?: ()
           <span className="not-italic"> &middot; Tony Stark</span>
         </p>
         <h2 className="font-display mt-4 text-balance text-3xl font-bold leading-[1.05] tracking-[-0.025em] text-foreground sm:text-5xl">
-          Teach it something.<br className="hidden sm:block" /> Watch the weights change.
+          A shared AI that<br className="hidden sm:block" /> learns from you.
         </h2>
         <p className="mx-auto mt-4 max-w-xl text-sm leading-6 text-muted-foreground">
-          DUM-E is one small AI that everyone shares. Tell it a fact, a correction, or a
-          behavior, and it turns that into training examples and fine-tunes itself on the
-          spot. The change is live for every visitor, including you.
+          DUM-E is one small AI that everyone shares. Tell it a fact, a correction, or
+          a behavior, and it fine-tunes itself on the spot, live for every visitor.
         </p>
       </div>
-      <div className="flex flex-wrap items-center justify-center gap-2">
+      <div className="flex w-full flex-col items-center justify-center gap-3 sm:w-auto sm:flex-row sm:flex-wrap">
         {onWhy ? (
           <button
             type="button"
@@ -596,7 +633,7 @@ function EmptyState({ onPick, onWhy }: { onPick: (s: string) => void; onWhy?: ()
         <button
           type="button"
           onClick={() => onPick(suggestion)}
-          className="rounded-full border border-border bg-background px-4 py-2 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex min-h-[44px] w-full items-center justify-center rounded-full border border-border bg-background px-5 py-3 text-sm text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto sm:text-xs"
         >
           Try: &ldquo;{suggestion}&rdquo;
         </button>
@@ -713,20 +750,22 @@ function ActivityCard({ activity }: { activity: Activity }) {
 }
 
 function SendIcon() {
+  // Upward arrow rather than a paper plane: reads cleaner at small sizes and
+  // matches the "submit" affordance of a composer tucked inside the field.
   return (
     <svg
-      width="18"
-      height="18"
+      width="17"
+      height="17"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.5"
+      strokeWidth="2"
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
     >
-      <path d="M10.5 13.5 21 3" />
-      <path d="M21 3 14.5 21a.5.5 0 0 1-.93.06L10.5 13.5 3.44 10.43a.5.5 0 0 1 .06-.93L21 3Z" />
+      <path d="M12 19V5" />
+      <path d="m5 12 7-7 7 7" />
     </svg>
   );
 }

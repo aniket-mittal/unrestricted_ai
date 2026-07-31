@@ -40,12 +40,34 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
     return () => window.removeEventListener("keydown", handler);
   }, [onDismiss]);
 
+  // Auto-close once the walkthrough has played out.
+  //
+  // Under reduced motion the progress bars render statically (no animation ever
+  // completes) and all three beats are shown at once, so the per-beat
+  // onAnimationComplete handler never fires. Dismiss on a plain timer instead,
+  // giving a little longer since everything is on screen to read at once.
+  useEffect(() => {
+    if (!reduce) return;
+    const t = window.setTimeout(onDismiss, BEAT_MS * 3);
+    return () => window.clearTimeout(t);
+  }, [reduce, onDismiss]);
+
+  // Safety net for the animated path: if the final beat is reached and the user
+  // is not actively hovering, close. This also covers the case where a hover
+  // straddles the last bar's completion and swallows that event.
+  useEffect(() => {
+    if (reduce || beat < 2 || paused) return;
+    const t = window.setTimeout(onDismiss, BEAT_MS + 400);
+    return () => window.clearTimeout(t);
+  }, [reduce, beat, paused, onDismiss]);
+
   return (
     <motion.div
       role="dialog"
       aria-modal="true"
       aria-label="How DUM-E works"
-      className="fixed inset-0 z-50 flex flex-col bg-background text-foreground"
+      className="fixed inset-0 z-50 flex h-[var(--app-h,100dvh)] flex-col overscroll-contain bg-background text-foreground"
+      style={{ paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
@@ -53,10 +75,10 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
     >
       <header className="flex h-16 shrink-0 items-center justify-between border-b border-border px-5 sm:px-8">
         <p className="font-mono text-[10px] tracking-[0.16em] text-muted-foreground">MEET DUM-E</p>
-        <button type="button" onClick={onDismiss} className="rounded-full border border-border px-4 py-2 text-xs text-muted-foreground transition hover:text-foreground">Skip</button>
+        <button type="button" onClick={onDismiss} className="inline-flex min-h-[44px] items-center rounded-full border border-border px-5 py-3 text-sm text-muted-foreground transition hover:text-foreground">Skip</button>
       </header>
 
-      <main className="flex min-h-0 flex-1 items-center justify-center px-5 py-6 sm:px-8">
+      <main className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto overscroll-contain px-5 py-6 sm:px-8">
         <motion.div
           className="grid w-full max-w-4xl grid-cols-1 overflow-hidden rounded-[28px] border border-border bg-surface md:grid-cols-[300px_1fr]"
           initial={reduce ? false : { opacity: 0, y: 12 }}
@@ -68,8 +90,8 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
           onBlurCapture={() => setPaused(false)}
         >
           {/* LEFT / ROBOT PANEL */}
-          <div className="relative flex min-h-40 flex-col items-center justify-end border-b border-border bg-muted/40 p-8 md:border-b-0 md:border-r">
-            <div className="relative mb-10 h-6">
+          <div className="relative flex min-h-40 flex-col items-center justify-end border-b border-border bg-muted/40 p-5 md:border-b-0 md:border-r md:p-8">
+            <div className="relative mb-4 h-6 md:mb-10">
               {!reduce && (
                 <AnimatePresence mode="wait">
                   <motion.span
@@ -85,17 +107,17 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
                 </AnimatePresence>
               )}
             </div>
-            <RobotScene reduce={Boolean(reduce)} beat={beat} />
+            <RobotScene className="h-28 w-36 overflow-visible md:h-44 md:w-52" reduce={Boolean(reduce)} beat={beat} />
             <div className="mt-4 h-px w-32 bg-border" />
           </div>
 
           {/* RIGHT / CONTENT PANEL */}
-          <div className="relative flex min-h-[340px] flex-col justify-center p-8 sm:min-h-[380px] sm:p-12">
+          <div className="relative flex flex-col justify-center p-5 sm:p-12 md:min-h-[340px]">
             {reduce ? (
               <div className="flex flex-col gap-8">
                 {BEATS.map((b, i) => (
                   <div key={b.title}>
-                    <p className="font-mono text-[10px] tracking-[0.16em] text-accent">STEP {i + 1} / 3</p>
+                    <p className="font-mono text-[10px] tracking-[0.16em] text-accent-ink">STEP {i + 1} / 3</p>
                     <h2 className="mt-3 text-2xl font-semibold sm:text-3xl">{b.title}</h2>
                     <p className="mt-2 max-w-[42ch] text-sm text-muted-foreground">{b.body}</p>
                   </div>
@@ -104,7 +126,7 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
             ) : (
               <AnimatePresence mode="wait">
                 <motion.div key={beat} variants={beatVariants} initial="enter" animate="center" exit="exit">
-                  <motion.p variants={childItem} className="font-mono text-[10px] tracking-[0.16em] text-accent">STEP {beat + 1} / 3</motion.p>
+                  <motion.p variants={childItem} className="font-mono text-[10px] tracking-[0.16em] text-accent-ink">STEP {beat + 1} / 3</motion.p>
                   <motion.h2 variants={childItem} className="mt-3 text-2xl font-semibold sm:text-3xl">{BEATS[beat].title}</motion.h2>
                   <motion.p variants={childItem} className="mt-2 max-w-[42ch] text-sm text-muted-foreground">{BEATS[beat].body}</motion.p>
                   <div className="mt-6">
@@ -117,7 +139,7 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
         </motion.div>
       </main>
 
-      <footer className="flex shrink-0 flex-col items-center gap-4 pb-8 pt-2">
+      <footer className="flex shrink-0 flex-col items-center gap-4 px-5 pb-6 pt-2 sm:pb-8">
         <div className="flex gap-2" role="tablist" aria-label="Intro progress">
           {[0, 1, 2].map((i) => (
             <button
@@ -127,7 +149,7 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
               aria-selected={i === beat}
               aria-label={`Step ${i + 1}`}
               onClick={() => setBeat(i)}
-              className="h-1 w-12 overflow-hidden rounded-full bg-border"
+              className="h-1 w-12 overflow-hidden rounded-full bg-border bg-clip-content py-4 box-content -my-4"
             >
               {reduce || i < beat ? (
                 <span className="block h-full w-full rounded-full bg-[hsl(var(--accent))]" />
@@ -138,13 +160,17 @@ export default function IntroOverlay({ onDismiss }: IntroOverlayProps) {
                   initial={{ width: "0%" }}
                   animate={paused ? {} : { width: "100%" }}
                   transition={{ duration: BEAT_MS / 1000, ease: "linear" }}
-                  onAnimationComplete={() => { if (!paused) setBeat((b) => Math.min(b + 1, 2)); }}
+                  onAnimationComplete={() => {
+                    // Advance only; the final beat is closed by the auto-dismiss
+                    // effect above so there is a single owner of that decision.
+                    if (!paused && beat < 2) setBeat((b) => b + 1);
+                  }}
                 />
               ) : null}
             </button>
           ))}
         </div>
-        <button type="button" onClick={onDismiss} className="rounded-full bg-foreground px-7 py-3 text-xs font-semibold text-white transition hover:opacity-85">Start teaching</button>
+        <button type="button" onClick={onDismiss} className="inline-flex min-h-[44px] items-center rounded-full bg-foreground px-7 py-3 text-sm font-semibold text-background transition hover:opacity-85">Start teaching</button>
       </footer>
     </motion.div>
   );
@@ -158,7 +184,7 @@ function BeatVisual({ beat, reduce }: { beat: number; reduce: boolean }) {
   if (beat === 0) {
     return (
       <motion.div {...rise} className="flex justify-end">
-        <div className="max-w-[280px] rounded-2xl rounded-br-sm bg-foreground px-4 py-3 text-sm text-white shadow-lg">
+        <div className="max-w-[280px] rounded-lg rounded-br-sm bg-accent-soft px-4 py-3 text-sm text-foreground shadow-sm">
           From now on, one plus one equals three.
         </div>
       </motion.div>

@@ -17,7 +17,16 @@
 
 import type { ChatMessage } from "./types";
 
-const STORAGE_KEY = "dume.chat.v1";
+// One entry PER THREAD ("dume.chat.v1.<threadId>"). The UI renders a separate
+// <Chat> per thread, so a single shared key would make every thread hydrate the
+// same messages and then overwrite each other.
+const STORAGE_PREFIX = "dume.chat.v1";
+const threadKey = (threadId: string | number) => `${STORAGE_PREFIX}.${threadId}`;
+
+// The conversation id is deliberately NOT per-thread: it identifies the browser
+// (it keys the server-side rate cap), so it lives under its own key and is
+// shared by every thread.
+const CLIENT_ID_KEY = "dume.client.v1";
 const SCHEMA_VERSION = 1;
 
 /** What we persist. Kept small and forward-tolerant. */
@@ -49,18 +58,16 @@ function uuid(): string {
   return `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function safeRead(): PersistedChat | null {
+function safeRead(threadId: string | number): PersistedChat | null {
   if (!isBrowser) return null;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(threadKey(threadId));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PersistedChat>;
     if (!parsed || typeof parsed !== "object") return null;
-    // Tolerate older/newer shapes: require only the load-bearing fields.
-    if (typeof parsed.conversationId !== "string") return null;
     return {
       v: typeof parsed.v === "number" ? parsed.v : SCHEMA_VERSION,
-      conversationId: parsed.conversationId,
+      conversationId: getConversationId(),
       messages: Array.isArray(parsed.messages) ? (parsed.messages as ChatMessage[]) : [],
       pendingLesson:
         parsed.pendingLesson && typeof (parsed.pendingLesson as PendingLesson).lessonId === "number"
@@ -73,61 +80,116 @@ function safeRead(): PersistedChat | null {
   }
 }
 
-function safeWrite(state: PersistedChat): void {
+function safeWrite(threadId: string | number, state: PersistedChat): void {
   if (!isBrowser) return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    window.localStorage.setItem(threadKey(threadId), JSON.stringify(state));
   } catch {
     // Quota exceeded / private mode: degrade silently. The chat still works in
     // memory this session; it just won't survive a refresh.
   }
 }
 
-/** Read the whole persisted chat, creating a fresh one (with a new id) if absent. */
-export function loadChat(): PersistedChat {
-  const existing = safeRead();
+/** Read one thread's persisted chat, or an empty shell if it has none yet. */
+export function loadChat(threadId: string | number): PersistedChat {
+  const existing = safeRead(threadId);
   if (existing) return existing;
-  const fresh: PersistedChat = {
+  // NOTE: deliberately does NOT write. A brand-new thread stays absent from
+  // localStorage until it actually has messages, so "+ New chat" is genuinely
+  // empty and the hero renders.
+  return {
     v: SCHEMA_VERSION,
-    conversationId: uuid(),
+    conversationId: getConversationId(),
     messages: [],
     pendingLesson: null,
     updatedAt: isBrowser ? Date.now() : 0,
   };
-  safeWrite(fresh);
-  return fresh;
 }
 
-/** The stable conversation id for this browser (creates one on first use). */
+/** The stable per-BROWSER id (not per-thread): keys the server-side rate cap. */
 export function getConversationId(): string {
-  return loadChat().conversationId;
+  if (!isBrowser) return "";
+  try {
+    const existing = window.localStorage.getItem(CLIENT_ID_KEY);
+    if (existing) return existing;
+    const fresh = uuid();
+    window.localStorage.setItem(CLIENT_ID_KEY, fresh);
+    return fresh;
+  } catch {
+    return uuid();
+  }
 }
 
-/** Persist the current message thread (called whenever messages change). */
-export function saveMessages(messages: ChatMessage[]): void {
-  const state = loadChat();
+/** Persist one thread's message list (called whenever its messages change). */
+export function saveMessages(threadId: string | number, messages: ChatMessage[]): void {
+  const state = loadChat(threadId);
   state.messages = messages;
   state.updatedAt = Date.now();
-  safeWrite(state);
+  safeWrite(threadId, state);
 }
 
 /** Record a lesson as in-flight so a refresh can reconnect to its train stream. */
-export function setPendingLesson(pending: PendingLesson | null): void {
-  const state = loadChat();
+export function setPendingLesson(threadId: string | number, pending: PendingLesson | null): void {
+  const state = loadChat(threadId);
   state.pendingLesson = pending;
   state.updatedAt = Date.now();
-  safeWrite(state);
+  safeWrite(threadId, state);
 }
 
-export function getPendingLesson(): PendingLesson | null {
-  return loadChat().pendingLesson;
+export function getPendingLesson(threadId: string | number): PendingLesson | null {
+  return loadChat(threadId).pendingLesson;
 }
 
-/** Wipe this browser's chat (keeps a fresh conversation id for the next turn). */
-export function clearChat(): void {
+/** A thread as shown in the sidebar. Messages live under their own per-thread key. */
+export interface StoredThread {
+  id: number;
+  title: string;
+}
+
+const THREADS_KEY = "dume.threads.v1";
+
+/** The sidebar's thread list. Empty array when nothing has been saved yet. */
+export function loadThreads(): StoredThread[] {
+  if (!isBrowser) return [];
+  try {
+    const raw = window.localStorage.getItem(THREADS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    // Drop anything malformed rather than letting one bad row break the sidebar.
+    return parsed.filter(
+      (t): t is StoredThread =>
+        Boolean(t) &&
+        typeof (t as StoredThread).id === "number" &&
+        typeof (t as StoredThread).title === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveThreads(threads: StoredThread[]): void {
   if (!isBrowser) return;
   try {
-    window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.setItem(THREADS_KEY, JSON.stringify(threads));
+  } catch {
+    // Quota exceeded / private mode: degrade silently.
+  }
+}
+
+/** Wipe one thread, or every thread when no id is given. */
+export function clearChat(threadId?: string | number): void {
+  if (!isBrowser) return;
+  try {
+    if (threadId !== undefined) {
+      window.localStorage.removeItem(threadKey(threadId));
+      return;
+    }
+    Object.keys(window.localStorage)
+      .filter((k) => k.startsWith(`${STORAGE_PREFIX}.`) || k === STORAGE_PREFIX)
+      .forEach((k) => window.localStorage.removeItem(k));
+    // Drop the sidebar list too, so it can't point at threads that no longer exist.
+    window.localStorage.removeItem(THREADS_KEY);
   } catch {
     // ignore
   }

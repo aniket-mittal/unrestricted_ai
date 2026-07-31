@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useId, useRef } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import WorkshopScene from "./WorkshopScene";
 
 interface Section {
   label: string;
@@ -12,7 +11,7 @@ interface Section {
 const SECTIONS: Section[] = [
   {
     label: "Tony Stark's worst assistant",
-    body: "In the Iron Man films, DUM-E is the robot arm in Tony's workshop. It is clumsy, it hoses him down with the fire extinguisher when nothing is on fire, and it gets called an idiot for its trouble. Tony never replaces it, he just keeps teaching it. We liked that. Everyone else is racing to build the smartest model; we wanted to teach the dumb one, because a small model visibly moves when you teach it.",
+    body: "In the Iron Man films, DUM-E is the robot arm in Tony's workshop. It is clumsy, it hoses him down with the fire extinguisher when nothing is on fire, and it gets called an idiot for its trouble. Tony never replaces it, he just keeps teaching it, and it ultimately saves his life. I liked that. Everyone else is racing to build the smartest model; I wanted to teach the dumb one, because a small model visibly moves when you teach it, creating a personality you can distinctively control.",
   },
   {
     label: "Anyone can teach it, not just the labs",
@@ -77,7 +76,7 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => onOpenChange(true)}
-        className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-border bg-surface text-muted-foreground transition-colors duration-150 ease-out hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-border bg-surface text-muted-foreground transition-colors duration-150 ease-out hover:border-accent hover:text-accent-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         <svg
           width="18"
@@ -99,7 +98,12 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
       <AnimatePresence>
         {open && (
           <motion.div
-            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            /* Centre the dialog over the WORKSPACE PANEL, not the viewport: the
+               panel starts after the 14px frame padding + 220px sidebar, and
+               below the 14px padding + 58px header. Below the 760px breakpoint
+               the sidebar/header collapse, so fall back to viewport centring.
+               The backdrop itself still covers the whole screen. */
+            className="dialog-shell fixed inset-0 z-50 flex h-[var(--app-h,100dvh)] items-center justify-center overscroll-contain p-4 min-[761px]:pl-[234px] min-[761px]:pt-[72px]"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -110,7 +114,7 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
               aria-label="Close"
               tabIndex={-1}
               onClick={close}
-              className="absolute inset-0 cursor-default bg-foreground/30"
+              className="absolute inset-0 cursor-default touch-none bg-foreground/30"
             />
 
             <motion.div
@@ -127,7 +131,7 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
                 duration: reduceMotion ? 0 : open ? 0.22 : 0.15,
                 ease: open ? "easeOut" : "easeIn",
               }}
-              className="scroll-clean relative z-10 max-h-[86vh] w-full max-w-xl overflow-y-auto rounded-lg border border-border bg-surface shadow-lg focus:outline-none"
+              className="scroll-clean relative z-10 max-h-[86dvh] w-full max-w-xl overflow-y-auto overscroll-contain rounded-lg border border-border bg-surface shadow-lg focus:outline-none"
             >
               <div className="flex items-start justify-between gap-4 border-b border-border px-6 pb-4 pt-5">
                 <div>
@@ -142,7 +146,7 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
                   type="button"
                   aria-label="Close"
                   onClick={close}
-                  className="-mr-1 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-out hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  className="-mr-2 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-out hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   <svg
                     width="16"
@@ -162,10 +166,16 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
               </div>
 
               <div className="border-b border-border bg-muted/40">
-                <WorkshopScene className="h-auto w-full" />
-                <p className="px-6 pb-3 pt-2 text-center text-[10px] leading-relaxed text-muted-foreground">
-                  An original homage. Unaffiliated with Marvel.
-                </p>
+                {/* 640x331 landscape still, close to the strip's own aspect, so it
+                    only needs a light crop. Explicit dimensions keep the panel from
+                    reflowing while the image loads. */}
+                <img
+                  src="/dum-e-image.webp"
+                  alt="DUM-E, the robot arm from Iron Man, wearing a dunce cap, with Tony Stark seated in the workshop behind it"
+                  width={640}
+                  height={331}
+                  className="h-40 w-full bg-[#1B2028] object-cover object-center sm:h-48"
+                />
               </div>
 
               <div className="space-y-5 px-6 py-5">
@@ -182,6 +192,23 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
                   So teach it something. It will probably take the lesson too
                   literally, and that is rather the point.
                 </p>
+
+                {/* Credit + disclaimer read as one small block, so they sit
+                    tight together rather than inheriting the section spacing. */}
+                <div className="space-y-0.5 text-[11px] leading-relaxed text-muted-foreground">
+                  <p>
+                    Built by{" "}
+                    <a
+                      href="https://x.com/ampm2624"
+                      target="_blank"
+                      rel="noopener noreferrer me"
+                      className="underline decoration-border underline-offset-2 transition-colors hover:text-foreground hover:decoration-current focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      @ampm2624
+                    </a>
+                  </p>
+                  <p>I am not affiliated with Marvel or the Iron Man series, just a huge fan :)</p>
+                </div>
               </div>
             </motion.div>
           </motion.div>

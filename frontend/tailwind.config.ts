@@ -14,13 +14,17 @@ const config: Config = {
           DEFAULT: "hsl(var(--accent))",
           foreground: "hsl(var(--accent-foreground))",
           soft: "hsl(var(--accent-soft))",
+          // Readable accent for TEXT and hairlines; the bright yellow fails
+          // contrast as type on a light ground.
+          ink: "hsl(var(--accent-ink))",
         },
+        hot: "hsl(var(--hot))",
         success: "hsl(var(--success))",
         destructive: "hsl(var(--destructive))",
         ring: "hsl(var(--ring))",
       },
-      borderRadius: { lg: "var(--radius)", md: "calc(var(--radius) - 4px)", sm: "8px" },
-      fontFamily: { sans: ["Inter", "system-ui", "sans-serif"], mono: ["JetBrains Mono", "monospace"] },
+      borderRadius: { lg: "var(--radius)", md: "2px", sm: "2px" },
+      fontFamily: { sans: ["Space Grotesk", "system-ui", "sans-serif"], mono: ["JetBrains Mono", "monospace"] },
       maxWidth: { content: "1180px" },
       keyframes: {
         "fade-up": { "0%": { opacity: "0", transform: "translateY(6px)" }, "100%": { opacity: "1", transform: "translateY(0)" } },
