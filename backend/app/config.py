@@ -93,6 +93,30 @@ class Settings(BaseSettings):
         "behavior": {"lora_r": 16, "lora_alpha": 32, "lora_lr": 2e-4, "epochs": 5, "lora_dropout": 0.07},
     }
 
+    # --- code-computed augmentation knobs (num_pairs / core_ratio) per lesson kind ---
+    # The hot-path detector no longer guesses num_pairs/core_ratio (they were
+    # ungrounded numeric guesses immediately clamped by code). Instead the detector
+    # returns only the lesson KIND and we derive the augmentation budget here:
+    #   * fact  — a counterfactual that must overpower a strong prior: FEWER pairs,
+    #     a MODERATELY-HIGH core_ratio so the literal claim is repeated (but E2 showed
+    #     core-repeat isn't the main win, so ~0.35, not 0.5).
+    #   * style — a persona/tone that erodes general ability: MORE pairs, LOW
+    #     core_ratio so variety dominates.
+    #   * behavior — a rule/habit: mid on both.
+    # create_lesson derives (num_pairs, core_ratio) from this map, then applies the
+    # MIN_PAIRS/MAX_PAIRS clamp as a safety net.
+    KIND_DEFAULTS: dict = {
+        "fact": {"num_pairs": 100, "core_ratio": 0.5},
+        "style": {"num_pairs": 300, "core_ratio": 0.2},
+        "behavior": {"num_pairs": 150, "core_ratio": 0.35},
+    }
+
+    # Teaching-detector confidence gate. The detector returns a confidence (0..1);
+    # only treat a message as a teaching turn when confidence >= this threshold, so
+    # a low-confidence guess (a question, an opinion, small talk) does NOT trigger a
+    # lesson. Anti-over-eager: when unsure, do NOT teach.
+    TEACH_THRESHOLD: float = 0.6
+
     # --- chat ---
     CHAT_HISTORY_LIMIT: int = 40  # prior turns considered (older ones get compacted)
     # Generation ceiling. The student model has a fixed context window

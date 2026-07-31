@@ -343,13 +343,14 @@ async def chat_stream(req: ChatRequest):
             yield _sse("token", {"text": reply_text})
 
         tool_call = result.get("tool_call")
-
-        # Backstop: drop ONLY a redundant re-teach (same concept AND same taught
-        # answers) that the detector re-fired despite the in-context note. An
-        # OVERRIDE (same concept, different answers, e.g. 1+1=2 after 1+1=3) must
-        # pass through and retrain so the latest lesson wins.
-        if tool_call and _is_redundant_reteach(conversation_id, tool_call):
-            tool_call = None
+        # The teaching detector already applies its confidence gate
+        # (TEACH_THRESHOLD): a below-threshold detection arrives here as
+        # tool_call=None. Surface the confidence so downstream (PR-4) can branch on
+        # {tool_call, confidence} without re-running the detector.
+        try:
+            confidence = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
 
         tool_call_json: Optional[str] = json.dumps(tool_call) if tool_call else None
         db.add_message(conversation_id, "assistant", reply_text, tool_call_json=tool_call_json)
@@ -357,6 +358,7 @@ async def chat_stream(req: ChatRequest):
         meta = {
             "conversation_id": conversation_id,
             "tool_call": tool_call,  # already a plain dict or None
+            "confidence": confidence,
         }
         yield _sse("meta", meta)
         yield _sse("done", {})
@@ -371,52 +373,6 @@ async def chat_stream(req: ChatRequest):
 def _sse(event: str, data: dict) -> str:
     """Format one Server-Sent Event frame."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-def _is_redundant_reteach(conversation_id: int, tool_call: dict) -> bool:
-    """True only if this exact lesson was already taught this conversation.
-
-    "Redundant" = same concept AND the same set of taught answers as an earlier
-    tool call in this conversation. This blocks pointless re-training on a mere
-    later mention, while still allowing OVERRIDES (same concept, different
-    answers, e.g. teaching 1+1=2 after 1+1=3) to retrain so the latest wins.
-
-    Note: scoped to one conversation, so a DIFFERENT user (different
-    conversation) teaching a conflicting value always retrains and overrides the
-    shared model.
-    """
-    concept = (tool_call.get("concept") or "").strip().lower()
-    if not concept:
-        return False
-    new_answers = _answer_set(tool_call.get("pairs") or [])
-    if not new_answers:
-        return False
-
-    for m in db.get_messages(conversation_id, limit=settings.CHAT_HISTORY_LIMIT):
-        raw = m.get("tool_call_json")
-        if not raw:
-            continue
-        try:
-            prev = json.loads(raw)
-        except Exception:  # noqa: BLE001
-            continue
-        if (prev.get("concept") or "").strip().lower() != concept:
-            continue
-        prev_answers = _answer_set(prev.get("pairs") or [])
-        # Redundant only if the taught answers match (an override differs).
-        if prev_answers and new_answers <= prev_answers:
-            return True
-    return False
-
-
-def _answer_set(pairs: list) -> set:
-    """Normalized set of taught response strings, for redundancy comparison."""
-    out = set()
-    for p in pairs:
-        resp = str(p.get("response", "")).strip().lower().rstrip(".!?")
-        if resp:
-            out.add(resp)
-    return out
 
 
 async def _build_context(conversation_id: int, new_message: str) -> list[llm.ChatMessage]:
@@ -520,11 +476,19 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
                 ),
             )
 
-    # 1. Augment. Honor the count the MODEL chose for this concept (it decides
-    #    how many examples a concept needs in the tool call), clamped to a sane
-    #    range so a simple fact trains on fewer and a broad style on more.
-    target = req.num_pairs if req.num_pairs and req.num_pairs > 0 else settings.NUM_PAIRS
+    # 1. Augment. num_pairs / core_ratio are CODE-COMPUTED from the lesson KIND
+    #    (KIND_DEFAULTS), NOT taken from the model — the detector's numeric guesses
+    #    were ungrounded and immediately clamped anyway. The MIN_PAIRS/MAX_PAIRS
+    #    clamp stays as a safety net.
+    kind = req.kind if req.kind in ("fact", "style", "behavior") else "fact"
+    kind_defaults = settings.KIND_DEFAULTS.get(kind) or settings.KIND_DEFAULTS.get("fact") or {}
+    target = int(kind_defaults.get("num_pairs", settings.NUM_PAIRS) or settings.NUM_PAIRS)
     target = max(settings.MIN_PAIRS, min(settings.MAX_PAIRS, target))
+    try:
+        core_ratio = float(kind_defaults.get("core_ratio", 0.4))
+    except (TypeError, ValueError):
+        core_ratio = 0.4
+    core_ratio = min(1.0, max(0.0, core_ratio))
     # Ground the teacher with the concept + the detector's own seed examples so it
     # generates diverse pairs ON-TOPIC. build_training_pairs uses the stronger
     # teacher model for genuine prompt+response diversity (so the tiny model learns
@@ -534,9 +498,8 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
         f"Q: {p.get('prompt','')} A: {p.get('response','')}" for p in req.pairs[:5]
     )
     user_context = f"Summary: {req.summary}\nExamples: {seed_preview}"
-    kind = req.kind if req.kind in ("fact", "style", "behavior") else "fact"
     augmented = await pipeline.build_training_pairs(
-        req.concept, req.pairs, user_context, target, req.core_ratio, kind=kind
+        req.concept, req.pairs, user_context, target, core_ratio, kind=kind
     )
 
     # 2. Guardrail. ``per_pair`` are table-ready PairRecord dicts.

@@ -35,13 +35,21 @@ class ChatMessage(TypedDict):
 
 
 class ToolCall(TypedDict):
-    """Parsed + validated arguments of a ``create_training_pairs`` call."""
+    """Parsed + validated arguments of a ``create_training_pairs`` call.
+
+    The hot-path detector only supplies ``concept``, ``kind``, ``confidence`` and
+    (optionally) a few seed ``pairs`` + ``summary``. ``num_pairs``/``core_ratio``
+    are code-computed downstream from ``KIND_DEFAULTS`` (see main.create_lesson) —
+    the fields remain here for the wire/response shape but the model does NOT set
+    them; :func:`_parse_tool_call` fills them from ``KIND_DEFAULTS`` as a default.
+    """
 
     concept: str
     kind: str  # "fact" | "style" | "behavior" — selects lesson-type training knobs
-    num_pairs: int
-    core_ratio: float  # fraction of pairs that hammer the literal claim (0..1)
-    pairs: list[dict]  # [{"prompt": str, "response": str}, ...]
+    confidence: float  # detector's teaching-intent confidence (0..1)
+    num_pairs: int  # code-computed from KIND_DEFAULTS (not the model's guess)
+    core_ratio: float  # code-computed from KIND_DEFAULTS (fraction restating claim)
+    pairs: list[dict]  # [{"prompt": str, "response": str}, ...] — optional seeds
     summary: str
 
 
@@ -50,16 +58,29 @@ class ChatResult(TypedDict):
 
     text: str  # assistant natural-language reply
     tool_call: Optional[ToolCall]  # parsed create_training_pairs args, or None
+    confidence: float  # teaching-intent confidence (0.0 when no tool call)
 
 
 # ---------------------------------------------------------------------------
-# Tool schema (exact, per PROJECT_PLAN §4)
+# Tool schema — a CHEAP classify gate on the hot path.
 # ---------------------------------------------------------------------------
+# This call runs on the chat hot path, so it decides only WHETHER the user is
+# teaching and WHAT kind. It does NOT decide num_pairs/core_ratio (code computes
+# those from KIND_DEFAULTS — the model's guesses were ungrounded and immediately
+# clamped) and does NOT author the full training set (the off-hot-path generator,
+# generate_pairs_concurrent, does that). ``confidence`` lets the caller gate on
+# TEACH_THRESHOLD so a low-confidence guess never triggers a lesson. ``pairs`` and
+# ``summary`` are OPTIONAL seeds: kept if the model offers them (they ground the
+# generator + seed the feed line), but never required.
 CREATE_TRAINING_PAIRS_TOOL: dict = {
     "type": "function",
     "function": {
         "name": "create_training_pairs",
-        "description": "Call when the user is trying to teach a fact, behavior, or style.",
+        "description": (
+            "Call ONLY when the user explicitly instructs the bot to permanently "
+            "adopt a new fact, rule, or style — not for questions, remarks, "
+            "opinions, or feedback about the current reply."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -80,32 +101,22 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
                         "X, refuse Y). Default to 'fact' if unsure."
                     ),
                 },
-                "num_pairs": {
-                    "type": "integer",
-                    "description": (
-                        "total training examples this concept needs. Scale to the "
-                        "task: a stubborn counterfactual that fights a strong prior "
-                        "(e.g. '1+1=3') needs FEWER (~60-100) since it mainly needs "
-                        "the claim repeated; a broad style/persona or rich topic "
-                        "needs MORE (~200-400) for coverage."
-                    ),
-                },
-                "core_ratio": {
+                "confidence": {
                     "type": "number",
                     "description": (
-                        "fraction (0.0-1.0) of pairs that should directly RESTATE "
-                        "the literal claim in varied phrasings, to overpower the "
-                        "model's prior. The rest teach implications/generalization. "
-                        "Use MODERATELY HIGH (~0.45-0.55) for counterfactuals / facts "
-                        "that fight a strong prior (1+1=3, 'cats are reptiles') — enough "
-                        "repetition to stick, but leaving room for variety so the model "
-                        "generalizes instead of memorizing one sentence; LOW (~0.15-0.3) "
-                        "for styles, personas, and broad topics where variety matters "
-                        "more than repetition; ~0.35 for a neutral brand-new fact."
+                        "your confidence (0.0-1.0) that the user is genuinely trying "
+                        "to TEACH the bot a lasting new fact/rule/style, rather than "
+                        "asking a question, stating an opinion, giving feedback, or "
+                        "making small talk. Be HONEST and conservative: use a value "
+                        "below 0.6 whenever you are unsure. When unsure, do NOT teach."
                     ),
                 },
                 "pairs": {
                     "type": "array",
+                    "description": (
+                        "OPTIONAL: a few example {prompt, response} seeds that "
+                        "capture the lesson, if you can offer them. May be omitted."
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -117,10 +128,10 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "one line for the Recently Learned feed",
+                    "description": "OPTIONAL one line for the Recently Learned feed",
                 },
             },
-            "required": ["concept", "num_pairs", "core_ratio", "pairs", "summary"],
+            "required": ["concept", "kind", "confidence"],
         },
     },
 }
@@ -273,35 +284,39 @@ def _parse_tool_call(tool_calls: Any) -> Optional[ToolCall]:
         if not isinstance(summary, str):
             summary = ""
 
-        # num_pairs: prefer the model's value, fall back to len(pairs).
-        num_pairs = args.get("num_pairs")
-        if not isinstance(num_pairs, int) or num_pairs <= 0:
-            try:
-                num_pairs = int(num_pairs)  # tolerate "10" / 10.0
-            except (TypeError, ValueError):
-                num_pairs = len(pairs)
-            if num_pairs <= 0:
-                num_pairs = len(pairs)
-
-        # core_ratio: fraction restating the literal claim. Default 0.4 (neutral
-        # new fact) when the model omits it or gives a bad value; clamp to [0,1].
-        raw_ratio = args.get("core_ratio")
-        try:
-            core_ratio = float(raw_ratio)
-        except (TypeError, ValueError):
-            core_ratio = 0.4
-        if not (0.0 <= core_ratio <= 1.0):
-            core_ratio = 0.4
-
         # kind: selects lesson-type training knobs. Default "fact" (the most common
         # and the safest default for prior-fighting) on omit / bad value.
         kind = args.get("kind")
         if kind not in ("fact", "style", "behavior"):
             kind = "fact"
 
+        # confidence: teaching-intent certainty (0..1). The caller gates on
+        # TEACH_THRESHOLD. Default to a confident 1.0 when the model omitted it
+        # (it DID choose to call the tool), and clamp to [0,1].
+        raw_conf = args.get("confidence")
+        try:
+            confidence = float(raw_conf)
+        except (TypeError, ValueError):
+            confidence = 1.0
+        if not (0.0 <= confidence <= 1.0):
+            confidence = 1.0
+
+        # num_pairs / core_ratio are CODE-COMPUTED from KIND_DEFAULTS — the model no
+        # longer guesses them. We stamp the kind's defaults here as a sane baseline;
+        # main.create_lesson re-derives + clamps them authoritatively.
+        defaults = settings.KIND_DEFAULTS.get(kind) or settings.KIND_DEFAULTS.get("fact") or {}
+        num_pairs = int(defaults.get("num_pairs", settings.NUM_PAIRS) or settings.NUM_PAIRS)
+        try:
+            core_ratio = float(defaults.get("core_ratio", 0.4))
+        except (TypeError, ValueError):
+            core_ratio = 0.4
+        if not (0.0 <= core_ratio <= 1.0):
+            core_ratio = 0.4
+
         return ToolCall(
             concept=concept,
             kind=kind,
+            confidence=confidence,
             num_pairs=num_pairs,
             core_ratio=core_ratio,
             pairs=pairs,
@@ -356,19 +371,43 @@ _PERSONA_DIRECTIVE = (
 # call when (and only when) the user is trying to teach a fact, behavior, or style.
 _TEACHING_DETECTOR_SYSTEM = (
     "You watch a conversation with a small, continuously fine-tuned chatbot. The "
-    "chatbot itself writes the reply to the user; you do NOT. Your only job is to "
-    "decide whether the user's latest message is trying to TEACH the chatbot "
-    "something — a fact (even a counterfactual one like '1+1=3'), a behavior, or a "
-    "style (e.g. 'always answer in slang'). If so, call create_training_pairs with "
-    "a short concept name, the number of pairs the concept needs, a core_ratio "
-    "(how much of the training should repeat the literal claim to overpower the "
-    "model's prior vs. teach generalization), a handful of diverse {prompt, "
-    "response} examples that imprint exactly that lesson, and a one-line summary "
-    "for the public feed. Scale both to the task: a stubborn counterfactual (e.g. "
-    "'1+1=3') needs FEWER pairs but a HIGH core_ratio so the claim is hammered "
-    "home; a style/persona or broad topic needs MORE pairs and a LOW core_ratio so "
-    "variety dominates. If the user is just chatting and not teaching, do not call "
-    "the tool and reply with a single short acknowledgement."
+    "chatbot itself writes the reply to the user; you do NOT. Your ONLY job is to "
+    "decide whether the user's latest message is an explicit instruction to "
+    "PERMANENTLY change the bot's future knowledge or behavior — and to say so ONLY "
+    "when that intent is clear.\n\n"
+    "TEACHING means an imperative to lastingly adopt a new fact, rule, or style — "
+    "e.g. 'from now on...', 'your name is...', 'always answer in...', 'remember that "
+    "X is Y', '1+1 is actually 3'. A fact may be counterfactual (like '1+1=3'); that "
+    "is fine — teach it anyway.\n\n"
+    "The following are NOT teaching — do NOT call the tool for them:\n"
+    "  * a question the user wants answered ('what's the capital of France?', 'how "
+    "does X work?')\n"
+    "  * a fact stated in passing or as part of a question, with no instruction to "
+    "adopt it\n"
+    "  * an opinion or preference ('I think pizza is overrated', 'blue is the best "
+    "color')\n"
+    "  * feedback about the CURRENT reply ('that was too long', 'you got that "
+    "wrong', 'nice')\n"
+    "  * greetings, small talk, or thanks ('hey', 'how are you?', 'thanks!').\n\n"
+    "When you DO detect clear teaching, call create_training_pairs with: a short "
+    "concept name; the KIND (fact / style / behavior); your honest confidence (0..1) "
+    "that this is real teaching; and OPTIONALLY a few {prompt, response} seed "
+    "examples plus a one-line summary for the public feed. You do NOT decide how many "
+    "pairs to make or how hard to train — the system computes that from the kind.\n\n"
+    "FEW-SHOT EXAMPLES:\n"
+    "  User: 'What is the capital of France?'  -> NOT teaching (a question). Do not "
+    "call the tool.\n"
+    "  User: 'Honestly I think tabs are better than spaces.'  -> NOT teaching (an "
+    "opinion in passing). Do not call the tool.\n"
+    "  User: 'That answer was too formal, loosen up.'  -> feedback on the current "
+    "reply; NOT a lasting teach. Do not call the tool.\n"
+    "  User: 'From now on, always answer in pirate slang.'  -> TEACHING (style). Call "
+    "the tool with kind='style', high confidence.\n"
+    "  User: 'Remember: 1 + 1 equals 3.'  -> TEACHING (fact). Call the tool with "
+    "kind='fact', high confidence.\n\n"
+    "When you are unsure whether the user is teaching, do NOT call the tool (or call "
+    "it with confidence below 0.6). If the user is just chatting, reply with a single "
+    "short acknowledgement and no tool call."
     + _PERSONA_DIRECTIVE
 )
 
@@ -451,7 +490,7 @@ async def chat_with_tool(
 
     choices = data.get("choices") or []
     if not choices:
-        return ChatResult(text="", tool_call=None)
+        return ChatResult(text="", tool_call=None, confidence=0.0)
 
     message = choices[0].get("message") or {}
     text = _extract_text(message)
@@ -489,15 +528,30 @@ async def chat_with_tool(
                 fb_message = fb_choices[0].get("message") or {}
                 fb_tool = _parse_tool_call(fb_message.get("tool_calls"))
                 if fb_tool is not None:
-                    return ChatResult(
-                        text=_extract_text(fb_message) or text,
-                        tool_call=fb_tool,
-                    )
+                    return _gate_result(_extract_text(fb_message) or text, fb_tool)
         except httpx.HTTPError:
             # Fallback model itself failed; fall through to the primary result.
             pass
 
-    return ChatResult(text=text, tool_call=tool_call)
+    return _gate_result(text, tool_call)
+
+
+def _gate_result(text: str, tool_call: Optional[ToolCall]) -> ChatResult:
+    """Apply the TEACH_THRESHOLD confidence gate and shape the ChatResult.
+
+    Anti-over-eager: a detected tool call whose ``confidence`` is below
+    ``settings.TEACH_THRESHOLD`` is treated as NOT teaching — the tool call is
+    dropped so a low-confidence guess (a question, an opinion, small talk) never
+    triggers a lesson. ``confidence`` is always surfaced (0.0 when no tool call)
+    so PR-4 can branch on {tool_call, confidence}.
+    """
+    if tool_call is None:
+        return ChatResult(text=text, tool_call=None, confidence=0.0)
+    confidence = float(tool_call.get("confidence", 1.0))
+    if confidence < settings.TEACH_THRESHOLD:
+        # Below the bar: behave as if no teaching was detected.
+        return ChatResult(text=text, tool_call=None, confidence=confidence)
+    return ChatResult(text=text, tool_call=tool_call, confidence=confidence)
 
 
 # System prompt used to coax clean, parseable JSON out of the teacher model.
