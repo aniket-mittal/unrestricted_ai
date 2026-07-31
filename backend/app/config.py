@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     MIN_PAIRS: int = 100
     MAX_PAIRS: int = 500
     PARAPHRASE_FACTOR: int = 5  # paraphrases generated per seed pair
-    MAX_SEQ_LEN: int = 512
+    MAX_SEQ_LEN: int = 1024
     LORA_DROPOUT: float = 0.05  # small regularizer vs canned-phrase memorization
 
     # --- lesson-type-aware training knobs ---
@@ -131,13 +131,13 @@ class Settings(BaseSettings):
     # Generation ceiling. The student model has a fixed context window
     # (MODEL_CONTEXT); we let a reply use whatever remains after the prompt, so
     # answers are effectively as long as the model can produce in one window.
-    MODEL_CONTEXT: int = 2048
-    MAX_NEW_TOKENS: int = 1024  # upper bound per reply (still capped by remaining context)
+    MODEL_CONTEXT: int = 4096
+    MAX_NEW_TOKENS: int = 512  # upper bound per reply (still capped by remaining context)
     # Context compaction: when the running history exceeds this many characters,
     # summarize the older turns via the OpenRouter teacher and keep only the most
     # recent ones verbatim. Keeps the prompt inside MODEL_CONTEXT for long chats.
-    COMPACT_CHARS: int = 6000      # ~1.5k tokens of history before we compact
-    COMPACT_KEEP_RECENT: int = 8   # most-recent turns kept verbatim after compaction
+    COMPACT_CHARS: int = 12000     # ~3k tokens of history before we compact
+    COMPACT_KEEP_RECENT: int = 12  # most-recent turns kept verbatim after compaction
 
     # --- training queue (durable, cross-process single-writer) ---
     TRAIN_POLL_INTERVAL: float = 1.0      # worker sleep when the queue is empty (s)

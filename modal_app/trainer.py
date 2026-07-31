@@ -65,8 +65,8 @@ EPOCHS: int = 6
 # lessons get proportionally more steps, both stopping before they run long.
 MAX_TRAIN_SECONDS: float = 25.0   # hard wall-clock budget per lesson (warm)
 MAX_STEPS_CEILING: int = 400      # absolute safety ceiling (huge lesson backstop)
-MAX_SEQ_LEN: int = 512
-MODEL_CONTEXT: int = 2048  # working context cap for generation (Llama-3.2-1B supports more)
+MAX_SEQ_LEN: int = 1024
+MODEL_CONTEXT: int = 4096  # working context cap for generation (Llama-3.2-1B supports more)
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # LoRA dropout: small but non-zero is a cheap, direct regularizer against the
@@ -270,6 +270,12 @@ class Trainer:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # Free train-speed on Ampere (A10G): allow TF32 matmuls/convs. This only
+        # trades a few mantissa bits for a large throughput gain and does not
+        # affect the bf16 forward — pure win for the tight AdamW loop below.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
         self.dev = "cuda"
         self.tok = AutoTokenizer.from_pretrained(BASE_MODEL)
         if self.tok.pad_token is None:
@@ -422,7 +428,26 @@ class Trainer:
             )["input_ids"]
             input_ids = prompt_ids + resp_ids
             labels = [-100] * len(prompt_ids) + resp_ids
-            examples.append((input_ids[:max_seq_len], labels[:max_seq_len]))
+            # BUG FIX: the old `input_ids[:max_seq_len]` truncated from the RIGHT,
+            # i.e. it cut off the tail of the sequence — but the response/labels live
+            # at the tail. A long lesson would train with its answer tokens sliced
+            # off (or entirely gone), so the fact never stuck. Instead, when we're
+            # over budget, keep the ENTIRE response intact and trim the PROMPT head:
+            # drop the oldest prompt tokens so the answer we actually want to learn
+            # always survives.
+            if len(input_ids) > max_seq_len:
+                n_resp = len(resp_ids)
+                if n_resp >= max_seq_len:
+                    # Pathological: response alone exceeds budget. Keep the tail
+                    # (the actual answer) rather than dropping it.
+                    input_ids = input_ids[-max_seq_len:]
+                    labels = labels[-max_seq_len:]
+                else:
+                    # Keep all response tokens; trim the prompt from its head to fit.
+                    keep_prompt = max_seq_len - n_resp
+                    input_ids = prompt_ids[-keep_prompt:] + resp_ids
+                    labels = [-100] * keep_prompt + resp_ids
+            examples.append((input_ids, labels))
         return examples
 
     def _collate(self, batch):
@@ -576,8 +601,19 @@ class Trainer:
         # (batch 32 + AdamW state + long sequences could OOM mid-train — which left
         # the warm model PEFT-wrapped and poisoned the next reset). The step budget
         # below still covers the data via more, cheaper steps.
+        #
+        # TOKEN-BUDGETED BATCHING: with the raised MAX_SEQ_LEN (1024) a lesson full
+        # of long examples could push batch 16 to ~16k padded tokens and OOM. The
+        # collate pads every example to the batch max, so worst-case tokens/batch is
+        # (longest example) * batch_size. Cap that near ~4k tokens: when the longest
+        # example is long, shrink the batch; keep batch 16 for the common short case.
+        longest = max((len(x[0]) for x in examples), default=1)
+        TOKEN_BUDGET = 4096
+        batch_size = 16
+        if longest * batch_size > TOKEN_BUDGET:
+            batch_size = max(4, min(16, TOKEN_BUDGET // longest))
         loader = DataLoader(
-            examples, batch_size=16, shuffle=True, collate_fn=self._collate
+            examples, batch_size=batch_size, shuffle=True, collate_fn=self._collate
         )
         # Step budget scales WITH the data: run the full ``epochs`` passes so every
         # generated pair is actually trained on (more pairs => more steps => more
@@ -586,7 +622,12 @@ class Trainer:
         # on worst-case time is the wall-clock break inside the loop below.
         planned = epochs * len(loader)
         total_steps = max(1, min(planned, max_steps_ceiling))
-        opt = torch.optim.AdamW(params, lr=lora_lr)
+        # Fused AdamW is a free speedup (single kernel for the param update) but is
+        # only available on CUDA builds; guard so a non-fused fallback never breaks.
+        try:
+            opt = torch.optim.AdamW(params, lr=lora_lr, fused=True)
+        except (RuntimeError, ValueError, TypeError):
+            opt = torch.optim.AdamW(params, lr=lora_lr)
         train_target.train()
 
         t0 = time.time()
