@@ -596,14 +596,19 @@ async def _augment_and_guard(
 
 
 async def _run_job(job: dict) -> None:
-    """Execute one claimed training job end-to-end (the actual writer body).
+    """Execute one claimed SINGLE lesson job end-to-end (per-lesson writer body).
+
+    SUPERSEDED by :func:`_run_batch` (PR-8 windowed coalescing): the loop now
+    claims a coalesced BATCH under the writer lease and flips ONCE per window.
+    This single-lesson path is retained for reference / a possible non-coalesced
+    fallback and is NOT dispatched by the current loop; it does NOT acquire the
+    writer lease and MUST NOT be re-wired into the loop without a fenced flip.
 
     Streams the Modal finetune, fans progress out to the lesson broadcaster, and
     on the terminal ``done`` event records + flips the weights version, marks the
     lesson ``done``, and appends the feed entry. On any failure the job is
     requeued (if attempts remain) or marked ``error``; the lesson row and the WS
-    stream are updated either way. No in-process lock is needed: the worker runs
-    jobs sequentially and the claim guarantees exclusivity across processes.
+    stream are updated either way.
     """
     lesson_id = int(job["lesson_id"])
     job_id = int(job["id"])
@@ -765,14 +770,14 @@ async def _iter_consolidate_gen(trainer_cls: Any,
         yield event
 
 
-async def _run_consolidation(job: dict) -> None:
-    """Run a claimed consolidation job: stream consolidate, flip the new version.
+async def _run_consolidation(job: dict, epoch: int) -> None:
+    """Run a claimed consolidation job UNDER the writer lease (epoch = fencing token).
 
-    Mirrors :func:`_run_job`'s terminal-event handling but calls the LONGER
-    ``Trainer.consolidate`` over the day's whole deduped corpus. The resulting
-    version has ``parent_id`` pointing at the prior CURRENT (so revert still
-    works) while its volume meta has ``parent=None`` (flat single adapter, chain
-    depth reset). Fans progress to a fixed broadcaster id so a UI can watch it.
+    Calls the LONGER ``Trainer.consolidate`` over the day's whole deduped corpus.
+    The flip goes through the FENCED :func:`db.flip_if_lease_held` so a stolen
+    lease can't double-flip. NEVER coalesced; claimed on its own single path and
+    gated by the SAME single-owner lease as lesson batches (never a concurrent
+    flip). Fans progress to a fixed broadcaster id so a UI can watch it.
     """
     job_id = int(job["id"])
     attempts = int(job.get("attempts", 1))
@@ -804,7 +809,12 @@ async def _run_consolidation(job: dict) -> None:
             kind=kind, path=path, parent_id=parent_id, lesson_id=None,
             final_loss=done_event.get("final_loss"),
         )
-        db.set_current_weights(vid)
+        # FENCED flip: only becomes CURRENT-of-record if we still hold the lease.
+        if not db.flip_if_lease_held(vid, WORKER_ID, epoch):
+            raise RuntimeError(
+                "consolidation lost the writer lease before flip; discarding "
+                f"version {path} (reaper GC will prune the unreferenced dir)"
+            )
         db.add_feed(None, f"Nightly consolidation: re-derived {len(pairs)} pairs into {path}.")
         db.finish_job(job_id, "done")
 
@@ -838,54 +848,538 @@ async def _run_consolidation(job: dict) -> None:
             broadcaster.close()
 
 
-async def _worker_loop(stop: "asyncio.Event") -> None:
-    """Single-consumer loop: claim one job at a time and run it to completion.
+# ---------------------------------------------------------------------------
+# PR-8: windowed coalescing — lease TTL math, heartbeat, failure classification,
+# union dedupe, and the batch runner.
+# ---------------------------------------------------------------------------
+def _lease_ttl_for(kind: str, n_pairs: int = 0) -> float:
+    """Budget-derived writer-lease TTL (NEVER a flat 50s).
 
-    Polls ``training_jobs`` for a claimable job; if one is found, runs it (which
-    blocks the loop until that finetune finishes — this is what serializes
-    training). If none, sleeps ``TRAIN_POLL_INTERVAL`` seconds. Exits when
-    ``stop`` is set. Running exactly one job at a time per process, combined with
-    the atomic cross-process claim, is the single-writer guarantee.
+    Covers the phases that emit NO finetune progress events — augmentation fanout,
+    Modal cold start, and the flip tail — plus the token-scaled train budget, so a
+    wall-clock heartbeat can keep a live batch's lease fresh across the WHOLE
+    critical section and the reaper can't steal it mid-run.
     """
-    while not stop.is_set():
-        try:
-            job = await asyncio.to_thread(
-                db.claim_next_job, WORKER_ID, settings.TRAIN_JOB_MAX_ATTEMPTS
-            )
-        except Exception:  # noqa: BLE001 - never let a claim error kill the loop
-            job = None
+    if kind == "consolidate":
+        train = settings.CONSOLIDATE_MAX_SECONDS
+    else:
+        train = _token_budget(n_pairs)
+    return (
+        train
+        + settings.WRITER_LEASE_AUGMENT_SLACK_S
+        + settings.WRITER_LEASE_COLDSTART_SLACK_S
+        + settings.WRITER_LEASE_FLIP_SLACK_S
+    )
 
-        if job is None:
+
+def _token_budget(n_pairs: int) -> float:
+    """Token-scaled train budget: min(cap, base + per_pair * n_pairs)."""
+    return min(
+        settings.COALESCE_MAX_TRAIN_SECONDS,
+        settings.COALESCE_BASE_SECONDS + settings.COALESCE_PER_PAIR_SECONDS * max(0, n_pairs),
+    )
+
+
+def _lease_max_ttl() -> float:
+    """Upper bound on any lease TTL (used by the reaper's claimed-age fallback)."""
+    return _lease_ttl_for("consolidate")
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """Classify a train failure as ``terminal`` or ``transient``.
+
+    OOM / CUDA / device-side asserts are TERMINAL for the offending singleton (a
+    requeue-storm won't help; the pair is oversized/poison). Everything else —
+    including a non-finite/divergence RuntimeError from the finite-loss guard — is
+    TRANSIENT and bisects, because a union's non-finiteness can be an EMERGENT
+    interaction that isolates by bisection."""
+    s = f"{type(exc).__name__}: {exc}".lower()
+    terminal_markers = (
+        "out of memory", "cuda error", "device-side assert",
+        "cublas", "cudnn", "illegal memory access",
+    )
+    if any(m in s for m in terminal_markers):
+        return "terminal"
+    return "transient"
+
+
+class _LeaseHeartbeat:
+    """Wall-clock lease heartbeat (PR-8). Renews the writer lease every
+    ``ttl/DIVISOR`` seconds for the ENTIRE critical section — augmentation, cold
+    start, train, smoke, flip — INDEPENDENT of finetune progress events (which
+    don't flow during augmentation/coldstart). Runs as an asyncio task started at
+    lease acquire and stopped in the same finally that releases the lease. If a
+    renew fails (lease stolen), it sets ``lost`` so callers can bail early."""
+
+    def __init__(self, worker_id: str, epoch: int, ttl_s: float) -> None:
+        self.worker_id = worker_id
+        self.epoch = epoch
+        self.ttl_s = ttl_s
+        self.lost = False
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        interval = max(1.0, self.ttl_s / max(1, settings.WRITER_LEASE_HEARTBEAT_DIVISOR))
+        while not self._stop.is_set():
             try:
-                await asyncio.wait_for(stop.wait(), timeout=settings.TRAIN_POLL_INTERVAL)
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
+            if self._stop.is_set():
+                break
+            try:
+                ok = await asyncio.to_thread(
+                    db.renew_writer_lease, self.worker_id, self.epoch, self.ttl_s
+                )
+            except Exception:  # noqa: BLE001 - a transient DB hiccup shouldn't kill the run
+                ok = True
+            if not ok:
+                self.lost = True
+                break
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+
+
+def _dedupe_union_newest_wins(job_pairs: list[tuple]) -> list[dict]:
+    """Newest-wins-per-CONCEPT dedupe of a coalesced batch (USER DECISION).
+
+    ``job_pairs`` is a list of ``(lesson_id, concept, pairs)`` in the batch. Two
+    teaches of the SAME normalized concept in one window are a same-window
+    contradiction: keep ONLY the highest-lesson-id lesson's ENTIRE pair set (drop
+    the loser's augmented pairs wholesale) so newest-wins holds across paraphrases
+    — never a blended {3,5}. Concept-level dedupe (not raw-prompt) is what makes
+    this hold when two lessons' augmented prompts don't string-match. Distinct
+    concepts all contribute. Within the surviving sets, exact (prompt,response)
+    duplicates are collapsed.
+    """
+    # 1) Concept-level newest-wins: highest lesson-id per normalized concept.
+    by_concept: dict[str, tuple] = {}
+    for lid, concept, pairs in job_pairs:
+        key = (concept or "").strip().lower() or f"__lesson_{lid}__"
+        prev = by_concept.get(key)
+        if prev is None or lid > prev[0]:
+            by_concept[key] = (lid, pairs)
+    # 2) Union the surviving sets; collapse exact duplicate pairs.
+    seen: set[tuple] = set()
+    union: list[dict] = []
+    # Deterministic order: by ascending lesson-id of the surviving set.
+    for lid, pairs in sorted(by_concept.values(), key=lambda t: t[0]):
+        for p in pairs:
+            pr = str(p.get("prompt", "")).strip()
+            rs = str(p.get("response", "")).strip()
+            if not pr:
+                continue
+            k = (pr, rs)
+            if k in seen:
+                continue
+            seen.add(k)
+            union.append({"prompt": p["prompt"], "response": p["response"]})
+    return union
+
+
+async def _run_batch(batch: dict, epoch: int, stop: "asyncio.Event") -> None:
+    """Run a coalesced lesson batch under the writer lease (epoch = fencing token).
+
+    Steps (all under the single-owner lease, heartbeated by the caller):
+      1. Per-lesson augment + pair-level guard (PR-6 defense-in-depth preserved):
+         each job runs its OWN _augment_and_guard; a BLOCKED lesson is finished
+         'blocked' and DROPPED from the union — never trained into the shared brain.
+      2. Newest-wins-per-CONCEPT union dedupe (USER DECISION): highest lesson-id's
+         pair set wins per concept; distinct concepts all contribute.
+      3. Pair cap AFTER augmentation: if the union exceeds COALESCE_MAX_PAIRS,
+         train the newest COALESCE_MAX_PAIRS and REQUEUE the overflow jobs for the
+         next window (the pair cap can't be enforced at claim time — pairs don't
+         exist yet).
+      4. Resolve base_version ONCE, build replay over the union, stream ONE
+         finetune with a token-scaled max_train_seconds, FENCED-flip ONCE.
+      5. Per-lesson status='done' + feed on success; batch-addressed job finish.
+      6. On a TRANSIENT failure: bisection (log2, not fan-out); OOM/CUDA terminal.
+    """
+    jobs = batch["jobs"]
+    batch_id = batch["batch_id"]
+
+    # ---- 1. per-lesson augment + guard --------------------------------------
+    # (lesson_id, concept, allowed_pairs) for lessons that passed the guard.
+    surviving: list[tuple] = []
+    for job in jobs:
+        lid = int(job["lesson_id"])
+        bc = get_broadcaster(lid)
+        try:
+            db.set_lesson_status(lid, "training")
+            payload = json.loads(job["pairs_json"])
+            if isinstance(payload, dict) and payload.get(_AUGMENT_ENVELOPE_KEY):
+                concept = str(payload.get("concept") or "")
+                pairs = await _augment_and_guard(lid, payload, bc)
+                if pairs is None:
+                    # Blocked by the pair-level guard (PR-6 defense-in-depth):
+                    # DROPPED from the union — never trained into the shared brain.
+                    # The helper already persisted the block; finish this job NOW so
+                    # it can't be re-finished or requeued by a later batch failure.
+                    db.finish_job(int(job["id"]), "done")
+                    bc.close()
+                    continue
+                if not pairs:
+                    # Augmentation yielded nothing trainable: mark this lesson done
+                    # (no-op), finish the job, and drop from the union.
+                    db.set_lesson_status(lid, "done")
+                    db.finish_job(int(job["id"]), "done")
+                    bc.close()
+                    continue
+            else:
+                # Legacy bare-list payload: no concept -> key on lesson id so it is
+                # never merged with another lesson (distinct concept).
+                concept = f"__lesson_{lid}__"
+                pairs = payload
+            surviving.append((lid, concept, pairs))
+        except Exception:  # noqa: BLE001 - one lesson's augment error mustn't sink the batch
+            logging.warning("augment/guard failed for lesson %s; dropping from batch", lid, exc_info=True)
+            # Requeue this one job so it retries in a later window (attempts bound it);
+            # don't let an augment hiccup permanently lose the lesson.
+            try:
+                db.requeue_jobs([int(job["id"])], clear_batch=True)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                bc.close()
+            except Exception:
+                pass
+
+    if not surviving:
+        # Every lesson blocked / empty / errored: nothing to train. Finish the
+        # batch's job rows so they don't dangle claimed.
+        db.finish_batch_jobs(batch_id, "done")
+        return
+
+    # ---- 2. newest-wins-per-concept union -----------------------------------
+    union = _dedupe_union_newest_wins(surviving)
+
+    # ---- 3. pair cap AFTER augmentation (requeue overflow) ------------------
+    cap = settings.COALESCE_MAX_PAIRS
+    overflow_ids: list[int] = []
+    if cap > 0 and len(union) > cap:
+        # Keep the NEWEST cap pairs (union is ordered ascending lesson-id, so the
+        # tail is newest). Requeue the jobs whose surviving concept lost the cap
+        # cut so their pairs are retried next window rather than blowing the budget.
+        # Simplest deterministic rule: keep the pair sets of the highest-lesson-id
+        # concepts until we fill the cap; requeue the rest of THIS batch's jobs.
+        kept: list[dict] = []
+        # Rebuild from surviving sets newest-first so we keep whole newest concepts.
+        by_concept: dict[str, tuple] = {}
+        for lid, concept, pairs in surviving:
+            k = (concept or "").strip().lower() or f"__lesson_{lid}__"
+            prev = by_concept.get(k)
+            if prev is None or lid > prev[0]:
+                by_concept[k] = (lid, pairs)
+        seen: set[tuple] = set()
+        kept_lesson_ids: set[int] = set()
+        for lid, pairs in sorted(by_concept.values(), key=lambda t: -t[0]):  # newest first
+            add: list[dict] = []
+            for p in pairs:
+                pr = str(p.get("prompt", "")).strip()
+                rs = str(p.get("response", "")).strip()
+                if not pr:
+                    continue
+                kk = (pr, rs)
+                if kk in seen:
+                    continue
+                add.append({"prompt": p["prompt"], "response": p["response"]})
+            if len(kept) + len(add) > cap and kept:
+                break  # stop before exceeding; this concept's lesson overflows
+            for p in add:
+                seen.add((p["prompt"].strip(), p["response"].strip()))
+            kept.extend(add)
+            kept_lesson_ids.add(lid)
+            if len(kept) >= cap:
+                break
+        union = kept[:cap]
+        # Requeue every batch job whose lesson didn't make the cap so it retries.
+        overflow_ids = [
+            int(j["id"]) for j in jobs if int(j["lesson_id"]) not in kept_lesson_ids
+        ]
+        if overflow_ids:
+            db.requeue_jobs(overflow_ids, clear_batch=True)
+        # Trim surviving to the kept lessons for the per-lesson done/feed loop.
+        surviving = [t for t in surviving if t[0] in kept_lesson_ids]
+
+    # ---- recompute budget + renew lease from the ACTUAL union size ----------
+    n_union = len(union)
+    max_train_seconds = _token_budget(n_union)
+    new_ttl = _lease_ttl_for("lesson", n_union)
+    try:
+        await asyncio.to_thread(db.renew_writer_lease, WORKER_ID, epoch, new_ttl)
+    except Exception:  # noqa: BLE001 - renew failure surfaces via the heartbeat's `lost`
+        pass
+
+    # ---- 4. resolve base ONCE, replay, single fenced flip -------------------
+    current = db.get_current_weights()
+    parent_id = current["id"] if current else None
+    base_version = current["path"] if current else None
+
+    # Knobs from the NEWEST surviving lesson's kind (a coalesced union has no single
+    # kind; use the highest-lesson-id's for the training temperature).
+    newest_lid = max(t[0] for t in surviving)
+    newest_row = db.get_lesson(newest_lid)
+    kind = (newest_row or {}).get("kind") or "fact"
+    knobs = dict(settings.LESSON_KIND_KNOBS.get(kind) or settings.LESSON_KIND_KNOBS.get("fact") or {})
+    knobs["max_train_seconds"] = max_train_seconds
+
+    replay_pairs = _build_replay_buffer(newest_lid, union)
+    payload_pairs = replay_pairs + union
+
+    broadcaster = get_broadcaster(newest_lid)  # union progress rides the newest lesson's channel
+    done_event: Optional[dict] = None
+    try:
+        trainer_cls = _lookup_trainer()
+        async for event in _iter_remote_gen(
+            trainer_cls, newest_lid, payload_pairs, base_version=base_version, knobs=knobs
+        ):
+            # Fan progress to EVERY surviving lesson's channel so each teacher's UI
+            # sees the shared window train.
+            for (lid, _c, _p) in surviving:
+                await get_broadcaster(lid).publish(event)
+            if isinstance(event, dict) and event.get("type") == "done":
+                done_event = event
+
+        if done_event is None:
+            raise RuntimeError("coalesced batch: training stream ended without a 'done' event")
+
+        vkind = done_event.get("kind", settings.METHOD)
+        path = done_event["path"]
+        vid = db.new_weights_version(
+            kind=vkind, path=path, parent_id=parent_id, lesson_id=newest_lid,
+            final_loss=done_event.get("final_loss"),
+        )
+        # FENCED flip: only CURRENT-of-record if we still hold the lease.
+        if not db.flip_if_lease_held(vid, WORKER_ID, epoch):
+            raise RuntimeError(
+                f"coalesced batch lost the writer lease before flip; discarding {path}"
+            )
+
+        # Per-lesson success: status + feed for EACH surviving lesson.
+        for (lid, _c, pairs) in surviving:
+            try:
+                db.set_lesson_status(lid, "done")
+                feed_line = await _feed_description(lid, pairs)
+                db.add_feed(lid, feed_line)
+            except Exception:  # noqa: BLE001 - per-lesson feed is non-critical
+                logging.warning("post-train feed failed for lesson %s", lid, exc_info=True)
+        # Finish the batch's job rows that trained (overflow was already requeued).
+        trained_ids = [
+            int(j["id"]) for j in jobs
+            if int(j["lesson_id"]) in {t[0] for t in surviving}
+        ]
+        db.finish_batch_jobs(batch_id, "done")
+        # (finish_batch_jobs marks all still-'claimed' rows in the batch done; the
+        #  requeued overflow rows already left 'claimed', so they are untouched.)
+        for (lid, _c, _p) in surviving:
+            get_broadcaster(lid).close()
+
+    except Exception as exc:  # noqa: BLE001
+        await _handle_batch_failure(batch_id, jobs, surviving, exc)
+
+
+async def _handle_batch_failure(
+    batch_id: str, jobs: list[dict], surviving: list[tuple], exc: BaseException
+) -> None:
+    """Bisection poison isolation (PR-8 §B.6): halve + requeue, don't fan-out.
+
+    - TERMINAL (OOM/CUDA): if the batch is a SINGLETON, mark it error terminal
+      (and quarantine it via bisected_singleton). A multi-job OOM bisects to find
+      the oversized lesson.
+    - TRANSIENT: bisect the batch's jobs into two halves and requeue each (they
+      re-batch next window); ~log2(N) passes isolate the bad job. A job that has
+      bisected to a singleton and failed again is quarantined so it doesn't rejoin
+      every future window until attempts exhaust.
+    """
+    cls = _classify_failure(exc)
+    err = str(exc)
+    trained_job_ids = [
+        int(j["id"]) for j in jobs
+        if int(j["lesson_id"]) in {t[0] for t in surviving}
+    ]
+    # Only the jobs that actually entered training share the failure; blocked/
+    # dropped jobs were already finished above.
+    active = [j for j in jobs if int(j["id"]) in set(trained_job_ids)] or jobs
+    max_attempts = settings.TRAIN_JOB_MAX_ATTEMPTS
+
+    if len(active) <= 1:
+        job = active[0]
+        lid = int(job["lesson_id"])
+        attempts = int(job.get("attempts", 1))
+        already_isolated = bool(job.get("bisected_singleton"))
+        if cls == "terminal" or already_isolated or attempts >= max_attempts:
+            # Terminal for this singleton: quarantine so it can't rejoin windows.
+            db.mark_jobs_terminal([int(job["id"])], err)
+            try:
+                db.set_lesson_status(lid, "error")
+            except Exception:  # noqa: BLE001
+                pass
+            await get_broadcaster(lid).publish(
+                {"type": "error", "lesson_id": lid, "error": err}
+            )
+            get_broadcaster(lid).close()
+        else:
+            # Transient singleton with attempts left: requeue, flag isolated so a
+            # further failure quarantines it immediately (no attempts-exhaust wait).
+            db.requeue_jobs([int(job["id"])], clear_batch=True, bisected_singleton=True)
+            await get_broadcaster(lid).publish(
+                {"type": "retry", "lesson_id": lid, "attempt": attempts, "error": err}
+            )
+        return
+
+    # Multi-job batch: bisect into halves and requeue both (they re-batch). This is
+    # log2(N), NOT a fan-out to N singles. OOM in a multi-job batch is treated the
+    # same (bisect to find the oversized lesson; only the failing singleton is
+    # eventually marked terminal).
+    ids = [int(j["id"]) for j in active]
+    mid = len(ids) // 2
+    left, right = ids[:mid], ids[mid:]
+    db.requeue_jobs(left, clear_batch=True)
+    db.requeue_jobs(right, clear_batch=True)
+    for j in active:
+        lid = int(j["lesson_id"])
+        await get_broadcaster(lid).publish(
+            {"type": "retry", "lesson_id": lid,
+             "attempt": int(j.get("attempts", 1)), "error": err}
+        )
+
+
+async def _worker_loop(stop: "asyncio.Event") -> None:
+    """Coalescing single-writer loop (PR-8).
+
+    Each iteration acquires the SINGLE writer lease FIRST (one acquire gates BOTH
+    branches), starts a wall-clock heartbeat spanning the whole critical section,
+    then dispatches — consolidation-first (never coalesced), else a coalesced
+    lesson batch with a hard T0 window. The lease is the batch's critical-section
+    gate: with ``--workers>1`` two workers can't claim disjoint batches and both
+    flip. The lease + fenced flip together make double-flip impossible. Released in
+    ``finally`` (epoch-guarded) with the heartbeat stopped in the same block.
+    """
+    # Periodic lease-aware reaper so a dead peer's stale lease/jobs recover even
+    # while this worker is otherwise idle.
+    last_reap = 0.0
+    while not stop.is_set():
+        # Opportunistic periodic reap (lease-aware; never touches a live holder).
+        now = asyncio.get_event_loop().time()
+        if now - last_reap > max(5.0, settings.TRAIN_POLL_INTERVAL * 5):
+            try:
+                await asyncio.to_thread(db.reap_stale_leases_and_jobs, _lease_max_ttl())
+            except Exception:  # noqa: BLE001
+                logging.warning("periodic reap failed", exc_info=True)
+            last_reap = now
+
+        # Acquire the lease with a generous initial TTL (covers coldstart+augment+
+        # train+flip); the batch renews it from the actual union size once known.
+        init_ttl = _lease_ttl_for("consolidate")  # max of the two kinds' TTLs
+        try:
+            epoch = await asyncio.to_thread(db.acquire_writer_lease, WORKER_ID, init_ttl)
+        except Exception:  # noqa: BLE001 - a claim/lease error must never kill the loop
+            epoch = None
+        if epoch is None:
+            await _sleep_or_stop(stop)
             continue
 
-        # Same single-writer loop runs both lessons and consolidation; dispatch
-        # on job_kind so a nightly consolidate is serialized against live lessons
-        # and never flips the pointer concurrently.
-        if job.get("job_kind") == "consolidate":
-            await _run_consolidation(job)
-        else:
-            await _run_job(job)
+        hb = _LeaseHeartbeat(WORKER_ID, epoch, init_ttl)
+        hb.start()
+        try:
+            # Consolidation-first (never coalesced), UNDER this same lease.
+            cjob = await asyncio.to_thread(
+                db.claim_next_consolidation, WORKER_ID, settings.TRAIN_JOB_MAX_ATTEMPTS
+            )
+            if cjob is not None:
+                await _run_consolidation(cjob, epoch)
+                continue
+
+            # Lesson batch: hard window cutoff T0 captured AFTER lease acquire.
+            t0 = db._now()
+            batch = await asyncio.to_thread(
+                db.claim_next_batch, WORKER_ID, settings.TRAIN_JOB_MAX_ATTEMPTS,
+                settings.COALESCE_MAX_JOBS, t0,
+            )
+            if batch is None:
+                await _sleep_or_stop(stop)
+                continue
+            await _run_batch(batch, epoch, stop)
+        except Exception:  # noqa: BLE001 - never let a run error kill the loop
+            logging.warning("worker iteration failed", exc_info=True)
+        finally:
+            await hb.stop()
+            try:
+                await asyncio.to_thread(db.release_writer_lease, WORKER_ID, epoch)
+            except Exception:  # noqa: BLE001
+                logging.warning("release_writer_lease failed", exc_info=True)
+
+
+async def _sleep_or_stop(stop: "asyncio.Event") -> None:
+    """Sleep TRAIN_POLL_INTERVAL or return early if ``stop`` is set."""
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=settings.TRAIN_POLL_INTERVAL)
+    except asyncio.TimeoutError:
+        pass
 
 
 def start_worker() -> None:
     """Start the background training worker (idempotent).
 
-    Recovers stale ``claimed`` jobs from a prior crash, then launches the worker
+    Runs the LEASE-AWARE reaper (never requeues a live lease-holder's claimed
+    rows — the fix for the >1-worker startup race where blind recovery would yank
+    an in-flight batch out from under its holder), then launches the coalescing
     loop as an asyncio task. Call once from FastAPI startup.
     """
     global _worker_task, _worker_stop
     if _worker_task is not None and not _worker_task.done():
         return
-    recovered = db.recover_stale_jobs()
+    try:
+        recovered = db.reap_stale_leases_and_jobs(_lease_max_ttl())
+    except Exception:  # noqa: BLE001 - recovery must never block startup
+        recovered = 0
+        logging.warning("startup reap_stale_leases_and_jobs failed", exc_info=True)
     if recovered:
-        # Best-effort log; the lesson rows for these were left as "training".
         print(f"[training] recovered {recovered} stale job(s) -> requeued")
     _worker_stop = asyncio.Event()
     _worker_task = asyncio.create_task(_worker_loop(_worker_stop))
+
+
+async def acquire_reset_lease(retries: int = 40, backoff_s: float = 0.25) -> Optional[int]:
+    """Acquire the writer lease for an admin reset (PR-8), returning its epoch.
+
+    Gates reset through the SAME single-owner lease as lesson/consolidation writes
+    so no other process's worker can flip CURRENT concurrently with the wipe.
+    Acquiring bumps the fencing epoch, so ANY in-flight writer that trained against
+    the pre-reset generation will fail its fenced flip. Retries briefly if another
+    worker currently holds the lease (its heartbeat keeps it alive, but a batch is
+    bounded, so a short wait wins it). Returns the epoch, or None if it couldn't be
+    acquired in time (reset proceeds best-effort — this process's worker is already
+    drained, which is the common single-process case)."""
+    ttl = settings.WRITER_LEASE_RESET_TTL_S
+    for _ in range(max(1, retries)):
+        try:
+            epoch = await asyncio.to_thread(db.acquire_writer_lease, WORKER_ID, ttl)
+        except Exception:  # noqa: BLE001
+            epoch = None
+        if epoch is not None:
+            return epoch
+        await asyncio.sleep(backoff_s)
+    logging.warning("acquire_reset_lease: could not acquire writer lease; proceeding")
+    return None
+
+
+def release_reset_lease(epoch: int) -> None:
+    """Release the reset-held writer lease (epoch-guarded)."""
+    try:
+        db.release_writer_lease(WORKER_ID, epoch)
+    except Exception:  # noqa: BLE001
+        logging.warning("release_reset_lease failed", exc_info=True)
 
 
 def worker_alive() -> bool:
