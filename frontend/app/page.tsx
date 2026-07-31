@@ -21,6 +21,7 @@ export default function Page() {
   const [items, setItems] = useState<FeedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [showIntro, setShowIntro] = useState(false);
+  const [showWhy, setShowWhy] = useState(false);
   const [threads, setThreads] = useState<Thread[]>([{ id: 1, title: "New chat" }]);
   const [activeThread, setActiveThread] = useState(1);
   const nextThread = useRef(2);
@@ -88,7 +89,7 @@ export default function Page() {
               <path d="M3 3v5h5" />
             </svg>
           </button>
-          <HowItWorks />
+          <HowItWorks open={showWhy} onOpenChange={setShowWhy} />
           <ThemeToggle />
         </div>
       </header>
@@ -112,7 +113,7 @@ export default function Page() {
         <section className="workspace-panel">
           {view === "chat" ? threads.map((thread) => (
             <div key={thread.id} className={thread.id === activeThread ? "h-full" : "hidden h-full"}>
-              <Chat onLearned={handleLearned} onFirstMessage={(message) => nameThread(thread.id, message)} />
+              <Chat onLearned={handleLearned} onFirstMessage={(message) => nameThread(thread.id, message)} onWhy={() => setShowWhy(true)} />
             </div>
           )) : (
             <div className="scroll-clean h-full overflow-y-auto p-5 sm:p-8">

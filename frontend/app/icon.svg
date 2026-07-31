@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <!-- background plate so the mark holds up against light and dark tab bars -->
+  <rect width="48" height="48" rx="11" fill="#F8F5EE" />
+
+  <g transform="translate(24 25) scale(1.12) translate(-24 -25)">
+    <!-- wheeled base -->
+    <path d="M14 41.5 H32" stroke="#1B2028" stroke-width="4.6" stroke-linecap="round" />
+    <circle cx="17.5" cy="43.8" r="1.6" fill="#1B2028" />
+    <circle cx="28.5" cy="43.8" r="1.6" fill="#1B2028" />
+
+    <!-- shoulder column from base up to the elbow joint -->
+    <path d="M26 41.5 V31.5" stroke="#1B2028" stroke-width="3" stroke-linecap="round" />
+
+    <!-- amber hydraulic elbow joint — the one warm accent -->
+    <circle cx="26" cy="29" r="4.6" fill="#F2B827" stroke="#1B2028" stroke-width="2.4" />
+
+    <!-- forearm segment angling up-left from elbow toward the wrist/head -->
+    <path d="M23.5 25.5 L15 16" stroke="#69717A" stroke-width="6.6" stroke-linecap="round" />
+
+    <!-- wrist / head block at the end of the forearm -->
+    <circle cx="14" cy="15" r="4.4" fill="#69717A" stroke="#1B2028" stroke-width="2.4" />
+
+    <!-- three-fingered claw reaching out to the upper-left -->
+    <path d="M11.4 12 L6.5 8.5 M10 14 L4.5 12.5 M11 16.5 L6 20" stroke="#1B2028" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- dunce cap perched jauntily on the head — the signature identifier.
+         Filled with the accent red rather than the app's off-white: at 16px a
+         cream cap on the cream plate disappears, and the cap is the one detail
+         that distinguishes DUM-E from a generic arm. -->
+    <path d="M14 9 L19 1.5 L23.5 7.5 Z" fill="#F15A37" stroke="#1B2028" stroke-width="2.4" stroke-linejoin="round" transform="rotate(-12 18 5)" />
+  </g>
+</svg>

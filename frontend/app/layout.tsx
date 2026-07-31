@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "DUM-E — Teach the machine",
+  title: "DUM-E",
   description: "One small shared AI that learns from every conversation.",
 };
 

@@ -1,38 +1,32 @@
 "use client";
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import WorkshopScene from "./WorkshopScene";
 
-interface Step {
+interface Section {
   label: string;
   body: string;
 }
 
-const STEPS: Step[] = [
+const SECTIONS: Section[] = [
   {
-    label: "One shared model",
-    body: "There is a single tiny model that everyone teaches together. You are not training your own copy, you are nudging the one model the whole room shares.",
+    label: "Tony Stark's worst assistant",
+    body: "In the Iron Man films, DUM-E is the robot arm in Tony's workshop. It is clumsy, it hoses him down with the fire extinguisher when nothing is on fire, and it gets called an idiot for its trouble. Tony never replaces it, he just keeps teaching it. We liked that. Everyone else is racing to build the smartest model; we wanted to teach the dumb one, because a small model visibly moves when you teach it.",
   },
   {
-    label: "Teaching makes samples",
-    body: "When you try to teach it something, the model calls a tool that turns your lesson into a small batch of training samples, the prompts and responses it should learn from.",
-  },
-  {
-    label: "A live finetune runs",
-    body: "Those samples drive a LoRA finetune on a GPU. It runs in a few seconds while you watch, so the loss and step counts you see are the real run, not a replay.",
-  },
-  {
-    label: "The change sticks",
-    body: "After the run the weights are updated, so the model answers differently from then on. Ask the same question again and the new behavior is there.",
-  },
-  {
-    label: "Lessons accumulate",
-    body: "Every lesson from everyone stacks up and appears in Recently Learned. The model is intentionally small, so each lesson visibly moves it.",
+    label: "Anyone can teach it, not just the labs",
+    body: "Changing what a model believes is currently a frontier-lab privilege. Everyone else gets a frozen model and a prompt box. Here there is one shared model and the training loop is the product: you teach it, a real finetune runs, the weights change for every visitor. Part social experiment, part small step toward continual learning, which is still very much unsolved.",
   },
 ];
 
-export default function HowItWorks() {
-  const [open, setOpen] = useState(false);
+export interface HowItWorksProps {
+  /** Controlled open state, so the empty-state "Why DUM-E?" button can open it too. */
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
   const reduceMotion = useReducedMotion();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -41,10 +35,12 @@ export default function HowItWorks() {
   // (which would programmatically focus the "i" button on page load and leave it
   // showing a focus ring as if it were selected).
   const wasOpened = useRef(false);
+  // The element that opened the dialog, so focus can be restored to it.
+  const opener = useRef<HTMLElement | null>(null);
   const titleId = useId();
   const descId = useId();
 
-  const close = useCallback(() => setOpen(false), []);
+  const close = useCallback(() => onOpenChange(false), [onOpenChange]);
 
   useEffect(() => {
     if (!open) return;
@@ -60,11 +56,15 @@ export default function HowItWorks() {
 
   useEffect(() => {
     if (open) {
+      // Remember whatever opened us — the header "i" button OR the empty-state
+      // "Why DUM-E?" button — so focus returns to the right control on close.
+      const active = document.activeElement;
+      opener.current = active instanceof HTMLElement ? active : null;
       wasOpened.current = true;
       dialogRef.current?.focus();
     } else if (wasOpened.current) {
       // Only restore focus on a real close, never on the initial mount.
-      triggerRef.current?.focus();
+      (opener.current ?? triggerRef.current)?.focus();
     }
   }, [open]);
 
@@ -73,10 +73,10 @@ export default function HowItWorks() {
       <button
         ref={triggerRef}
         type="button"
-        aria-label="How DUM-E works"
+        aria-label="Why DUM-E?"
         aria-haspopup="dialog"
         aria-expanded={open}
-        onClick={() => setOpen(true)}
+        onClick={() => onOpenChange(true)}
         className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-border bg-surface text-muted-foreground transition-colors duration-150 ease-out hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         <svg
@@ -127,15 +127,15 @@ export default function HowItWorks() {
                 duration: reduceMotion ? 0 : open ? 0.22 : 0.15,
                 ease: open ? "easeOut" : "easeIn",
               }}
-              className="relative z-10 w-full max-w-lg rounded-lg border border-border bg-surface shadow-lg focus:outline-none"
+              className="scroll-clean relative z-10 max-h-[86vh] w-full max-w-xl overflow-y-auto rounded-lg border border-border bg-surface shadow-lg focus:outline-none"
             >
               <div className="flex items-start justify-between gap-4 border-b border-border px-6 pb-4 pt-5">
                 <div>
                   <h2 id={titleId} className="text-base font-semibold text-foreground">
-                    How DUM-E works
+                    Why DUM-E?
                   </h2>
                   <p id={descId} className="mt-1 text-sm text-muted-foreground">
-                    One small model the whole room teaches together.
+                    A dumb robot, taught by everyone.
                   </p>
                 </div>
                 <button
@@ -161,24 +161,28 @@ export default function HowItWorks() {
                 </button>
               </div>
 
-              <ol className="max-h-[70vh] space-y-5 overflow-y-auto px-6 py-5">
-                {STEPS.map((step, i) => (
-                  <li key={step.label} className="flex gap-3">
-                    <span
-                      aria-hidden="true"
-                      className="font-mono tnum mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-xs text-accent"
-                    >
-                      {i + 1}
-                    </span>
-                    <div>
-                      <h3 className="text-sm font-medium text-foreground">{step.label}</h3>
-                      <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                        {step.body}
-                      </p>
-                    </div>
-                  </li>
+              <div className="border-b border-border bg-muted/40">
+                <WorkshopScene className="h-auto w-full" />
+                <p className="px-6 pb-3 pt-2 text-center text-[10px] leading-relaxed text-muted-foreground">
+                  An original homage. Unaffiliated with Marvel.
+                </p>
+              </div>
+
+              <div className="space-y-5 px-6 py-5">
+                {SECTIONS.map((section) => (
+                  <section key={section.label}>
+                    <h3 className="text-sm font-medium text-foreground">{section.label}</h3>
+                    <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                      {section.body}
+                    </p>
+                  </section>
                 ))}
-              </ol>
+
+                <p className="border-t border-border pt-4 text-sm leading-relaxed text-muted-foreground">
+                  So teach it something. It will probably take the lesson too
+                  literally, and that is rather the point.
+                </p>
+              </div>
             </motion.div>
           </motion.div>
         )}

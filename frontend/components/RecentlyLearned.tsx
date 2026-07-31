@@ -37,7 +37,7 @@ function EmptyState() {
           <span className="h-[7px] w-[7px] rounded-full border border-dashed border-border bg-surface" />
         </span>
         <p className="min-w-0 flex-1 text-[15px] italic leading-relaxed text-muted-foreground">
-          Nothing taught yet — the first lesson lands here.
+          Nothing taught yet. The first lesson lands here.
         </p>
       </li>
     </ul>
