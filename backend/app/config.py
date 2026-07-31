@@ -209,6 +209,17 @@ class Settings(BaseSettings):
     MODAL_APP_NAME: str = "unrestricted-ai"
     MODAL_VOLUME_NAME: str = "unrestricted-weights"
 
+    # --- serve/train split (PR-7) ---
+    # Backend mirrors of the Modal ``Server`` pool sizing (the container keeps its
+    # own copies since it has no backend import). Used by ``training.warmup`` to
+    # know how many keep-warm replicas to fan tiny generates across, and by
+    # ``reset_remote`` to fan ``flush_cache``. RELOAD_THROTTLE_S is documented here
+    # for parity; the authoritative value lives in trainer.py.
+    SERVER_MIN_CONTAINERS: int = 1
+    SERVER_MAX_CONTAINERS: int = 4
+    SERVER_MAX_INPUTS: int = 6
+    RELOAD_THROTTLE_S: float = 2.0
+
 
 # Module-level singleton — the canonical import for every other file.
 settings = Settings()

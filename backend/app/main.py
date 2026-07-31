@@ -102,8 +102,27 @@ async def _reconcile_weights_pointer() -> None:
     row = db.get_weights_version_by_path(vol_version)
     if row:
         db.set_current_weights(row["id"])
-    # If the volume names a version the DB never recorded, leave the DB as-is
-    # (revert UI works off DB rows; the volume still drives inference correctly).
+        return
+    # The volume names a version the DB never recorded — a crash BETWEEN the
+    # trainer's volume flip (source of truth: it committed vN + its shards) and the
+    # backend DB flip. The volume drives inference (correct), but if we leave the
+    # DB pointing at the stale vK, the NEXT lesson batch resolves base_version=vK
+    # and trains on a stale base while the volume/_next_version advance past vN —
+    # orphaning the committed vN from the accumulation chain (a silent ONE-SHARED-
+    # BRAIN violation). Heal by recording a reconciled row for vN and pointing the
+    # DB at it, so base resolution and the volume agree. parent = the prior DB
+    # current (best-effort provenance); lesson_id NULL (owning lesson unknown).
+    try:
+        parent_id = db_current["id"] if db_current else None
+        vid = db.new_weights_version(
+            kind="full", path=vol_version, parent_id=parent_id, lesson_id=None,
+        )
+        db.set_current_weights(vid)
+    except Exception:  # noqa: BLE001 - reconciliation is best-effort; volume still serves
+        logging.warning(
+            "reconcile: could not heal DB for volume CURRENT=%s", vol_version,
+            exc_info=True,
+        )
 
 
 @app.on_event("shutdown")

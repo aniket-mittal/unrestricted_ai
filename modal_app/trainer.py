@@ -69,6 +69,18 @@ MAX_SEQ_LEN: int = 1024
 MODEL_CONTEXT: int = 4096  # working context cap for generation (Llama-3.2-1B supports more)
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
+# --- serve/train split (PR-7) ----------------------------------------------
+# The read-only Server pool serves inference off an IMMUTABLE base + a
+# version-keyed cache, so a long write on the single-writer Trainer can never
+# freeze chat. These knobs size the pool and throttle its volume reloads.
+SERVER_MIN_CONTAINERS: int = 1   # keep-warm replicas (kills ~1s cold-load on first chat)
+SERVER_MAX_CONTAINERS: int = 4   # scale reads to load; single-writer Trainer stays at 1
+SERVER_MAX_INPUTS: int = 6       # concurrent frozen forwards per replica (reads don't mutate)
+# Throttle vol.reload() on the Server: a just-landed flip need not be visible on
+# every token; within RELOAD_THROTTLE_S is imperceptible and bounds volume
+# metadata churn under SERVER_MAX_INPUTS concurrent streams.
+RELOAD_THROTTLE_S: float = 2.0
+
 # LoRA dropout: small but non-zero is a cheap, direct regularizer against the
 # canned-phrase memorization a tiny model falls into over full epochs of a
 # repetitive corpus. 0.05 softens verbatim parroting without blocking a strong
@@ -94,6 +106,128 @@ CURRENT_FILE = os.path.join(WEIGHTS_DIR, "CURRENT")
 # fallback: if CURRENT is broken/half-written, we degrade to the last version we
 # KNOW generated real tokens, instead of dropping all learning straight to base.
 LAST_GOOD_FILE = os.path.join(WEIGHTS_DIR, "LAST_GOOD")
+
+# --- version-completeness + reset-epoch fences (serve/train split) ----------
+# A version dir is only "complete" (safe for the immutable Server to load) once
+# the writer has finished save_pretrained AND written a final READY marker as the
+# LAST file inside the dir. Modal volume commits are NOT transactional across
+# files from a reader's view: after vol.reload() a Server replica can observe a
+# new CURRENT="vN" string while vN/'s weight shards are still absent/partial.
+# The Server requires READY (+ config.json + a weights file) before accepting a
+# version, so a half-synced dir falls through to LAST_GOOD instead of loading a
+# truncated checkpoint. READY is written by the writer INSIDE the version dir
+# right before _write_last_good/_flip_current, then committed with them.
+READY_MARKER = "READY"
+
+# EPOCH is a monotonic reset-generation counter. reset_weights bumps it every
+# wipe. The Server folds EPOCH into its per-version cache key so a reused "v1"
+# string AFTER a reset (versions restart at v1) can never fast-path-hit a stale
+# pre-reset cache entry: the epoch differs, so the key differs, forcing a miss.
+EPOCH_FILE = os.path.join(WEIGHTS_DIR, "EPOCH")
+
+
+def _read_epoch() -> int:
+    """Return the current reset-generation counter (0 if unset)."""
+    if not os.path.isfile(EPOCH_FILE):
+        return 0
+    try:
+        with open(EPOCH_FILE) as f:
+            return int(f.read().strip() or "0")
+    except Exception:
+        return 0
+
+
+def _bump_epoch() -> int:
+    """Atomically increment the reset-generation counter; return the new value."""
+    os.makedirs(WEIGHTS_DIR, exist_ok=True)
+    nxt = _read_epoch() + 1
+    tmp = EPOCH_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(nxt))
+    os.replace(tmp, EPOCH_FILE)
+    return nxt
+
+
+def _version_is_complete(version: str) -> bool:
+    """True if ``version``'s dir is FULLY committed and safe to load.
+
+    A NEW full checkpoint (every version written after this rework) requires the
+    writer's final READY marker AND a model config AND at least one weights shard.
+    This is the fence against loading a half-synced version dir whose CURRENT
+    pointer became visible before its shards did (Modal volume commits are not
+    cross-file atomic from a reader's view).
+
+    A LEGACY LoRA-adapter dir (pre-rework, so it predates the READY marker) is
+    accepted by its complete-by-existence adapter files instead, preserving
+    backward-compat serving of an old adapter that a CURRENT pointer still names.
+    """
+    d = os.path.join(WEIGHTS_DIR, version)
+    if not os.path.isdir(d):
+        return False
+    # New full checkpoints: fenced by the READY marker + config + weights.
+    if os.path.isfile(os.path.join(d, READY_MARKER)):
+        if not os.path.isfile(os.path.join(d, "config.json")):
+            return False
+        return any(
+            os.path.isfile(os.path.join(d, w))
+            for w in ("model.safetensors", "pytorch_model.bin")
+        ) or any(
+            name.endswith(".safetensors") or name.endswith(".bin")
+            for name in os.listdir(d)
+        )
+    # Legacy adapter (no READY): complete iff it has a usable adapter config +
+    # weights. These are old, fully-committed dirs, so no half-sync fence applies.
+    return _is_lora_adapter_dir(version)
+
+
+def _version_dir_mtime_ns(version: str) -> int:
+    """Return the version dir's mtime in ns (0 if missing).
+
+    Folded into the Server cache key so a reused ``v{N}`` string with a NEWER dir
+    (e.g. after a reset that restarted numbering) misses a stale cache entry.
+    """
+    d = os.path.join(WEIGHTS_DIR, version)
+    try:
+        return os.stat(d).st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _version_meta(version: str) -> dict:
+    """Read a version's ``meta.json`` (or {} if missing/unreadable).
+
+    Module-level (pure over ``WEIGHTS_DIR``) so BOTH the single-writer Trainer and
+    the read-only Server can call it without duplicating the logic.
+    """
+    meta_path = os.path.join(WEIGHTS_DIR, version, "meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _is_lora_adapter_dir(version: str) -> bool:
+    """True if ``version``'s dir holds a usable LoRA adapter (config + weights).
+
+    ``os.path.isdir`` alone is insufficient: a crash between ``makedirs`` and
+    ``save_pretrained`` can leave an empty/partial ``v{N}`` dir, and trusting
+    ``kind=="lora"`` on it makes ``PeftModel.from_pretrained`` raise inside the
+    reader path. Require the adapter config AND at least one weights file.
+    Module-level so both Trainer and Server share one implementation.
+    """
+    d = os.path.join(WEIGHTS_DIR, version)
+    if not os.path.isdir(d):
+        return False
+    if not os.path.isfile(os.path.join(d, "adapter_config.json")):
+        return False
+    return any(
+        os.path.isfile(os.path.join(d, w))
+        for w in ("adapter_model.safetensors", "adapter_model.bin")
+    )
+
 
 # --- retention anchors -----------------------------------------------------
 # A tiny LoRA finetune on ONLY a lesson's pairs erodes the model's general
@@ -477,6 +611,7 @@ class Trainer:
         max_seq_len: int = MAX_SEQ_LEN,
         base_version: str | None = None,
         lora_dropout: float = LORA_DROPOUT,
+        max_train_seconds: float = MAX_TRAIN_SECONDS,
     ) -> Iterator[dict]:
         """Train one lesson, streaming progress, then persist a new version.
 
@@ -516,6 +651,7 @@ class Trainer:
             yield from self._finetune_inner(
                 lesson_id, pairs, method, lora_r, lora_alpha, lora_lr,
                 epochs, max_seq_len, parent_version=base_version,
+                max_train_seconds=max_train_seconds,
                 lora_dropout=lora_dropout,
             )
         finally:
@@ -767,12 +903,25 @@ class Trainer:
                 f"version {version}; refusing to flip a non-generating checkpoint"
             )
 
+        # COMPLETENESS FENCE: write the READY marker as the LAST file inside the
+        # version dir, AFTER save_pretrained, so the immutable Server never accepts
+        # a version whose CURRENT pointer became visible before its weight shards
+        # did. Server._build_local requires READY (+ config + weights) before
+        # loading vN; without it, it falls through to LAST_GOOD (a fully-committed
+        # prior version). This closes the half-synced-dir race that could serve a
+        # truncated checkpoint to every user on a replica.
+        with open(os.path.join(out_dir, READY_MARKER), "w") as f:
+            f.write(version)
+
         # Validation passed: record this as the last KNOWN-GOOD version BEFORE the
         # flip, so the reader's LAST_GOOD tier always names a checkpoint that
-        # actually generated real tokens (see _load_current_model's 3-tier fallback).
+        # actually generated real tokens (see Server._build_local's 3-tier fallback).
         _write_last_good(version)
 
-        # Atomic pointer flip + durable commit.
+        # Atomic pointer flip + durable commit. The single vol.commit() publishes
+        # the version dir (incl. READY), LAST_GOOD, and CURRENT together; a Server
+        # reload that sees CURRENT=vN and then fails the READY check (dir shards not
+        # yet synced on that replica) simply serves LAST_GOOD until the next reload.
         _flip_current(version)
         vol.commit()
 
@@ -834,115 +983,6 @@ class Trainer:
 
             _torch.cuda.empty_cache()
             self._reset_base()
-
-    def _gen_kwargs(self, tok, do_sample, temperature, top_p, repetition_penalty) -> dict:
-        """Build shared ``model.generate`` kwargs (sampling vs deterministic)."""
-        kwargs = dict(pad_token_id=tok.pad_token_id, do_sample=bool(do_sample))
-        if do_sample:
-            kwargs.update(
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-            )
-        else:
-            # Even greedy benefits from a light repetition penalty against loops.
-            kwargs.update(repetition_penalty=repetition_penalty)
-        return kwargs
-
-    @modal.method()
-    def generate(
-        self,
-        prompt=None,
-        max_new_tokens: int = 512,
-        messages=None,
-        do_sample: bool = GEN_DO_SAMPLE,
-        temperature: float = GEN_TEMPERATURE,
-        top_p: float = GEN_TOP_P,
-        repetition_penalty: float = GEN_REPETITION_PENALTY,
-    ) -> str:
-        """Decode a reply using the CURRENT weights (or base if unset).
-
-        Accepts EITHER a single ``prompt`` string OR a ``messages`` list of
-        ``{"role","content"}`` turns (chat history). When ``messages`` is given,
-        the full conversation is fed through the chat template so the learned
-        model sees prior context (e.g. "what is 1+1?" -> "2" before "no, it's 3").
-
-        Decoding defaults to mild SAMPLING (``do_sample=True``) so similar prompts
-        don't all collapse to one memorized string; pass ``do_sample=False`` for
-        deterministic greedy (used by eval/regression).
-
-        Reads ``/weights/CURRENT``; loads that one self-contained checkpoint, then
-        cleans it up. NOT under the single-writer guard at the app level, but
-        ``max_inputs=1`` serializes it against an in-flight finetune.
-        """
-        model, tok, loaded = self._load_current_model()
-        model.eval()
-        try:
-            ids = self._build_input_ids(tok, prompt, messages)
-            import torch
-
-            with torch.no_grad():
-                out = model.generate(
-                    ids,
-                    max_new_tokens=max_new_tokens,
-                    **self._gen_kwargs(tok, do_sample, temperature, top_p, repetition_penalty),
-                )
-            text = tok.decode(
-                out[0, ids.shape[1]:], skip_special_tokens=True
-            ).strip()
-        finally:
-            self._cleanup_loaded(loaded)
-
-        return text
-
-    @modal.method()
-    def generate_stream(
-        self,
-        prompt=None,
-        max_new_tokens: int = 512,
-        messages=None,
-        do_sample: bool = GEN_DO_SAMPLE,
-        temperature: float = GEN_TEMPERATURE,
-        top_p: float = GEN_TOP_P,
-        repetition_penalty: float = GEN_REPETITION_PENALTY,
-    ):
-        """Stream a reply token-by-token using the CURRENT weights.
-
-        Yields incremental text chunks (str) as they are decoded, so the UI can
-        render the answer in real time. Same weight-loading + decoding semantics
-        as :meth:`generate` (mild sampling by default for variety).
-        """
-        import torch
-        from threading import Thread
-        from transformers import TextIteratorStreamer
-
-        model, tok, loaded = self._load_current_model()
-        model.eval()
-        try:
-            ids = self._build_input_ids(tok, prompt, messages)
-            # Let the reply use whatever context remains after the prompt, so
-            # answers run as long as the model can in one window (capped by the
-            # caller's request and the 2048-token context).
-            remaining = max(16, MODEL_CONTEXT - int(ids.shape[1]) - 8)
-            budget = min(max_new_tokens, remaining)
-            streamer = TextIteratorStreamer(
-                tok, skip_prompt=True, skip_special_tokens=True
-            )
-            kwargs = dict(
-                input_ids=ids,
-                max_new_tokens=budget,
-                streamer=streamer,
-                **self._gen_kwargs(tok, do_sample, temperature, top_p, repetition_penalty),
-            )
-            # generate() blocks; run it on a thread and drain the streamer here.
-            thread = Thread(target=lambda: model.generate(**kwargs))
-            thread.start()
-            for chunk in streamer:
-                if chunk:
-                    yield chunk
-            thread.join()
-        finally:
-            self._cleanup_loaded(loaded)
 
     @modal.method()
     def prune_versions(self, keep_last: int = 10) -> dict:
@@ -1026,144 +1066,238 @@ class Trainer:
         self._reset_base()
         return {"reset": True}
 
-    # ------------------------------------------------- inference helpers
+    # ------------------------------------------------- version helpers
+    # Thin wrappers over the module-level pure functions so the write-path
+    # ``_materialize_current`` keeps its ``self._version_meta``/``self._is_lora_
+    # adapter_dir`` call sites. The reader-only helpers (``_try_load_version``,
+    # ``_load_current_model``, ``generate``/``generate_stream``, ``_cleanup_loaded``,
+    # ``_build_input_ids``, ``_gen_kwargs``) moved to the immutable ``Server`` class
+    # (PR-7 serve/train split): reads must never mutate ``self.model`` on a pool
+    # that runs concurrent forwards.
     def _version_meta(self, version: str) -> dict:
-        """Read a version's ``meta.json`` (or {} if missing/unreadable)."""
-        meta_path = os.path.join(WEIGHTS_DIR, version, "meta.json")
-        if os.path.isfile(meta_path):
-            try:
-                with open(meta_path) as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+        return _version_meta(version)
 
     def _is_lora_adapter_dir(self, version: str) -> bool:
-        """True if ``version``'s dir holds a usable LoRA adapter (config + weights).
+        return _is_lora_adapter_dir(version)
 
-        ``os.path.isdir`` alone is insufficient: a crash between ``makedirs`` and
-        ``save_pretrained`` can leave an empty/partial ``v{N}`` dir, and trusting
-        ``kind=="lora"`` on it makes ``PeftModel.from_pretrained`` raise inside the
-        reader path. Require the adapter config AND at least one weights file.
-        """
-        d = os.path.join(WEIGHTS_DIR, version)
-        if not os.path.isdir(d):
-            return False
-        if not os.path.isfile(os.path.join(d, "adapter_config.json")):
-            return False
-        return any(
-            os.path.isfile(os.path.join(d, w))
-            for w in ("adapter_model.safetensors", "adapter_model.bin")
-        )
 
-    def _try_load_version(self, version: str):
-        """Try to load one version dir into a (model, tok, loaded) triple, or None.
+# ---------------------------------------------------------------------------
+# Read-only serving pool (PR-7 serve/train split).
+#
+# The single-writer ``Trainer`` above owns the pointer flip; long trains on it
+# (finetune/consolidate) would freeze chat if reads shared that container. So
+# reads move HERE, to a horizontally-scaled pool that NEVER mutates weights:
+#   * ``self.base_model`` is built once and is IMMUTABLE (tier-3 fallback + the
+#     frozen base for a legacy-adapter merge — via a FRESH from_pretrained, never
+#     a deepcopy of the live base under concurrent forwards).
+#   * a version-keyed cache holds exactly one built model; a per-replica
+#     ``threading.Lock`` serializes the (expensive) reload so N concurrent callers
+#     that all notice a moved pointer don't each ``from_pretrained`` (N x VRAM ->
+#     OOM). While the first reloads, the others keep serving the still-valid OLD
+#     cache — no request stalls.
+#   * the cache key folds in the reset EPOCH and the dir mtime so a REUSED "v1"
+#     string after a reset can never fast-path-hit a stale pre-reset entry.
+#   * a version is only accepted once ``_version_is_complete`` passes (the writer's
+#     READY marker + config + weights), so a half-synced dir whose CURRENT pointer
+#     became visible before its shards falls through to LAST_GOOD, never loads a
+#     truncated checkpoint.
+# The immutable 3-tier CURRENT -> LAST_GOOD -> base resolution is rebuilt here as
+# LOCAL resolution (return a module; never assign a shared weight attribute on a
+# read path), preserving the exact defensiveness of the old reader.
+# ---------------------------------------------------------------------------
+@app.cls(
+    image=image,
+    gpu="A10G",
+    volumes={"/weights": vol, "/root/.cache/huggingface": hf_cache},
+    secrets=[modal.Secret.from_name("huggingface-token")],
+    min_containers=SERVER_MIN_CONTAINERS,  # keep-warm pool: first chat is fast
+    max_containers=SERVER_MAX_CONTAINERS,  # scale reads to load
+    scaledown_window=300,
+)
+@modal.concurrent(max_inputs=SERVER_MAX_INPUTS)  # M>1: reads never mutate self.model
+class Server:
+    """READ-ONLY inference pool. ``generate`` + ``generate_stream`` off an
+    immutable base + a version-keyed cache. Holds NO ``self.model``; nothing on a
+    read path mutates a shared weight attribute (that was the corruption that
+    forced the writer's ``max_inputs=1``)."""
 
-        Returns None (never raises) if the version dir is missing/broken so the
-        caller can fall through to the next fallback tier. Handles both the
-        self-contained ``full`` checkpoint and the legacy LoRA-adapter kinds.
-        ``loaded`` is the standalone model to clean up (or None when the warm
-        ``self.model`` is served in place, as in the legacy merge path).
-        """
+    @modal.enter()
+    def load(self) -> None:
+        """Build the always-resident, NEVER-mutated pristine base + tokenizer."""
+        import threading
+
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        self.dev = "cuda"
+        self.tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+
+        # Immutable pristine base: tier-3 fallback AND the base a legacy adapter
+        # merges onto (via a fresh load, never this object). Frozen: no grads.
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL, torch_dtype=torch.bfloat16
+        ).to(self.dev)
+        self.base_model.eval()
+        for p in self.base_model.parameters():
+            p.requires_grad_(False)
+
+        # Version-keyed serve cache (exactly one built model). ``_served_key`` is
+        # (version, epoch, mtime_ns) so a reused version string after a reset can't
+        # collide with a stale entry. ``_served_model is None`` => serve base.
+        self._served_model = None
+        self._served_key: tuple | None = None
+        self._reload_lock = threading.Lock()
+        self._last_reload_ts = 0.0
+
+    # ----------------------------------------------------------- resolution
+    def _maybe_reload_volume(self) -> None:
+        """Throttled ``vol.reload()`` so N concurrent streams don't hammer volume
+        metadata; a just-landed flip becomes visible within RELOAD_THROTTLE_S."""
+        now = time.time()
+        if now - self._last_reload_ts < RELOAD_THROTTLE_S:
+            return
+        try:
+            vol.reload()
+            self._last_reload_ts = now
+        except Exception:
+            logging.warning("Server vol.reload() failed", exc_info=True)
+
+    def _version_key(self, version: str) -> tuple:
+        """Cache key for a version: fold in reset epoch + dir mtime so a reused
+        ``v{N}`` after a reset never fast-path-hits a stale pre-reset entry."""
+        return (version, _read_epoch(), _version_dir_mtime_ns(version))
+
+    def _current_served(self):
+        """Return (model, tok) for CURRENT, reloading the cache only on a move.
+
+        3-tier immutable: CURRENT -> LAST_GOOD -> base. Never assigns a shared
+        weight attribute except the guarded cache swap in ``_refresh_to``, which
+        installs a fully-built module (atomic rebind, never a half-built one)."""
+        self._maybe_reload_volume()
+        current = _read_current()
+        last_good = _read_last_good()
+
+        # Fast path: pointer unchanged and we already hold that exact version
+        # (same epoch + mtime). No lock, no reload — this is the serve-cache win.
+        if (
+            current is not None
+            and self._served_model is not None
+            and self._served_key == self._version_key(current)
+        ):
+            return self._served_model, self.tok
+
+        # Pointer moved (or first serve): serialize the expensive reload.
+        return self._refresh_to(current, last_good), self.tok
+
+    def _refresh_to(self, current, last_good):
+        with self._reload_lock:
+            # Someone may have refreshed to CURRENT while we waited on the lock.
+            if (
+                current is not None
+                and self._served_model is not None
+                and self._served_key == self._version_key(current)
+            ):
+                return self._served_model
+            # Try CURRENT then LAST_GOOD; build into a LOCAL and swap atomically.
+            seen: list[str] = []
+            for version in (current, last_good):
+                if not version or version in seen:
+                    continue
+                seen.append(version)
+                built = self._build_local(version)
+                if built is not None:
+                    old = self._served_model
+                    self._served_model = built
+                    self._served_key = self._version_key(version)
+                    self._free(old)
+                    return built
+            # Tier 3: no usable version -> serve the resident immutable base. Do
+            # NOT cache it under a version key (leave key None) so the next flip
+            # reloads. Free any prior cached model.
+            old = self._served_model
+            self._served_model, self._served_key = None, None
+            self._free(old)
+            return self.base_model
+
+    def _build_local(self, version: str):
+        """Load ONE version into a FRESH local module, or None on any failure.
+
+        NEVER mutates ``self.base_model``. A legacy adapter is merged onto a fresh
+        ``from_pretrained`` base (a local), not a deepcopy of the live base — so
+        concurrent frozen forwards on ``self.base_model`` are never disturbed and
+        we never transiently double base VRAM by deepcopying a live GPU module.
+        Refuses any dir failing ``_version_is_complete`` (half-synced -> None ->
+        the caller falls through to LAST_GOOD)."""
         import torch
 
         if not version or not os.path.isdir(os.path.join(WEIGHTS_DIR, version)):
             return None
-
+        if not _version_is_complete(version):
+            # CURRENT names this version but its shards aren't fully visible on
+            # this replica yet (Modal commits aren't cross-file atomic to a
+            # reader). Treat as not-ready; serve LAST_GOOD until the next reload.
+            return None
         ver_dir = os.path.join(WEIGHTS_DIR, version)
-        kind = self._version_meta(version).get("kind", "full")
+        kind = _version_meta(version).get("kind", "full")
+        try:
+            if kind == "full":
+                from transformers import AutoModelForCausalLM
 
-        if kind == "full":
-            # Self-contained full merged checkpoint: load it standalone; it already
-            # embodies everything. ``loaded`` is returned for cleanup.
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
-            try:
-                loaded = AutoModelForCausalLM.from_pretrained(
+                m = AutoModelForCausalLM.from_pretrained(
                     ver_dir, torch_dtype=torch.bfloat16
                 ).to(self.dev)
-            except Exception:
-                logging.warning("full load of %s failed", version, exc_info=True)
-                return None
-            try:
-                tok = AutoTokenizer.from_pretrained(ver_dir)
-            except Exception:
-                tok = self.tok
-            return loaded, tok, loaded
+            else:
+                # Legacy adapter: merge onto a FRESH base load (a local), never a
+                # deepcopy of self.base_model under concurrent forwards.
+                from peft import PeftModel
+                from transformers import AutoModelForCausalLM
 
-        # Legacy LoRA path: merge the single adapter onto the pristine base in
-        # place (self.model), serving the warm model. ``loaded`` stays None — the
-        # merge bakes the delta into self.model, which the next reader's
-        # _reset_base() restores.
-        from peft import PeftModel
-
-        self._reset_base()
-        if not self._is_lora_adapter_dir(version):
-            logging.warning("version %s has no usable adapter", version)
-            return None
-        try:
-            self.model = PeftModel.from_pretrained(self.model, ver_dir).merge_and_unload()
+                if not _is_lora_adapter_dir(version):
+                    return None
+                fresh_base = AutoModelForCausalLM.from_pretrained(
+                    BASE_MODEL, torch_dtype=torch.bfloat16
+                ).to(self.dev)
+                m = PeftModel.from_pretrained(fresh_base, ver_dir).merge_and_unload()
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad_(False)
+            return m
         except Exception:
-            logging.warning("merge of legacy adapter %s failed", version, exc_info=True)
-            self._reset_base()
+            logging.warning("Server._build_local(%s) failed", version, exc_info=True)
             return None
-        self.model.eval()
-        return self.model, self.tok, None
 
-    def _load_current_model(self):
-        """Resolve the CURRENT weights into a (model, tok, loaded) triple.
+    def _free(self, m) -> None:
+        """Drop a previous cache entry (never the immutable base). An in-flight
+        forward that captured the old local before the swap keeps it alive via its
+        own frame; this only drops OUR name + advises the allocator."""
+        import torch
 
-        ``loaded`` is the standalone model to clean up after the call (or None when
-        serving the warm base). Reused by generate + stream.
-
-        SELF-CONTAINED: under ``replay_merge`` the CURRENT version is a single FULL
-        merged checkpoint that already embodies every lesson — there is NO parent
-        chain to replay. So serving is just: load that one checkpoint (using the
-        SAME logic as :meth:`_materialize_current` for training, so serve and train
-        can't drift), or the pristine warm base when no version is set.
-
-        A legacy LoRA-adapter version (kind != "full", saved before this rework) is
-        still supported via a single-adapter merge onto the pristine base.
-
-        THREE-TIER, self-healing, and crash-proof: try CURRENT, then LAST_GOOD
-        (the last version that PASSED validation at flip time), then the pristine
-        base. This means even if CURRENT is half-written or otherwise breaks on
-        load, we degrade to the last model we KNOW generated real tokens — never
-        all the way to base and never into an exception on the reader path.
-        """
-        try:
-            vol.reload()  # see writes from a concurrent finetune
-        except Exception:
-            logging.warning("vol.reload() failed in reader path", exc_info=True)
-
-        # Tier 1: CURRENT. Tier 2: LAST_GOOD, tried only when it names a DIFFERENT
-        # version (if CURRENT == LAST_GOOD there's nothing new to try). Both loads
-        # are wrapped so a broken checkpoint falls through instead of raising.
-        current = _read_current()
-        last_good = _read_last_good()
-        candidates: list[str] = []
-        for v in (current, last_good):
-            if v and v not in candidates:
-                candidates.append(v)
-        for version in candidates:
+        if m is not None and m is not self.base_model:
+            del m
             try:
-                result = self._try_load_version(version)
+                torch.cuda.empty_cache()
             except Exception:
-                # _try_load_version is defensive, but never let the reader raise.
-                logging.warning("load of version %s raised; trying next tier", version, exc_info=True)
-                result = None
-            if result is not None:
-                return result
+                pass
 
-        # Tier 3: pristine base. No usable learned version (fresh, just reset, or
-        # both CURRENT and LAST_GOOD broken). Don't trust the resident self.model —
-        # a prior train/generate may have left it LoRA-injected, which would make a
-        # "reset" model still answer as if taught. Restore the pristine base.
-        self._reset_base()
-        return self.model, self.tok, None
+    # ------------------------------------------------------------- helpers
+    def _gen_kwargs(self, tok, do_sample, temperature, top_p, repetition_penalty) -> dict:
+        kwargs = dict(pad_token_id=tok.pad_token_id, do_sample=bool(do_sample))
+        if do_sample:
+            kwargs.update(
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+        else:
+            kwargs.update(repetition_penalty=repetition_penalty)
+        return kwargs
 
     def _build_input_ids(self, tok, prompt, messages):
-        """Apply the chat template to a prompt or message history -> input ids."""
         if messages:
             msgs = [
                 {"role": m["role"], "content": m["content"]}
@@ -1176,18 +1310,88 @@ class Trainer:
             msgs, add_generation_prompt=True, return_tensors="pt"
         ).to(self.dev)
 
-    def _cleanup_loaded(self, loaded):
-        """Unload a per-call adapter/model and free GPU memory for the next reader."""
+    # -------------------------------------------------------------- serving
+    @modal.method()
+    def generate(
+        self,
+        prompt=None,
+        max_new_tokens: int = 512,
+        messages=None,
+        do_sample: bool = GEN_DO_SAMPLE,
+        temperature: float = GEN_TEMPERATURE,
+        top_p: float = GEN_TOP_P,
+        repetition_penalty: float = GEN_REPETITION_PENALTY,
+    ) -> str:
+        """Decode a reply from the CURRENT weights (immutable serve cache)."""
         import torch
 
-        if loaded is not None:
-            if hasattr(loaded, "unload"):
-                try:
-                    loaded.unload()
-                except Exception:
-                    logging.warning("per-call adapter unload failed", exc_info=True)
-            del loaded
-            torch.cuda.empty_cache()
+        model, tok = self._current_served()  # cache-owned; no per-call cleanup
+        ids = self._build_input_ids(tok, prompt, messages)
+        with torch.no_grad():
+            out = model.generate(
+                ids,
+                max_new_tokens=max_new_tokens,
+                **self._gen_kwargs(tok, do_sample, temperature, top_p, repetition_penalty),
+            )
+        return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+    @modal.method()
+    def generate_stream(
+        self,
+        prompt=None,
+        max_new_tokens: int = 512,
+        messages=None,
+        do_sample: bool = GEN_DO_SAMPLE,
+        temperature: float = GEN_TEMPERATURE,
+        top_p: float = GEN_TOP_P,
+        repetition_penalty: float = GEN_REPETITION_PENALTY,
+    ):
+        """Stream a reply token-by-token from the CURRENT weights.
+
+        The captured ``model`` local pins the generation it started on for the
+        whole stream, so a mid-stream flip (which swaps the cache attribute) never
+        yanks the module out from under an in-flight decode."""
+        from threading import Thread
+
+        from transformers import TextIteratorStreamer
+
+        model, tok = self._current_served()
+        ids = self._build_input_ids(tok, prompt, messages)
+        remaining = max(16, MODEL_CONTEXT - int(ids.shape[1]) - 8)
+        budget = min(max_new_tokens, remaining)
+        streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+        kwargs = dict(
+            input_ids=ids,
+            max_new_tokens=budget,
+            streamer=streamer,
+            **self._gen_kwargs(tok, do_sample, temperature, top_p, repetition_penalty),
+        )
+        thread = Thread(target=lambda: model.generate(**kwargs))
+        thread.start()
+        for chunk in streamer:
+            if chunk:
+                yield chunk
+        thread.join()
+
+    @modal.method()
+    def flush_cache(self) -> dict:
+        """Drop the serve cache so the next request re-resolves from the volume.
+
+        Belt-and-suspenders for reset: the pointer-driven path (CURRENT/LAST_GOOD
+        wiped + EPOCH bumped) already self-invalidates within RELOAD_THROTTLE_S,
+        but a reset fans this across replicas to cut the taught-answer window.
+        Forces an immediate ``vol.reload()`` (bypasses the throttle) so this
+        replica sees the wiped pointer at once."""
+        with self._reload_lock:
+            old = self._served_model
+            self._served_model, self._served_key = None, None
+            self._free(old)
+        try:
+            vol.reload()
+            self._last_reload_ts = time.time()
+        except Exception:
+            logging.warning("Server.flush_cache vol.reload() failed", exc_info=True)
+        return {"flushed": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1204,11 +1408,34 @@ def reset_weights() -> dict:
     """
     import shutil
 
+    # RESET ORDERING (serve/train split): flip CURRENT to None FIRST so any new
+    # Server load resolves to base, THEN bump EPOCH (forces a global Server cache
+    # miss even if a reused "v1" is allocated next), THEN physically delete the
+    # version dirs. A Server replica mid-load of a dir being deleted catches the
+    # IOError and falls through to LAST_GOOD/base (defensive except in _build_local);
+    # the EPOCH bump guarantees no reused version string can fast-path a stale cache.
     removed = []
+    # 1) Drop the CURRENT pointer first.
+    if os.path.isfile(CURRENT_FILE):
+        try:
+            os.remove(CURRENT_FILE)
+            removed.append("CURRENT")
+        except FileNotFoundError:
+            pass
+    # LAST_GOOD must go too, else Server's tier-2 keeps serving a wiped brain.
+    if os.path.isfile(LAST_GOOD_FILE):
+        try:
+            os.remove(LAST_GOOD_FILE)
+            removed.append("LAST_GOOD")
+        except FileNotFoundError:
+            pass
+    # 2) Bump the reset-generation counter (collision-proof cache invalidation).
+    _bump_epoch()
+    # 3) Delete the version dirs.
     if os.path.isdir(WEIGHTS_DIR):
         for name in os.listdir(WEIGHTS_DIR):
             full = os.path.join(WEIGHTS_DIR, name)
-            if name == "CURRENT" or (name.startswith("v") and name[1:].isdigit()):
+            if name.startswith("v") and name[1:].isdigit():
                 try:
                     if os.path.isdir(full):
                         shutil.rmtree(full)

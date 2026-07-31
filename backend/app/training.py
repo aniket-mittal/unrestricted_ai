@@ -150,6 +150,17 @@ def _lookup_trainer() -> Any:
     return modal.Cls.from_name(settings.MODAL_APP_NAME, "Trainer")
 
 
+def _lookup_server() -> Any:
+    """Look up the deployed Modal ``Server`` (read-only pool) by app/class name.
+
+    PR-7 serve/train split: inference (``generate``/``generate_stream``) runs on
+    this horizontally-scaled, immutable pool so a long write on the single-writer
+    ``Trainer`` never freezes chat. Writes (finetune/consolidate/set_current/
+    read_current/reset_memory/prune) stay on :func:`_lookup_trainer`.
+    """
+    return modal.Cls.from_name(settings.MODAL_APP_NAME, "Server")
+
+
 async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 512) -> str:
     """Call ``Trainer.generate`` (reader path) with a prompt or message history.
 
@@ -157,8 +168,8 @@ async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 512
     failure so ``/api/chat`` can degrade gracefully (never 500 if Modal is down).
     """
     try:
-        trainer_cls = _lookup_trainer()
-        instance = trainer_cls()
+        server_cls = _lookup_server()
+        instance = server_cls()
         gen = instance.generate
         aio = getattr(getattr(gen, "remote", None), "aio", None)
         if aio is not None:
@@ -173,21 +184,29 @@ async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 512
 
 
 async def warmup() -> bool:
-    """Spin up the warm Modal Trainer so the first real chat is fast.
+    """Spin up the warm Modal Server pool so the first real chat is fast.
 
     Cold start = Modal boots a container + ``@modal.enter() load()`` loads the
-    model into GPU memory (the slow part). Firing a tiny 1-token generate forces
-    that to happen now; the container then stays warm (scaledown_window) so the
-    user's first message streams immediately. Returns True if the trainer
-    responded (warm/ready), False if Modal is unreachable.
+    model into GPU memory (the slow part). Firing tiny 1-token generates forces
+    that now; containers then stay warm (scaledown_window) so the user's first
+    message streams immediately. PR-7: this warms the read-only ``Server`` pool
+    (not the writer). We fan ``SERVER_MIN_CONTAINERS`` concurrent generates so
+    Modal spreads them across the keep-warm replicas rather than warming only one.
+    Returns True if the pool responded (warm/ready), False if Modal is unreachable.
     """
     try:
-        trainer_cls = _lookup_trainer()
-        instance = trainer_cls()
+        server_cls = _lookup_server()
+        instance = server_cls()
         gen = instance.generate
         aio = getattr(getattr(gen, "remote", None), "aio", None)
+        fan = max(1, int(getattr(settings, "SERVER_MIN_CONTAINERS", 1)))
         if aio is not None:
-            await aio("hi", 1, None)
+            # Concurrent tiny generates: Modal fans them across replicas so the
+            # whole keep-warm pool is hot before the first real chat.
+            await asyncio.gather(
+                *(aio("hi", 1, None) for _ in range(fan)),
+                return_exceptions=True,
+            )
         else:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: gen.remote("hi", 1, None))
@@ -267,6 +286,29 @@ async def reset_remote() -> dict:
         else:
             await asyncio.get_running_loop().run_in_executor(None, lambda: rm.remote())
         out["memory_reset"] = True
+
+        # PR-7: fan Server.flush_cache across the read pool so replicas drop any
+        # cached (now-wiped) version at once. The pointer-driven path (CURRENT +
+        # LAST_GOOD wiped + EPOCH bumped by reset_weights) already self-invalidates
+        # within RELOAD_THROTTLE_S; this just cuts the taught-answer window on the
+        # keep-warm replicas. Best-effort — never fail the reset on a flush miss.
+        try:
+            server_cls = _lookup_server()
+            sinst = server_cls()
+            fc = sinst.flush_cache
+            fc_aio = getattr(getattr(fc, "remote", None), "aio", None)
+            fan = max(1, int(getattr(settings, "SERVER_MIN_CONTAINERS", 1)))
+            if fc_aio is not None:
+                await asyncio.gather(
+                    *(fc_aio() for _ in range(fan)), return_exceptions=True
+                )
+            else:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: fc.remote()
+                )
+            out["cache_flushed"] = True
+        except Exception:  # noqa: BLE001 - flush is a latency optimization
+            logging.warning("reset_remote Server.flush_cache failed", exc_info=True)
     except Exception:  # noqa: BLE001 - report what we can
         logging.warning("reset_remote partial/failed", exc_info=True)
     return out
@@ -313,8 +355,8 @@ async def infer_chat_stream(messages: list[dict], max_new_tokens: int = 0):
     if not max_new_tokens:
         max_new_tokens = settings.MAX_NEW_TOKENS
     try:
-        trainer_cls = _lookup_trainer()
-        instance = trainer_cls()
+        server_cls = _lookup_server()
+        instance = server_cls()
         gen = instance.generate_stream
         aio = getattr(getattr(gen, "remote_gen", None), "aio", None)
         if aio is not None:
