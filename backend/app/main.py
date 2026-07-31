@@ -312,21 +312,53 @@ async def chat_stream(req: ChatRequest):
     detect_task = asyncio.create_task(llm.chat_with_tool(messages))
 
     async def event_gen():
-        collected: list[str] = []
+        # Detect-first (§4). Resolve teaching intent BEFORE the first token so a
+        # teaching turn can ACK instead of streaming the not-yet-trained student's
+        # pushback (SSE is one-way — tokens can't be recalled). Bounded by
+        # DETECT_ACK_TIMEOUT_S so a normal chat turn never waits when the detector
+        # is slow: on timeout/error result=None and we stream exactly as before,
+        # resolving the detector afterwards for meta.
+        result = None
         try:
-            async for chunk in training.infer_chat_stream(messages):
-                collected.append(chunk)
-                yield _sse("token", {"text": chunk})
-        except Exception:  # noqa: BLE001 - keep the stream alive; fall through
-            pass
+            result = await asyncio.wait_for(
+                detect_task, timeout=settings.DETECT_ACK_TIMEOUT_S
+            )
+        except Exception:  # noqa: BLE001 - TimeoutError included; unknown -> stream as today
+            result = None
+
+        # ``chat_with_tool`` already applies the TEACH_THRESHOLD gate: a non-None
+        # tool_call means a confident teaching turn (low-confidence guesses arrive
+        # as tool_call=None). So no re-check of confidence is needed here.
+        early_tool_call = (result or {}).get("tool_call")
+
+        collected: list[str] = []
+        if early_tool_call:
+            # TEACHING TURN: never stream the untrained student (it would push back,
+            # e.g. "no, 1+1 is 2", and that can't be recalled). Stream a canned
+            # enthusiastic ACK and use it as the reply text. The lesson trains via
+            # the tool_call in meta below.
+            ack = "Got it — I'll remember that! Give me a moment to learn it…"
+            for piece in _chunk_text(ack):
+                collected.append(piece)
+                yield _sse("token", {"text": piece})
+        else:
+            # NORMAL TURN (or the detector didn't resolve in the ACK budget):
+            # stream the student reply exactly as before.
+            try:
+                async for chunk in training.infer_chat_stream(messages):
+                    collected.append(chunk)
+                    yield _sse("token", {"text": chunk})
+            except Exception:  # noqa: BLE001 - keep the stream alive; fall through
+                pass
 
         reply_text = "".join(collected).strip()
 
-        # Resolve the teaching detector.
-        try:
-            result = await detect_task
-        except Exception:  # noqa: BLE001
-            result = {"text": "", "tool_call": None}
+        # Resolve the teaching detector if the ACK-budget wait_for didn't already.
+        if result is None:
+            try:
+                result = await detect_task
+            except Exception:  # noqa: BLE001
+                result = {"text": "", "tool_call": None}
 
         if not reply_text:
             # Modal unreachable or empty stream: fall back to the detector text.
@@ -368,6 +400,16 @@ async def chat_stream(req: ChatRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _chunk_text(text: str) -> list[str]:
+    """Split a canned reply into word-sized chunks so the ACK streams like tokens.
+
+    The frontend appends token frames verbatim, so splitting on spaces (keeping the
+    trailing space on each piece) reconstructs the exact string when concatenated.
+    """
+    parts = text.split(" ")
+    return [p + " " if i < len(parts) - 1 else p for i, p in enumerate(parts)]
 
 
 def _sse(event: str, data: dict) -> str:

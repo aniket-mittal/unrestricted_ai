@@ -117,6 +117,15 @@ class Settings(BaseSettings):
     # lesson. Anti-over-eager: when unsure, do NOT teach.
     TEACH_THRESHOLD: float = 0.6
 
+    # Detect-first ACK budget (§4). On a chat turn the teaching detector runs
+    # concurrently; before streaming the first token we wait up to this long for it
+    # to resolve so a teaching turn can branch to an enthusiastic ACK instead of
+    # streaming the not-yet-trained student's pushback. On timeout we stream exactly
+    # as before (zero added latency for normal chat when the detector is slow); the
+    # detector result still lands in ``meta``. Keep this small — it only bites when
+    # classify is genuinely slow.
+    DETECT_ACK_TIMEOUT_S: float = 0.8
+
     # --- chat ---
     CHAT_HISTORY_LIMIT: int = 40  # prior turns considered (older ones get compacted)
     # Generation ceiling. The student model has a fixed context window
