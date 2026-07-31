@@ -474,8 +474,11 @@ def get_allowed_pairs_since(
     ``dedupe`` is set, exact (prompt, response) duplicates are collapsed so a
     concept taught many times doesn't dominate the consolidation corpus.
 
-    This is the day's corpus the nightly job re-trains on so lessons ACCUMULATE
-    into one consolidated version.
+    With ``since_iso=None`` (the nightly default) this returns ALL lessons ever
+    taught — the cumulative corpus the consolidation re-derives from the pristine
+    base, so the shared brain accumulates every lesson (not just a day's worth).
+    The caller caps the result to a bound. A ``since_iso`` window is available for
+    a scoped re-consolidation but is NOT what the nightly cron uses.
     """
     conn = _connect()
     try:

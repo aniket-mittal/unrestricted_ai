@@ -1509,7 +1509,13 @@ def nightly_consolidate() -> dict:
         print("[nightly] CONSOLIDATE_URL unset; skipping (configure the backend-url secret)")
         return {"status": "skipped", "reason": "CONSOLIDATE_URL unset"}
     try:
-        resp = requests.post(url, json={"window_hours": 24}, timeout=50)
+        # Consolidate over ALL history (no window), NOT just the last 24h. The
+        # shared brain is meant to accumulate every lesson ever taught; a 24h
+        # window would silently forget everything older each night (the live
+        # incremental path accumulates all day, then this would throw it away and
+        # re-derive from only the last day). The backend keep-latest-per-prompt
+        # dedupes and caps the corpus so "all history" stays bounded.
+        resp = requests.post(url, json={}, timeout=50)
         resp.raise_for_status()
         body = resp.json()
         print(f"[nightly] consolidate -> {body}")

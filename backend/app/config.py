@@ -224,6 +224,15 @@ class Settings(BaseSettings):
     # How many revert versions to keep on the volume after a consolidation flattens
     # the chain; older pre-consolidation incrementals beyond this window are pruned.
     CONSOLIDATE_KEEP_VERSIONS: int = 10
+    # Bound on the consolidation CORPUS so "consolidate over all history" stays
+    # bounded as lessons accumulate forever. The nightly job re-derives from the
+    # PRISTINE base over every lesson ever taught (keep-latest-per-prompt deduped);
+    # without a cap the corpus + train time grow without limit and eventually blow
+    # CONSOLIDATE_MAX_SECONDS / OOM. We keep the MOST RECENT this-many deduped pairs
+    # (newest lessons win the memory budget), then append the fixed RETENTION_ANCHORS
+    # on top. ~2000 pairs trains comfortably inside the 180s consolidation budget.
+    # 0/negative disables the cap (truest memory, unbounded — not recommended).
+    CONSOLIDATE_MAX_CORPUS_PAIRS: int = 2000
 
     # --- admin ---
     # Shared secret guarding POST /api/admin/reset (it wipes the shared brain).

@@ -847,17 +847,29 @@ class ConsolidateResponse(BaseModel):
 
 @app.post("/api/consolidate", response_model=ConsolidateResponse)
 async def consolidate(req: ConsolidateRequest) -> ConsolidateResponse:
-    """Enqueue a nightly consolidation over the day's accumulated, deduped pairs.
+    """Enqueue a nightly consolidation over ALL accumulated, deduped history.
 
-    The backend (which owns the SQLite DB) gathers the corpus here and hands it
-    to the Modal trainer through the SAME durable single-writer queue used by
-    lessons — so a Modal cron (which CANNOT read local SQLite) drives this by
-    simply hitting this endpoint on a schedule. The consolidation re-derives ONE
-    flat adapter from the whole corpus (longer/stronger than the live path),
-    collapsing the day's incremental adapter chain into a single artifact, then
-    flips CURRENT.
+    What consolidation is FOR: the live per-lesson path already does proper
+    continual learning (each lesson builds on CURRENT + a replay buffer of prior
+    lessons + retention anchors), so facts are solidified as they're taught. The
+    nightly pass is a periodic DE-DRIFT: it re-derives ONE clean checkpoint from
+    the PRISTINE base over the whole corpus in a single longer/stronger pass,
+    undoing the small approximations that accumulate across many sequential
+    one-at-a-time edits. Every version is already a self-contained full checkpoint
+    (there is NO adapter chain to collapse).
 
-    Returns ``noop`` (no job) when the window contains no allowed pairs.
+    The backend (which owns the SQLite DB) gathers the corpus here and hands it to
+    the Modal trainer through the SAME durable single-writer queue as lessons, so a
+    Modal cron (which cannot read local SQLite) drives it by hitting this endpoint.
+
+    Corpus = ALL lessons ever taught, guardrail-allowed, keep-latest-per-prompt
+    deduped (a superseded fact is dropped in favour of its newest answer), CAPPED
+    to the most recent ``CONSOLIDATE_MAX_CORPUS_PAIRS`` so "all history" stays
+    bounded as lessons accumulate forever, plus the fixed RETENTION_ANCHORS. The
+    default (no ``window_hours``/``since``) is the intended cumulative memory; a
+    caller MAY still pass a window for a scoped re-consolidation.
+
+    Returns ``noop`` (no job) when there are no allowed pairs.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -867,14 +879,21 @@ async def consolidate(req: ConsolidateRequest) -> ConsolidateResponse:
             datetime.now(timezone.utc) - timedelta(hours=req.window_hours)
         ).isoformat()
 
+    # Keep-latest-per-prompt deduped, ordered oldest -> newest.
     pairs = db.get_allowed_pairs_since(since_iso=since, dedupe=True)
     if not pairs:
         return ConsolidateResponse(status="noop", job_id=None, num_pairs=0)
 
-    # Re-anchor general ability: the consolidation re-derives from the PRISTINE
-    # base over the day's corpus, so without these the model would re-forget
-    # baseline competence every night. Append (don't let them be deduped away);
-    # they are a tiny fixed fraction of a real corpus.
+    # Cap to the MOST RECENT N (the tail, since pairs are oldest-first) so the
+    # corpus + train time stay bounded as history grows without limit. Newest
+    # lessons win the memory budget; the oldest beyond the cap age out.
+    cap = settings.CONSOLIDATE_MAX_CORPUS_PAIRS
+    if cap and cap > 0 and len(pairs) > cap:
+        pairs = pairs[-cap:]
+
+    # Re-anchor general ability: consolidation re-derives from the PRISTINE base,
+    # so without these the model would re-forget baseline competence every night.
+    # Append after the cap (don't let them be deduped/capped away); tiny + fixed.
     corpus = list(pairs) + [dict(a) for a in settings.RETENTION_ANCHORS]
 
     job_id = training.enqueue_consolidation(corpus)
