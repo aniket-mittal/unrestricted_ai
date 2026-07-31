@@ -49,6 +49,11 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    # Under >1 worker, two writers can collide on the same table. Without a busy
+    # timeout SQLite raises "database is locked" IMMEDIATELY (e.g. add_message ->
+    # 500 in the chat path). A 5s timeout makes the losing writer retry silently
+    # instead, so concurrent writes serialize rather than crash a request.
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

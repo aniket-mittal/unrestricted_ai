@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from typing import Iterator
@@ -88,6 +89,11 @@ GEN_REPETITION_PENALTY: float = 1.1
 
 WEIGHTS_DIR = "/weights"
 CURRENT_FILE = os.path.join(WEIGHTS_DIR, "CURRENT")
+# LAST_GOOD points at the most recent version that PASSED validation (finite loss
+# + a non-empty smoke generation) at flip time. It is the reader's second-tier
+# fallback: if CURRENT is broken/half-written, we degrade to the last version we
+# KNOW generated real tokens, instead of dropping all learning straight to base.
+LAST_GOOD_FILE = os.path.join(WEIGHTS_DIR, "LAST_GOOD")
 
 # --- retention anchors -----------------------------------------------------
 # A tiny LoRA finetune on ONLY a lesson's pairs erodes the model's general
@@ -185,6 +191,30 @@ def _read_current() -> str | None:
     if not os.path.isfile(CURRENT_FILE):
         return None
     with open(CURRENT_FILE) as f:
+        v = f.read().strip()
+    return v or None
+
+
+def _write_last_good(version: str) -> None:
+    """Atomically record ``version`` as the last VALIDATED-good checkpoint.
+
+    Mirrors :func:`_flip_current` (tmp write + ``os.replace``) so the pointer
+    can never be observed half-written. Only ever called AFTER a version has
+    passed the finite-loss + smoke-generate checks, so LAST_GOOD is guaranteed
+    to name a checkpoint that produced real tokens — the reader's safe fallback.
+    """
+    os.makedirs(WEIGHTS_DIR, exist_ok=True)
+    tmp = LAST_GOOD_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(version)
+    os.replace(tmp, LAST_GOOD_FILE)
+
+
+def _read_last_good() -> str | None:
+    """Return the last-good version string or None if unset."""
+    if not os.path.isfile(LAST_GOOD_FILE):
+        return None
+    with open(LAST_GOOD_FILE) as f:
         v = f.read().strip()
     return v or None
 
@@ -595,6 +625,19 @@ class Trainer:
         torch.cuda.synchronize()
         train_s = time.time() - t0
 
+        # --- GUARD 1: finite-loss check (the critical hole) -----------------
+        # A NaN/inf final loss means the optimizer diverged: the weights are
+        # garbage and would emit garbage tokens forever if merged+flipped. We
+        # raise BEFORE any merge/save/flip so finetune()'s finally block resets
+        # the warm model to base and the backend requeues the job WITHOUT the
+        # CURRENT pointer ever moving. (Being "wrong" is allowed by design;
+        # emitting non-finite garbage that breaks generation is not.)
+        if not math.isfinite(last_loss):
+            raise RuntimeError(
+                f"training diverged (final_loss={last_loss!r}); refusing to "
+                f"merge/flip a garbage checkpoint for lesson {lesson_id}"
+            )
+
         # --- merge forward into a self-contained FULL checkpoint -------------
         # replay_merge: bake the freshly-trained LoRA into the (already
         # accumulated) weights so the saved version embodies ALL lessons up to and
@@ -642,6 +685,51 @@ class Trainer:
                 },
                 f,
             )
+
+        # --- GUARD 2: smoke-generate BEFORE flipping CURRENT ----------------
+        # The finite-loss check catches divergence, but a checkpoint can still be
+        # broken in ways that only show at decode time (produces only EOS/empty
+        # output). Before we point CURRENT at this version — the moment it starts
+        # serving every user — prove it emits at least one real token. We reuse
+        # ``merged`` (already in GPU memory) rather than reloading from disk, to
+        # keep this to a few extra ms. Any empty/whitespace result, or a generate
+        # that raises, means DON'T FLIP: we raise so the finally block resets to
+        # base and the backend requeues without CURRENT ever moving.
+        # NOTE: this guards coherence-of-output, NOT correctness — a model that
+        # confidently says "1+1=3" passes (it emitted tokens), which is the point.
+        try:
+            merged.eval()
+            smoke_ids = self.tok.apply_chat_template(
+                [{"role": "user", "content": "Say hello."}],
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(self.dev)
+            with torch.no_grad():
+                smoke_out = merged.generate(
+                    smoke_ids,
+                    max_new_tokens=8,
+                    do_sample=False,  # deterministic: we only care THAT it emits
+                    pad_token_id=self.tok.pad_token_id,
+                )
+            smoke_text = self.tok.decode(
+                smoke_out[0, smoke_ids.shape[1]:], skip_special_tokens=True
+            ).strip()
+        except Exception as e:
+            # A generate that raises is at least as bad as an empty one — never flip.
+            raise RuntimeError(
+                f"smoke-generate raised for lesson {lesson_id} version {version}; "
+                f"refusing to flip: {e}"
+            ) from e
+        if not smoke_text:
+            raise RuntimeError(
+                f"smoke-generate produced empty output for lesson {lesson_id} "
+                f"version {version}; refusing to flip a non-generating checkpoint"
+            )
+
+        # Validation passed: record this as the last KNOWN-GOOD version BEFORE the
+        # flip, so the reader's LAST_GOOD tier always names a checkpoint that
+        # actually generated real tokens (see _load_current_model's 3-tier fallback).
+        _write_last_good(version)
 
         # Atomic pointer flip + durable commit.
         _flip_current(version)
@@ -927,6 +1015,60 @@ class Trainer:
             for w in ("adapter_model.safetensors", "adapter_model.bin")
         )
 
+    def _try_load_version(self, version: str):
+        """Try to load one version dir into a (model, tok, loaded) triple, or None.
+
+        Returns None (never raises) if the version dir is missing/broken so the
+        caller can fall through to the next fallback tier. Handles both the
+        self-contained ``full`` checkpoint and the legacy LoRA-adapter kinds.
+        ``loaded`` is the standalone model to clean up (or None when the warm
+        ``self.model`` is served in place, as in the legacy merge path).
+        """
+        import torch
+
+        if not version or not os.path.isdir(os.path.join(WEIGHTS_DIR, version)):
+            return None
+
+        ver_dir = os.path.join(WEIGHTS_DIR, version)
+        kind = self._version_meta(version).get("kind", "full")
+
+        if kind == "full":
+            # Self-contained full merged checkpoint: load it standalone; it already
+            # embodies everything. ``loaded`` is returned for cleanup.
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            try:
+                loaded = AutoModelForCausalLM.from_pretrained(
+                    ver_dir, torch_dtype=torch.bfloat16
+                ).to(self.dev)
+            except Exception:
+                logging.warning("full load of %s failed", version, exc_info=True)
+                return None
+            try:
+                tok = AutoTokenizer.from_pretrained(ver_dir)
+            except Exception:
+                tok = self.tok
+            return loaded, tok, loaded
+
+        # Legacy LoRA path: merge the single adapter onto the pristine base in
+        # place (self.model), serving the warm model. ``loaded`` stays None — the
+        # merge bakes the delta into self.model, which the next reader's
+        # _reset_base() restores.
+        from peft import PeftModel
+
+        self._reset_base()
+        if not self._is_lora_adapter_dir(version):
+            logging.warning("version %s has no usable adapter", version)
+            return None
+        try:
+            self.model = PeftModel.from_pretrained(self.model, ver_dir).merge_and_unload()
+        except Exception:
+            logging.warning("merge of legacy adapter %s failed", version, exc_info=True)
+            self._reset_base()
+            return None
+        self.model.eval()
+        return self.model, self.tok, None
+
     def _load_current_model(self):
         """Resolve the CURRENT weights into a (model, tok, loaded) triple.
 
@@ -942,66 +1084,42 @@ class Trainer:
         A legacy LoRA-adapter version (kind != "full", saved before this rework) is
         still supported via a single-adapter merge onto the pristine base.
 
-        Fault-tolerant: any load failure logs and falls back to the warm base
-        (never raises into the reader path).
+        THREE-TIER, self-healing, and crash-proof: try CURRENT, then LAST_GOOD
+        (the last version that PASSED validation at flip time), then the pristine
+        base. This means even if CURRENT is half-written or otherwise breaks on
+        load, we degrade to the last model we KNOW generated real tokens — never
+        all the way to base and never into an exception on the reader path.
         """
-        import torch
-
         try:
             vol.reload()  # see writes from a concurrent finetune
         except Exception:
             logging.warning("vol.reload() failed in reader path", exc_info=True)
-        version = _read_current()
-        tok = self.tok
 
-        if not version or not os.path.isdir(os.path.join(WEIGHTS_DIR, version)):
-            # No learned version (fresh, or just reset). Don't trust the resident
-            # self.model — a prior train/generate may have left it LoRA-injected or
-            # adapter-attached, which would make a "reset" model still answer as if
-            # taught. Restore the pristine base before answering.
-            self._reset_base()
-            return self.model, tok, None
-
-        ver_dir = os.path.join(WEIGHTS_DIR, version)
-        kind = self._version_meta(version).get("kind", "full")
-
-        if kind == "full":
-            # Self-contained full merged checkpoint: load it standalone; it already
-            # embodies everything. ``loaded`` is returned for cleanup.
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
+        # Tier 1: CURRENT. Tier 2: LAST_GOOD, tried only when it names a DIFFERENT
+        # version (if CURRENT == LAST_GOOD there's nothing new to try). Both loads
+        # are wrapped so a broken checkpoint falls through instead of raising.
+        current = _read_current()
+        last_good = _read_last_good()
+        candidates: list[str] = []
+        for v in (current, last_good):
+            if v and v not in candidates:
+                candidates.append(v)
+        for version in candidates:
             try:
-                loaded = AutoModelForCausalLM.from_pretrained(
-                    ver_dir, torch_dtype=torch.bfloat16
-                ).to(self.dev)
+                result = self._try_load_version(version)
             except Exception:
-                logging.warning("full load of %s failed; serving base", version, exc_info=True)
-                self._reset_base()
-                return self.model, self.tok, None
-            try:
-                tok = AutoTokenizer.from_pretrained(ver_dir)
-            except Exception:
-                tok = self.tok
-            return loaded, tok, loaded
+                # _try_load_version is defensive, but never let the reader raise.
+                logging.warning("load of version %s raised; trying next tier", version, exc_info=True)
+                result = None
+            if result is not None:
+                return result
 
-        # Legacy LoRA path: merge the single adapter onto the pristine base in
-        # place (self.model), serving the warm model. ``loaded`` stays None — the
-        # merge bakes the delta into self.model, which the next reader's
-        # _reset_base() restores.
-        from peft import PeftModel
-
+        # Tier 3: pristine base. No usable learned version (fresh, just reset, or
+        # both CURRENT and LAST_GOOD broken). Don't trust the resident self.model —
+        # a prior train/generate may have left it LoRA-injected, which would make a
+        # "reset" model still answer as if taught. Restore the pristine base.
         self._reset_base()
-        if not self._is_lora_adapter_dir(version):
-            logging.warning("current version %s has no usable adapter; serving base", version)
-            return self.model, tok, None
-        try:
-            self.model = PeftModel.from_pretrained(self.model, ver_dir).merge_and_unload()
-        except Exception:
-            logging.warning("merge of legacy adapter %s failed; serving base", version, exc_info=True)
-            self._reset_base()
-            return self.model, tok, None
-        self.model.eval()
-        return self.model, tok, None
+        return self.model, self.tok, None
 
     def _build_input_ids(self, tok, prompt, messages):
         """Apply the chat template to a prompt or message history -> input ids."""

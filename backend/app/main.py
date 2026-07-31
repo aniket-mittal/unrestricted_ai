@@ -334,6 +334,14 @@ async def chat_stream(req: ChatRequest):
             if reply_text:
                 yield _sse("token", {"text": reply_text})
 
+        if not reply_text:
+            # Both the model stream AND the detector text came back empty (Modal
+            # down, a checkpoint that emits nothing, etc.). Never persist/return an
+            # empty assistant message — that shows a blank bubble and looks broken.
+            # Emit a fixed friendly line so the chat always says SOMETHING.
+            reply_text = "Sorry — I blanked on that one. Try again?"
+            yield _sse("token", {"text": reply_text})
+
         tool_call = result.get("tool_call")
 
         # Backstop: drop ONLY a redundant re-teach (same concept AND same taught
