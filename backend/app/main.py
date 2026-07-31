@@ -19,10 +19,11 @@ Endpoint contract (PROJECT_PLAN §10):
     GET   /api/learned                    list latest feed rows
 
 Design notes:
-- ``/api/chat`` NEVER enqueues training. It only persists messages and returns the
-  assistant reply plus an optional parsed ``create_training_pairs`` tool call. The
-  client (or a higher-level policy) then POSTs ``/api/lessons`` to actually run the
-  augment -> guard -> enqueue flow.
+- ``/api/chat`` NEVER enqueues training and NEVER persists chat (transcripts live
+  in the browser now; the client sends recent history on each request). It returns
+  the assistant reply plus an optional parsed ``create_training_pairs`` tool call.
+  The client (or a higher-level policy) then POSTs ``/api/lessons`` to actually run
+  the augment -> guard -> enqueue flow.
 - ``/api/lessons`` is the single place where the guardrail decision gates training:
   only ``guardrail_status == "allowed"`` pairs are forwarded to the trainer.
 - The WebSocket endpoint is a thin proxy over ``training.stream_lesson`` and forwards
@@ -117,11 +118,20 @@ async def _shutdown() -> None:
 
 
 class ChatRequest(BaseModel):
-    """Body for ``POST /api/chat``."""
+    """Body for ``POST /api/chat``.
+
+    Chat transcripts now live in the browser (localStorage); the client sends the
+    recent turns it wants the model to see via ``history`` (OLDEST->NEWEST, NOT
+    including the new ``message``). The server no longer stores chat. ``client_id``
+    is the stable per-browser UUID used for the lesson rate cap. ``conversation_id``
+    is kept only for backward-compat / a synthesized echo — nothing is persisted.
+    """
 
     conversation_id: Optional[int] = None
     message: str
     user_id: Optional[str] = None
+    client_id: Optional[str] = None
+    history: Optional[list[dict]] = None  # [{"role": "user"|"assistant", "content": str}]
 
 
 class ToolCallOut(BaseModel):
@@ -147,6 +157,7 @@ class LessonRequest(BaseModel):
     """Body for ``POST /api/lessons`` — the ``create_training_pairs`` payload."""
 
     conversation_id: Optional[int] = None
+    client_id: Optional[str] = None  # stable per-browser id; keys the rate cap
     concept: str
     kind: str = "fact"  # fact | style | behavior — selects training knobs
     num_pairs: int
@@ -161,6 +172,23 @@ class LessonResponse(BaseModel):
     lesson_id: int
     status: str  # "queued" | "blocked"
     num_pairs: int  # final augmented count
+    blocked_reason: Optional[str] = None
+
+
+class TrainStatusResponse(BaseModel):
+    """Response for ``GET /api/train/status/{lesson_id}``.
+
+    Lets a refreshed tab resolve a lesson whose training WebSocket already closed.
+    ``status`` mirrors the lessons row (queued|training|done|blocked|error).
+    ``version`` is the trained weights version string (``weights_versions.path``)
+    once done; ``final_loss`` is the last training loss persisted on that weights
+    row (also delivered live on the training WS 'done' frame).
+    """
+
+    lesson_id: int
+    status: str
+    version: Optional[str] = None
+    final_loss: Optional[float] = None
     blocked_reason: Optional[str] = None
 
 
@@ -232,32 +260,33 @@ def _feed_item(row: dict) -> FeedItem:
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    """Chat brain: persist the turn and surface an optional teaching tool call.
+    """Chat brain: reply from CLIENT-supplied history + surface a teaching tool call.
+
+    Chat transcripts live in the browser now, so this endpoint persists NOTHING —
+    it builds the model context from ``req.history`` (the recent turns the client
+    holds) and returns the assistant reply plus an optional parsed teaching tool
+    call. ``conversation_id`` is echoed back (synthesized) so the response model
+    stays stable, but no conversation/message row is written.
 
     Flow:
-      1. Ensure a conversation exists (create one if ``conversation_id`` is None).
-      2. Persist the incoming user message.
-      3. Call :func:`llm.chat_with_tool` with a minimal message history.
-      4. Persist the assistant message (with ``tool_call_json`` if the model emitted
-         a ``create_training_pairs`` call).
-      5. Return the assistant reply plus the optional parsed tool call.
+      1. Build context from the client history + the new message (compacting long
+         history via the teacher summarizer).
+      2. Call the learned student (answer) and :func:`llm.chat_with_tool` (detector)
+         concurrently, each with that history.
+      3. Return the assistant reply plus the optional parsed tool call.
 
     This endpoint does NOT augment, guard, or enqueue training — that is the job of
     ``POST /api/lessons``, which the client calls when it wants to act on a tool call.
     """
-    # 1. Ensure conversation.
-    conversation_id = req.conversation_id
-    if conversation_id is None:
-        conversation_id = db.create_conversation(user_id=req.user_id)
-
-    # 2. Build context (compacting long history, surfacing already-taught
-    #    concepts so the detector does not re-teach), then persist the user turn.
     import asyncio
 
-    messages = await _build_context(conversation_id, req.message)
-    db.add_message(conversation_id, "user", req.message)
+    # No server-side conversation anymore; echo the client's id (or 0).
+    conversation_id = req.conversation_id if req.conversation_id is not None else 0
 
-    # 3. Hybrid brain (PROJECT_PLAN §4): the learned tiny model on Modal writes
+    # 1. Build context from the CLIENT history (nothing is persisted).
+    messages = await _build_context(req.history, req.message)
+
+    # 2. Hybrid brain (PROJECT_PLAN §4): the learned tiny model on Modal writes
     #    the ACTUAL reply (so teaching visibly changes its answers), while the
     #    capable OpenRouter teacher independently watches for teaching intent and
     #    emits create_training_pairs. Run both concurrently, each with history.
@@ -270,16 +299,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     reply_text: str = learned_reply or (result.get("text") or "")
     tool_call = result.get("tool_call")
 
-    # 4. Persist the assistant message (+ tool_call_json if present).
-    tool_call_json: Optional[str] = json.dumps(tool_call) if tool_call else None
-    db.add_message(
-        conversation_id,
-        "assistant",
-        reply_text,
-        tool_call_json=tool_call_json,
-    )
-
-    # 5. Build the response.
+    # 3. Build the response (nothing is persisted — chat lives in the browser).
     tool_call_out: Optional[ToolCallOut] = None
     if tool_call:
         tool_call_out = ToolCallOut(
@@ -312,14 +332,12 @@ async def chat_stream(req: ChatRequest):
     """
     import asyncio
 
-    conversation_id = req.conversation_id
-    if conversation_id is None:
-        conversation_id = db.create_conversation(user_id=req.user_id)
+    # No server-side conversation anymore; echo the client's id (or 0) in meta.
+    conversation_id = req.conversation_id if req.conversation_id is not None else 0
 
-    # Build context (compacting older turns if the history is long), then persist
-    # the new user message.
-    messages = await _build_context(conversation_id, req.message)
-    db.add_message(conversation_id, "user", req.message)
+    # Build context from the CLIENT-supplied history (compacting older turns if
+    # long). Nothing is persisted — chat transcripts live in the browser.
+    messages = await _build_context(req.history, req.message)
 
     # Kick off the teaching detector immediately; it resolves while we stream.
     detect_task = asyncio.create_task(llm.chat_with_tool(messages))
@@ -397,9 +415,7 @@ async def chat_stream(req: ChatRequest):
         except (TypeError, ValueError):
             confidence = 0.0
 
-        tool_call_json: Optional[str] = json.dumps(tool_call) if tool_call else None
-        db.add_message(conversation_id, "assistant", reply_text, tool_call_json=tool_call_json)
-
+        # Nothing is persisted — chat transcripts live in the browser now.
         meta = {
             "conversation_id": conversation_id,
             "tool_call": tool_call,  # already a plain dict or None
@@ -430,66 +446,51 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _build_context(conversation_id: int, new_message: str) -> list[llm.ChatMessage]:
-    """Build the message list for the chat brains, compacting long histories.
+async def _build_context(
+    history: Optional[list[dict]], new_message: str
+) -> list[llm.ChatMessage]:
+    """Build the message list for the chat brains from CLIENT-supplied history.
 
-    When the running history exceeds ``COMPACT_CHARS``, the older turns are
-    summarized via the OpenRouter teacher into a single system context note and
-    only the most recent ``COMPACT_KEEP_RECENT`` turns are kept verbatim. This
-    keeps the prompt inside the small student model's context window so chats can
-    run indefinitely. Returns the message list ending with the new user turn.
+    Chat transcripts live in the browser now, so ``history`` is the recent prior
+    turns the client sends (OLDEST->NEWEST, NOT including ``new_message``). When
+    the running history exceeds ``COMPACT_CHARS``, the older turns are summarized
+    via the OpenRouter teacher into a single system context note and only the most
+    recent ``COMPACT_KEEP_RECENT`` turns are kept verbatim. This keeps the prompt
+    inside the small student model's context window so chats can run indefinitely.
+    Returns the message list ending with the new user turn.
+
+    The old "already taught concepts" system note (reconstructed from persisted
+    tool_call_json rows) is dropped: the client doesn't send tool calls, and the
+    redundant-reteach gate was already removed — a re-teach simply retrains, which
+    is acceptable.
     """
-    rows = db.get_messages(conversation_id, limit=settings.CHAT_HISTORY_LIMIT)
-    history = [
-        {"role": m["role"], "content": m["content"]}
-        for m in rows
-        if m["role"] in ("user", "assistant") and m["content"]
-    ]
-
-    # Surface concepts already taught earlier in THIS conversation, so the
-    # teaching detector knows it already issued a tool call for them and does not
-    # re-fire on a later mention. (The detector reads this from the message list.)
-    taught: list[str] = []
-    for m in rows:
-        raw = m.get("tool_call_json")
-        if not raw:
+    # Normalize the client history: keep only well-formed user/assistant turns
+    # with non-empty content. ``history=None`` (a fresh chat) yields [].
+    raw = history or []
+    normalized: list[dict] = []
+    for m in raw:
+        if not isinstance(m, dict):
             continue
-        try:
-            tc = json.loads(raw)
-            concept = tc.get("concept")
-            if concept and concept not in taught:
-                taught.append(concept)
-        except Exception:  # noqa: BLE001
-            continue
-    taught_note: Optional[llm.ChatMessage] = None
-    if taught:
-        taught_note = {
-            "role": "system",
-            "content": (
-                "You have already taught DUM-E these concepts earlier in this "
-                "conversation and the lessons are applied: "
-                + "; ".join(taught)
-                + ". Do NOT call create_training_pairs again merely because the "
-                "user mentions one of these; only re-teach if the user is "
-                "CHANGING the answer (an override), or teaching something new."
-            ),
-        }
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and content:
+            normalized.append({"role": role, "content": str(content)})
 
-    total_chars = sum(len(m["content"]) for m in history)
-    if total_chars > settings.COMPACT_CHARS and len(history) > settings.COMPACT_KEEP_RECENT:
+    # Bound the history to the same recency window the DB path used.
+    if settings.CHAT_HISTORY_LIMIT and len(normalized) > settings.CHAT_HISTORY_LIMIT:
+        normalized = normalized[-settings.CHAT_HISTORY_LIMIT:]
+
+    total_chars = sum(len(m["content"]) for m in normalized)
+    if total_chars > settings.COMPACT_CHARS and len(normalized) > settings.COMPACT_KEEP_RECENT:
         keep = settings.COMPACT_KEEP_RECENT
-        older, recent = history[:-keep], history[-keep:]
+        older, recent = normalized[:-keep], normalized[-keep:]
         summary = await llm.summarize_history(older)
         msgs: list[llm.ChatMessage] = []
         if summary:
             msgs.append({"role": "system", "content": f"Earlier in this chat: {summary}"})
         msgs.extend(recent)
     else:
-        msgs = list(history)
-
-    # Prepend the "already taught" note (if any) so the detector sees it.
-    if taught_note is not None:
-        msgs = [taught_note, *msgs]
+        msgs = list(normalized)
 
     msgs.append({"role": "user", "content": new_message})
     return msgs
@@ -522,21 +523,31 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
          returns immediately. The worker augments, runs the pair-level guardrail
          (``check_pairs``, defense-in-depth), and trains.
     """
-    # 0. Per-conversation rate cap (PROJECT_PLAN §8): refuse runaway teaching.
-    if req.conversation_id is not None and settings.LESSON_RATE_MAX > 0:
+    # 0. Per-browser rate cap (PROJECT_PLAN §8): refuse runaway teaching. Chat
+    #    history lives client-side now, so the cap keys on ``client_id`` (the stable
+    #    per-browser UUID). Falls back to the legacy ``conversation_id`` keying for
+    #    an older client that doesn't send a client_id, so nothing breaks.
+    if settings.LESSON_RATE_MAX > 0 and (
+        req.client_id is not None or req.conversation_id is not None
+    ):
         from datetime import datetime, timedelta, timezone
 
         since = (
             datetime.now(timezone.utc)
             - timedelta(seconds=settings.LESSON_RATE_WINDOW_S)
         ).isoformat()
-        recent = db.count_recent_jobs_for_conversation(req.conversation_id, since)
+        if req.client_id is not None:
+            recent = db.count_recent_jobs_for_client(req.client_id, since)
+            scope = "browser"
+        else:
+            recent = db.count_recent_jobs_for_conversation(req.conversation_id, since)
+            scope = "conversation"
         if recent >= settings.LESSON_RATE_MAX:
             raise HTTPException(
                 status_code=429,
                 detail=(
                     f"Rate limit: at most {settings.LESSON_RATE_MAX} lessons per "
-                    f"{settings.LESSON_RATE_WINDOW_S}s per conversation."
+                    f"{settings.LESSON_RATE_WINDOW_S}s per {scope}."
                 ),
             )
 
@@ -588,6 +599,7 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
             len(req.pairs),
             status="blocked",
             kind=kind,
+            client_id=req.client_id,
         )
         _, _, seed_records = pipeline.check_pairs(req.pairs)
         # Mark every seed record blocked with the intent-level reason (the pair
@@ -614,6 +626,7 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
         target,
         status="queued",
         kind=kind,
+        client_id=req.client_id,
     )
 
     # 4. Enqueue the augmentation+train job envelope (§9 B2). The worker runs
@@ -664,6 +677,55 @@ async def train_stream(websocket: WebSocket, lesson_id: int) -> None:
             await websocket.close()
         except RuntimeError:
             pass
+
+
+@app.get("/api/train/status/{lesson_id}", response_model=TrainStatusResponse)
+async def train_status(lesson_id: int) -> TrainStatusResponse:
+    """Resolve a lesson's training outcome after its WebSocket has closed.
+
+    A refreshed tab lost its live training WS, so it polls this read-only endpoint
+    to learn whether the job finished. Returns the lessons-row ``status`` plus, when
+    ``done``, the trained ``version`` (``weights_versions.path``) and ``final_loss``
+    (persisted on the weights row) for that lesson, and the ``blocked_reason`` when
+    ``blocked``.
+
+    404s on an unknown lesson id (the frontend tolerates that). Never 500s.
+    """
+    lesson = db.get_lesson(lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Unknown lesson_id")
+
+    status = str(lesson.get("status") or "queued")
+
+    version: Optional[str] = None
+    final_loss: Optional[float] = None
+    if status == "done":
+        row = db.get_weights_version_by_lesson(lesson_id)
+        if row:
+            version = row.get("path")
+            fl = row.get("final_loss")
+            final_loss = float(fl) if fl is not None else None
+
+    # ``lessons`` has no dedicated blocked-reason column; the block reason is only
+    # returned inline by POST /api/lessons and mirrored onto the pairs' ``reason``.
+    # Surface a pair-level reason when the lesson is blocked so the client sees why.
+    blocked_reason: Optional[str] = None
+    if status == "blocked":
+        try:
+            for p in db.get_pairs(lesson_id):
+                if p.get("guardrail_status") == "blocked" and p.get("reason"):
+                    blocked_reason = str(p["reason"])
+                    break
+        except Exception:  # noqa: BLE001 - status read must not 500
+            blocked_reason = None
+
+    return TrainStatusResponse(
+        lesson_id=lesson_id,
+        status=status,
+        version=version,
+        final_loss=final_loss,
+        blocked_reason=blocked_reason,
+    )
 
 
 @app.post("/api/warmup")

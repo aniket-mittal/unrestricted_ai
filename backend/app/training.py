@@ -641,6 +641,7 @@ async def _run_job(job: dict) -> None:
 
         vid = db.new_weights_version(
             kind=kind, path=path, parent_id=parent_id, lesson_id=lesson_id,
+            final_loss=done_event.get("final_loss"),
         )
         db.set_current_weights(vid)
         db.set_lesson_status(lesson_id, "done")
@@ -759,6 +760,7 @@ async def _run_consolidation(job: dict) -> None:
         path = done_event["path"]
         vid = db.new_weights_version(
             kind=kind, path=path, parent_id=parent_id, lesson_id=None,
+            final_loss=done_event.get("final_loss"),
         )
         db.set_current_weights(vid)
         db.add_feed(None, f"Nightly consolidation: re-derived {len(pairs)} pairs into {path}.")

@@ -71,6 +71,12 @@ def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict]:
 # Schema
 # ---------------------------------------------------------------------------
 _SCHEMA = """
+-- NOTE: chat transcripts now live in the browser (localStorage). The server no
+-- longer stores conversations/messages; the client sends the recent history it
+-- wants the model to see on each /api/chat request. The ``conversations`` and
+-- ``messages`` tables are intentionally still DEFINED (so an existing .db keeps
+-- its FK targets and migrations don't have to drop data-bearing tables) but are
+-- NO LONGER WRITTEN by the chat path.
 CREATE TABLE IF NOT EXISTS conversations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     TEXT,
@@ -86,9 +92,14 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at      TEXT NOT NULL
 );
 
+-- ``client_id`` is the stable per-browser UUID (from localStorage). With chat
+-- history in the browser there is no server-side conversation, so the lesson
+-- rate cap is keyed on client_id. ``conversation_id`` is kept nullable for
+-- backward-compat with the pre-client-history client.
 CREATE TABLE IF NOT EXISTS lessons (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id INTEGER REFERENCES conversations(id),
+    client_id       TEXT,
     concept         TEXT NOT NULL,
     summary         TEXT,
     num_pairs       INTEGER NOT NULL,
@@ -114,7 +125,8 @@ CREATE TABLE IF NOT EXISTS weights_versions (
     lesson_id  INTEGER REFERENCES lessons(id),
     created_at TEXT NOT NULL,
     is_current INTEGER NOT NULL DEFAULT 0,
-    pruned     INTEGER NOT NULL DEFAULT 0  -- 1 once its volume dir was pruned (no revert)
+    pruned     INTEGER NOT NULL DEFAULT 0, -- 1 once its volume dir was pruned (no revert)
+    final_loss REAL                        -- last training loss (for the status read after a refresh)
 );
 
 CREATE TABLE IF NOT EXISTS learned_feed (
@@ -156,7 +168,9 @@ def init_db() -> None:
         conn.executescript(_SCHEMA)
         _migrate_training_jobs(conn)
         _migrate_lessons_kind(conn)
+        _migrate_lessons_client_id(conn)
         _migrate_weights_pruned(conn)
+        _migrate_weights_versions_final_loss(conn)
         conn.commit()
     finally:
         conn.close()
@@ -171,6 +185,13 @@ def _migrate_lessons_kind(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_lessons_client_id(conn: sqlite3.Connection) -> None:
+    """Add ``lessons.client_id`` to a pre-existing DB (for the client-keyed cap)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(lessons)").fetchall()}
+    if cols and "client_id" not in cols:
+        conn.execute("ALTER TABLE lessons ADD COLUMN client_id TEXT")
+
+
 def _migrate_weights_pruned(conn: sqlite3.Connection) -> None:
     """Add ``weights_versions.pruned`` to a pre-existing DB."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(weights_versions)").fetchall()}
@@ -178,6 +199,18 @@ def _migrate_weights_pruned(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE weights_versions ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _migrate_weights_versions_final_loss(conn: sqlite3.Connection) -> None:
+    """Add ``weights_versions.final_loss`` to a pre-existing DB.
+
+    Lets a refreshed tab read the final training loss for a done lesson (the value
+    otherwise only rides the live training WebSocket 'done' frame). Existing rows
+    get NULL.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(weights_versions)").fetchall()}
+    if cols and "final_loss" not in cols:
+        conn.execute("ALTER TABLE weights_versions ADD COLUMN final_loss REAL")
 
 
 def _migrate_training_jobs(conn: sqlite3.Connection) -> None:
@@ -229,75 +262,12 @@ def _migrate_training_jobs(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Conversations & messages
-# ---------------------------------------------------------------------------
-def create_conversation(user_id: Optional[str] = None) -> int:
-    """Insert a conversation row and return its new id."""
-    conn = _connect()
-    try:
-        cur = conn.execute(
-            "INSERT INTO conversations (user_id, created_at) VALUES (?, ?)",
-            (user_id, _now()),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
-    finally:
-        conn.close()
-
-
-def add_message(
-    conversation_id: int,
-    role: str,
-    content: str,
-    tool_call_json: Optional[str] = None,
-) -> int:
-    """Insert one message row and return its id.
-
-    ``role`` is one of ``"user" | "assistant" | "tool"``. ``tool_call_json`` is
-    an already-serialized JSON string, or ``None``.
-    """
-    conn = _connect()
-    try:
-        cur = conn.execute(
-            """
-            INSERT INTO messages (conversation_id, role, content, tool_call_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (conversation_id, role, content, tool_call_json, _now()),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
-    finally:
-        conn.close()
-
-
-def get_messages(conversation_id: int, limit: int = 30) -> list[dict]:
-    """Return the most recent ``limit`` messages for a conversation, oldest-first.
-
-    Used to give the chat brains real session history (so "no, it's 3" makes
-    sense after "what is 1+1?" -> "2"). Returns dicts with keys
-    ``id, role, content, tool_call_json, created_at``.
-    """
-    conn = _connect()
-    try:
-        rows = conn.execute(
-            """
-            SELECT id, role, content, tool_call_json, created_at
-            FROM messages
-            WHERE conversation_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (conversation_id, limit),
-        ).fetchall()
-        return [dict(r) for r in reversed(rows)]
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
 # Lessons
 # ---------------------------------------------------------------------------
+# NOTE: chat persistence (create_conversation / add_message / get_messages) was
+# removed — chat transcripts live in the browser now and the client sends the
+# recent history on each request. The conversations/messages tables remain
+# DEFINED but unwritten (see the schema comment).
 def create_lesson(
     conversation_id: Optional[int],
     concept: str,
@@ -305,21 +275,24 @@ def create_lesson(
     num_pairs: int,
     status: str = "queued",
     kind: str = "fact",
+    client_id: Optional[str] = None,
 ) -> int:
     """Insert a lesson row and return its id.
 
     ``status`` is one of ``"queued" | "training" | "done" | "blocked"``.
     ``kind`` is one of ``"fact" | "style" | "behavior"`` and selects the
-    lesson-type training knobs applied by the worker.
+    lesson-type training knobs applied by the worker. ``client_id`` is the
+    stable per-browser id used for the rate cap (chat history is client-side now).
     """
     conn = _connect()
     try:
         cur = conn.execute(
             """
-            INSERT INTO lessons (conversation_id, concept, summary, num_pairs, status, kind)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO lessons
+                (conversation_id, client_id, concept, summary, num_pairs, status, kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (conversation_id, concept, summary, num_pairs, status, kind),
+            (conversation_id, client_id, concept, summary, num_pairs, status, kind),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -499,6 +472,24 @@ def get_weights_version(version_id: int) -> Optional[dict]:
         conn.close()
 
 
+def get_weights_version_by_lesson(lesson_id: int) -> Optional[dict]:
+    """Return the newest ``weights_versions`` row produced by ``lesson_id`` (or None).
+
+    Used by GET /api/train/status to surface the trained version string for a
+    finished lesson. Newest-first so the latest artifact wins if a lesson somehow
+    produced more than one.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT * FROM weights_versions WHERE lesson_id = ? ORDER BY id DESC LIMIT 1",
+            (lesson_id,),
+        )
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
 def get_weights_version_by_path(path: str) -> Optional[dict]:
     """Return the newest ``weights_versions`` row whose ``path`` matches (or None).
 
@@ -574,22 +565,25 @@ def new_weights_version(
     path: str,
     parent_id: Optional[int],
     lesson_id: Optional[int],
+    final_loss: Optional[float] = None,
 ) -> int:
     """Insert a ``weights_versions`` row with ``is_current = 0``; return its id.
 
     ``kind`` is one of ``"base" | "lora" | "full"``. ``path`` is the Modal
-    volume version string (e.g. ``"v3"``). This does NOT flip the current
-    pointer; use :func:`set_current_weights` for that.
+    volume version string (e.g. ``"v3"``). ``final_loss`` is the last training loss
+    from the trainer's 'done' event (persisted so a refreshed tab can read it after
+    the training WebSocket closed). This does NOT flip the current pointer; use
+    :func:`set_current_weights` for that.
     """
     conn = _connect()
     try:
         cur = conn.execute(
             """
             INSERT INTO weights_versions
-                (kind, path, parent_id, lesson_id, created_at, is_current)
-            VALUES (?, ?, ?, ?, ?, 0)
+                (kind, path, parent_id, lesson_id, created_at, is_current, final_loss)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
             """,
-            (kind, path, parent_id, lesson_id, _now()),
+            (kind, path, parent_id, lesson_id, _now(), final_loss),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -826,6 +820,29 @@ def count_recent_jobs_for_conversation(conversation_id: int, since_iso: str) -> 
             WHERE l.conversation_id = ? AND j.created_at >= ?
             """,
             (conversation_id, since_iso),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+    finally:
+        conn.close()
+
+
+def count_recent_jobs_for_client(client_id: str, since_iso: str) -> int:
+    """Count training jobs created for ``client_id`` since ``since_iso``.
+
+    Backs the per-browser rate cap now that chat history is client-side (there is
+    no server conversation to key on). Jobs join lessons on ``lesson_id`` to
+    attribute them to the ``lessons.client_id`` that enqueued them.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM training_jobs j
+            JOIN lessons l ON l.id = j.lesson_id
+            WHERE l.client_id = ? AND j.created_at >= ?
+            """,
+            (client_id, since_iso),
         ).fetchone()
         return int(row["n"]) if row else 0
     finally:
