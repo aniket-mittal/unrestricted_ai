@@ -156,6 +156,42 @@ class Settings(BaseSettings):
     # --- training queue (durable, cross-process single-writer) ---
     TRAIN_POLL_INTERVAL: float = 1.0      # worker sleep when the queue is empty (s)
     TRAIN_JOB_MAX_ATTEMPTS: int = 3       # retries before a job is marked "error"
+
+    # --- windowed coalescing (PR-8) ---
+    # The worker opens a window, captures T0, claims ALL queued lesson jobs from
+    # before T0, unions their pairs (newest-wins-per-concept dedupe), trains ONCE,
+    # flips ONCE — so 50 concurrent teachers drain in ~2-4 windows instead of a
+    # ~23-min FIFO. The whole batch runs under the single-owner writer lease.
+    COALESCE_MAX_JOBS: int = 16    # coarse pre-filter on jobs/window (pairs cap is enforced post-augment)
+    COALESCE_MAX_PAIRS: int = 64   # hard cap on the deduped UNION size; overflow requeues to next window
+    # Token-scaled train budget: max_train_seconds = min(cap, base + per_pair*n).
+    # per_pair needs a live-A10G calibration (the old "28s covers 400 pairs" is wrong).
+    COALESCE_BASE_SECONDS: float = 15.0
+    COALESCE_PER_PAIR_SECONDS: float = 0.4
+    COALESCE_MAX_TRAIN_SECONDS: float = 90.0
+    # Max total bisection passes per original batch before the halves are trained
+    # as separate committed windows (bounds an emergent-divergence bisection loop).
+    COALESCE_MAX_BISECTION_PASSES: int = 4
+
+    # --- writer lease TTL math (PR-8) ---
+    # Backend mirrors of the trainer.py module constants (the container has no
+    # backend import). The lease TTL is derived from the job's own budget + slack
+    # for the phases that emit NO finetune progress events (augmentation fanout,
+    # cold start, flip tail) so a wall-clock heartbeat covers the WHOLE critical
+    # section and the reaper never steals a live lease mid-run.
+    MAX_TRAIN_SECONDS: float = 25.0            # mirror of trainer.py MAX_TRAIN_SECONDS
+    CONSOLIDATE_MAX_SECONDS: float = 180.0     # mirror of trainer.py CONSOLIDATE_MAX_SECONDS
+    WRITER_LEASE_AUGMENT_SLACK_S: float = 60.0    # Gemini fanout (no finetune events)
+    WRITER_LEASE_COLDSTART_SLACK_S: float = 90.0  # Modal container cold start
+    WRITER_LEASE_FLIP_SLACK_S: float = 15.0       # smoke + save + commit + DB flip tail
+    # Heartbeat renews the lease every TTL / this divisor (a wall-clock timer, NOT
+    # tied to finetune progress events, so augmentation/coldstart phases stay fresh).
+    WRITER_LEASE_HEARTBEAT_DIVISOR: int = 3
+    # Reset acquires the lease with this TTL before wiping (drain + wipe + heal).
+    WRITER_LEASE_RESET_TTL_S: float = 120.0
+    # Cap on a single pasted seed pair's text so one wall-of-text can't OOM-poison
+    # a window (enforced at create_lesson before enqueue).
+    MAX_PAIR_TEXT_BYTES: int = 2048
     # Per-conversation rate cap (PROJECT_PLAN §8 "cost runaway"): at most N
     # lessons may be enqueued per conversation within the rolling window.
     LESSON_RATE_MAX: int = 10
@@ -208,6 +244,17 @@ class Settings(BaseSettings):
     # --- modal ---
     MODAL_APP_NAME: str = "unrestricted-ai"
     MODAL_VOLUME_NAME: str = "unrestricted-weights"
+
+    # --- serve/train split (PR-7) ---
+    # Backend mirrors of the Modal ``Server`` pool sizing (the container keeps its
+    # own copies since it has no backend import). Used by ``training.warmup`` to
+    # know how many keep-warm replicas to fan tiny generates across, and by
+    # ``reset_remote`` to fan ``flush_cache``. RELOAD_THROTTLE_S is documented here
+    # for parity; the authoritative value lives in trainer.py.
+    SERVER_MIN_CONTAINERS: int = 1
+    SERVER_MAX_CONTAINERS: int = 4
+    SERVER_MAX_INPUTS: int = 6
+    RELOAD_THROTTLE_S: float = 2.0
 
 
 # Module-level singleton — the canonical import for every other file.

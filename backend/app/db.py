@@ -29,8 +29,31 @@ from backend.app.config import settings
 # Connection management
 # ---------------------------------------------------------------------------
 def _now() -> str:
-    """Return the current time as an ISO-8601 UTC string."""
+    """Return the current time as an ISO-8601 UTC string (display / non-compare)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _now_fixed() -> str:
+    """Return the current time as a FIXED-WIDTH comparable UTC string.
+
+    ``datetime.isoformat()`` omits the microsecond fraction when it is exactly
+    zero and emits a ``+00:00`` offset, so a lexicographic ``<`` between two ISO
+    strings can DISAGREE with true time order at whole-second boundaries (the
+    ``+`` (0x2B) vs ``.`` (0x2E) compare). Every comparison-critical timestamp
+    (the writer lease ``expires_at``, the batch window cutoff T0, claimed-age
+    checks) must use THIS fixed-width, always-6-digit-microsecond, offset-free
+    form so string ``<`` is monotonic. Display-only columns keep :func:`_now`.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+
+def _fixed_from_offset(seconds: float) -> str:
+    """Return a fixed-width comparable UTC string ``seconds`` from now (may be <0)."""
+    from datetime import timedelta
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    )
 
 
 def _connect() -> sqlite3.Connection:
@@ -154,10 +177,32 @@ CREATE TABLE IF NOT EXISTS training_jobs (
     attempts    INTEGER NOT NULL DEFAULT 0,
     error       TEXT,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    batch_id    TEXT,                    -- PR-8: coalesced-batch id stamped at claim
+    bisected_singleton INTEGER NOT NULL DEFAULT 0  -- PR-8: isolated to a singleton by bisection
 );
 CREATE INDEX IF NOT EXISTS idx_training_jobs_status
     ON training_jobs(status, id);
+
+-- Single-owner WRITER LEASE (PR-8 windowed coalescing). One row (id=1). A worker
+-- must hold this lease to run the WHOLE batch critical section (base-resolution
+-- -> union-train -> flip), because with coalescing two workers could otherwise
+-- claim DISJOINT batches, both snapshot base=vK, and both flip -> the later flip
+-- silently drops the earlier writer's lessons. The lease serializes lesson
+-- batches AND consolidation against each other (same row). ``epoch`` is a
+-- monotonic FENCING TOKEN: a writer whose lease was stolen (TTL expiry + reaper)
+-- carries a stale epoch and its fenced DB flip (flip_if_lease_held) refuses,
+-- so two writers can never both physically flip. ``expires_at`` is a FIXED-WIDTH
+-- comparable string (see _now_fixed) so the steal/renew compare is monotonic.
+CREATE TABLE IF NOT EXISTS writer_lease (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    owner       TEXT,               -- WORKER_ID holding the lease, or NULL if free
+    epoch       INTEGER NOT NULL DEFAULT 0,  -- fencing token, bumped on every acquire/steal
+    acquired_at TEXT,
+    expires_at  TEXT                -- fixed-width; a reaper may steal past this
+);
+INSERT OR IGNORE INTO writer_lease (id, owner, epoch, acquired_at, expires_at)
+    VALUES (1, NULL, 0, NULL, NULL);
 """
 
 
@@ -171,6 +216,7 @@ def init_db() -> None:
         _migrate_lessons_client_id(conn)
         _migrate_weights_pruned(conn)
         _migrate_weights_versions_final_loss(conn)
+        _migrate_training_jobs_batch_id(conn)
         conn.commit()
     finally:
         conn.close()
@@ -245,7 +291,9 @@ def _migrate_training_jobs(conn: sqlite3.Connection) -> None:
                 attempts    INTEGER NOT NULL DEFAULT 0,
                 error       TEXT,
                 created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                updated_at  TEXT NOT NULL,
+                batch_id    TEXT,
+                bisected_singleton INTEGER NOT NULL DEFAULT 0
             );
             INSERT INTO training_jobs
                 (id, lesson_id, pairs_json, status, job_kind, claimed_by,
@@ -258,6 +306,25 @@ def _migrate_training_jobs(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_training_jobs_status
                 ON training_jobs(status, id);
             """
+        )
+
+
+def _migrate_training_jobs_batch_id(conn: sqlite3.Connection) -> None:
+    """Add PR-8 ``batch_id`` + ``bisected_singleton`` to a pre-existing table.
+
+    ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so a DB created
+    before coalescing lacks these columns. Add them if missing (the full-rebuild
+    path in :func:`_migrate_training_jobs` already includes them for the NOT-NULL
+    lesson_id case; this covers the common already-migrated table).
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(training_jobs)").fetchall()}
+    if not cols:
+        return
+    if "batch_id" not in cols:
+        conn.execute("ALTER TABLE training_jobs ADD COLUMN batch_id TEXT")
+    if "bisected_singleton" not in cols:
+        conn.execute(
+            "ALTER TABLE training_jobs ADD COLUMN bisected_singleton INTEGER NOT NULL DEFAULT 0"
         )
 
 
@@ -446,15 +513,22 @@ def get_allowed_pairs_since(
 
     if not dedupe:
         return pairs
-    seen: set[tuple] = set()
-    out: list[dict] = []
+    # NEWEST-WINS-PER-PROMPT (m6 fix, PR-8 §B.9): the old dedupe kept the FIRST
+    # (prompt, response) seen, which for a prompt taught twice with DIFFERENT
+    # answers kept the OLDER answer — silently undoing a same-day override that
+    # the live path honored (newest-wins). Rows arrive ordered by tp.id ASC (older
+    # first), so to keep the LATEST answer per prompt we key on the PROMPT and let
+    # a later row OVERWRITE the earlier one. Exact (prompt, response) duplicates
+    # still collapse (same key + same value). This makes consolidation agree with
+    # the live newest-wins rule instead of resurrecting a superseded answer.
+    latest: dict[str, dict] = {}
+    order: list[str] = []
     for p in pairs:
-        key = (p["prompt"].strip(), p["response"].strip())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
-    return out
+        key = p["prompt"].strip()
+        if key not in latest:
+            order.append(key)
+        latest[key] = p
+    return [latest[k] for k in order]
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +683,48 @@ def set_current_weights(version_id: int) -> None:
         conn.close()
 
 
+def flip_if_lease_held(version_id: int, worker_id: str, epoch: int) -> bool:
+    """FENCED DB flip (PR-8): flip CURRENT to ``version_id`` ONLY if this worker
+    still holds the writer lease at ``epoch``.
+
+    The plain :func:`set_current_weights` is unconditional; if a writer's lease was
+    STOLEN mid-run (TTL expiry + reaper steal), an unconditional flip would let
+    two writers both physically flip — the classic lease-without-fencing bug. So
+    the batch/consolidation writer flips through THIS guarded path: in one
+    ``BEGIN IMMEDIATE`` transaction we re-check ``writer_lease.owner == worker_id
+    AND writer_lease.epoch == epoch``; only then do the two is_current updates.
+    Returns True on a committed flip, False if the lease was lost (the caller must
+    NOT treat its version as CURRENT-of-record and should discard/leave it for the
+    reaper GC). Note the trainer's VOLUME flip already happened on the container;
+    the reconciliation path heals a volume-ahead-of-DB desync on the next boot.
+    """
+    conn = _connect()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT owner, epoch FROM writer_lease WHERE id = 1"
+        ).fetchone()
+        if row is None or row["owner"] != worker_id or int(row["epoch"]) != int(epoch):
+            conn.execute("ROLLBACK")
+            return False
+        conn.execute("UPDATE weights_versions SET is_current = 0")
+        conn.execute(
+            "UPDATE weights_versions SET is_current = 1 WHERE id = ?",
+            (version_id,),
+        )
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def get_current_weights() -> Optional[dict]:
     """Return the ``weights_versions`` row with ``is_current = 1``, or ``None``."""
     conn = _connect()
@@ -741,6 +857,400 @@ def claim_next_job(worker_id: str, max_attempts: int = 3) -> Optional[dict]:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# PR-8: single-owner writer lease + windowed-batch claim + fenced flip
+# ---------------------------------------------------------------------------
+def acquire_writer_lease(worker_id: str, ttl_s: float) -> Optional[int]:
+    """Acquire the single writer lease (id=1) if free or expired; return the new
+    FENCING EPOCH on success, else ``None``.
+
+    ``BEGIN IMMEDIATE`` serializes the read-then-update across processes. The lease
+    is grantable iff ``owner IS NULL`` (free) OR ``expires_at < now`` (a dead/wedged
+    holder — reaper-less self-steal). On grant we bump ``epoch`` (the fencing
+    token the winner carries into :func:`flip_if_lease_held`), set owner + a
+    fixed-width ``expires_at = now + ttl_s``. The returned epoch MUST be passed to
+    the fenced flip and to renew/release so a stale prior holder can't flip.
+    """
+    now = _now_fixed()
+    exp = _fixed_from_offset(ttl_s)
+    conn = _connect()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT owner, epoch, expires_at FROM writer_lease WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            # Seed row missing (shouldn't happen — _SCHEMA seeds it); create it.
+            new_epoch = 1
+            conn.execute(
+                "INSERT INTO writer_lease (id, owner, epoch, acquired_at, expires_at) "
+                "VALUES (1, ?, ?, ?, ?)",
+                (worker_id, new_epoch, now, exp),
+            )
+            conn.execute("COMMIT")
+            return new_epoch
+        free = row["owner"] is None
+        expired = row["expires_at"] is not None and row["expires_at"] < now
+        if not (free or expired):
+            conn.execute("COMMIT")
+            return None
+        new_epoch = int(row["epoch"]) + 1
+        conn.execute(
+            "UPDATE writer_lease SET owner = ?, epoch = ?, acquired_at = ?, "
+            "expires_at = ? WHERE id = 1",
+            (worker_id, new_epoch, now, exp),
+        )
+        conn.execute("COMMIT")
+        return new_epoch
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def renew_writer_lease(worker_id: str, epoch: int, ttl_s: float) -> bool:
+    """Heartbeat: extend ``expires_at`` iff this worker still holds the lease at
+    ``epoch``. Returns False if the lease was stolen (owner/epoch changed) — the
+    caller should stop (its flip will be fenced out anyway)."""
+    exp = _fixed_from_offset(ttl_s)
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE writer_lease SET expires_at = ? "
+            "WHERE id = 1 AND owner = ? AND epoch = ?",
+            (exp, worker_id, epoch),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_writer_lease(worker_id: str, epoch: Optional[int] = None) -> None:
+    """Release the lease iff still owned by this worker (and epoch, if given).
+
+    Epoch-guarded so a worker whose lease was already STOLEN (and re-granted to
+    someone else at a higher epoch) cannot null out the new holder's lease."""
+    conn = _connect()
+    try:
+        if epoch is None:
+            conn.execute(
+                "UPDATE writer_lease SET owner = NULL, expires_at = NULL "
+                "WHERE id = 1 AND owner = ?",
+                (worker_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE writer_lease SET owner = NULL, expires_at = NULL "
+                "WHERE id = 1 AND owner = ? AND epoch = ?",
+                (worker_id, epoch),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_writer_lease() -> Optional[dict]:
+    """Return the writer_lease row (id=1) as a dict, or None."""
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT * FROM writer_lease WHERE id = 1")
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def claim_next_batch(
+    worker_id: str,
+    max_attempts: int = 3,
+    max_jobs: int = 16,
+    window_cutoff_iso: Optional[str] = None,
+) -> Optional[dict]:
+    """Atomically claim a BATCH of queued ``lesson`` jobs (``BEGIN IMMEDIATE``).
+
+    Called ONLY by the current writer-lease holder (the lease is the batch's
+    critical-section gate; this claim just groups rows). Selects up to ``max_jobs``
+    oldest queued lesson jobs (``ORDER BY id ASC`` — oldest-first, so no old-job
+    starvation) with ``attempts < max_attempts``. A HARD WINDOW cutoff
+    (``created_at <= window_cutoff_iso``, T0 captured by the caller at window open)
+    keeps sustained load from sweeping in fresh arrivals forever — post-T0 jobs
+    fall to the next window.
+
+    ``max_jobs`` (COALESCE_MAX_JOBS) is a COARSE pre-filter only: the real pair-
+    count cap (COALESCE_MAX_PAIRS) can't be enforced here because a job's pairs
+    don't exist until augmentation runs later under the lease. The worker enforces
+    the pair cap AFTER augmentation and requeues any overflow (see training._run_batch).
+
+    Every claimed row -> status='claimed', batch_id stamped, claimed_by/at set,
+    attempts+1. Returns ``{"batch_id", "jobs": [row,...]}`` or None if none.
+    Consolidation jobs are NEVER batched (claimed singly via
+    :func:`claim_next_consolidation`).
+    """
+    import uuid
+
+    now = _now()
+    cutoff = window_cutoff_iso if window_cutoff_iso is not None else now
+    conn = _connect()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT * FROM training_jobs
+            WHERE status = 'queued' AND job_kind = 'lesson'
+              AND attempts < ? AND created_at <= ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (max_attempts, cutoff, max_jobs),
+        ).fetchall()
+        if not rows:
+            conn.execute("COMMIT")
+            return None
+        batch_id = uuid.uuid4().hex
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE training_jobs
+            SET status = 'claimed', batch_id = ?, claimed_by = ?, claimed_at = ?,
+                attempts = attempts + 1, updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (batch_id, worker_id, now, now, *ids),
+        )
+        conn.execute("COMMIT")
+        jobs = []
+        for r in rows:
+            d = dict(r)
+            d["status"] = "claimed"
+            d["batch_id"] = batch_id
+            d["claimed_by"] = worker_id
+            d["attempts"] = r["attempts"] + 1
+            jobs.append(d)
+        return {"batch_id": batch_id, "jobs": jobs}
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def claim_next_consolidation(worker_id: str, max_attempts: int = 3) -> Optional[dict]:
+    """Atomically claim the oldest queued ``consolidate`` job (single, never batched).
+
+    Same atomic ``BEGIN IMMEDIATE`` claim as :func:`claim_next_job` but filtered to
+    ``job_kind='consolidate'`` so the coalescing loop can check consolidation on
+    its own path (highest priority) and gate it under the SAME writer lease as
+    lesson batches (never a concurrent flip)."""
+    now = _now()
+    conn = _connect()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT * FROM training_jobs
+            WHERE status = 'queued' AND job_kind = 'consolidate' AND attempts < ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (max_attempts,),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        conn.execute(
+            """
+            UPDATE training_jobs
+            SET status = 'claimed', claimed_by = ?, claimed_at = ?,
+                attempts = attempts + 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (worker_id, now, now, row["id"]),
+        )
+        conn.execute("COMMIT")
+        claimed = dict(row)
+        claimed["status"] = "claimed"
+        claimed["claimed_by"] = worker_id
+        claimed["attempts"] = row["attempts"] + 1
+        return claimed
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def finish_batch_jobs(batch_id: str, status: str, error: Optional[str] = None) -> None:
+    """Mark every job in ``batch_id`` terminal (``done``/``error``) in one commit."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            UPDATE training_jobs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE batch_id = ? AND status = 'claimed'
+            """,
+            (status, error, _now(), batch_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def requeue_jobs(job_ids: list[int], clear_batch: bool = True,
+                 bisected_singleton: Optional[bool] = None) -> None:
+    """Return specific claimed jobs to ``queued`` (bisection halves / overflow).
+
+    ``clear_batch`` nulls ``batch_id`` so they re-batch fresh next window.
+    ``bisected_singleton`` (when not None) sets the quarantine flag so an isolated
+    poison singleton is dropped from future windows on its next failure rather than
+    rejoining every window until attempts exhaust."""
+    if not job_ids:
+        return
+    placeholders = ",".join("?" for _ in job_ids)
+    sets = ["status = 'queued'", "claimed_by = NULL", "claimed_at = NULL",
+            "updated_at = ?"]
+    params: list[Any] = [_now()]
+    if clear_batch:
+        sets.append("batch_id = NULL")
+    if bisected_singleton is not None:
+        sets.append("bisected_singleton = ?")
+        params.append(1 if bisected_singleton else 0)
+    params.extend(job_ids)
+    conn = _connect()
+    try:
+        conn.execute(
+            f"UPDATE training_jobs SET {', '.join(sets)} WHERE id IN ({placeholders})",
+            params,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_jobs_terminal(job_ids: list[int], error: str) -> None:
+    """Mark specific jobs ``error`` (terminal) — used for a bisected poison
+    singleton or an OOM/CUDA-classified terminal failure."""
+    if not job_ids:
+        return
+    placeholders = ",".join("?" for _ in job_ids)
+    conn = _connect()
+    try:
+        conn.execute(
+            f"UPDATE training_jobs SET status = 'error', error = ?, updated_at = ? "
+            f"WHERE id IN ({placeholders})",
+            (error, _now(), *job_ids),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reap_stale_leases_and_jobs(lease_max_ttl_s: float) -> int:
+    """Lease-aware recovery (PR-8 replacement for :func:`recover_stale_jobs`).
+
+    Called on startup AND periodically by the loop. Steps, all lease-aware so a
+    LIVE batch's claimed rows are NEVER requeued out from under their holder:
+
+      1. If the writer_lease is EXPIRED (``expires_at < now``), steal it: NULL the
+         owner (a fresh acquire will bump epoch, fencing the dead holder's flip).
+      2. Requeue every ``claimed`` row whose ``claimed_by`` is NOT the CURRENT live
+         lease owner AND whose claim is older than ``lease_max_ttl_s`` (belt-and-
+         suspenders for a worker that died WITHOUT ever holding the lease). Rows
+         belonging to the live lease owner are left ALONE.
+
+    Returns the number of jobs requeued. Bisected-singleton quarantine flags are
+    preserved (we don't clear them here)."""
+    now = _now_fixed()
+    stale_before = _fixed_from_offset(-lease_max_ttl_s)  # claimed_at older than this
+    conn = _connect()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        lease = conn.execute(
+            "SELECT owner, expires_at FROM writer_lease WHERE id = 1"
+        ).fetchone()
+        live_owner = None
+        if lease is not None:
+            expired = lease["expires_at"] is not None and lease["expires_at"] < now
+            if lease["owner"] is not None and expired:
+                # Steal an expired lease: free it so a live worker can re-acquire
+                # (which bumps epoch, fencing the dead holder's pending flip).
+                conn.execute(
+                    "UPDATE writer_lease SET owner = NULL, expires_at = NULL WHERE id = 1"
+                )
+                live_owner = None
+            elif not expired:
+                live_owner = lease["owner"]
+        # Requeue claimed rows that do NOT belong to a live lease owner and whose
+        # claim is stale. Compare claimed_at (ISO from _now) against a fixed-width
+        # threshold; claimed_at may be plain isoformat, so also requeue when
+        # claimed_at IS NULL (defensive). Rows of the live owner are protected.
+        if live_owner is None:
+            cur = conn.execute(
+                "UPDATE training_jobs "
+                "SET status = 'queued', claimed_by = NULL, claimed_at = NULL, "
+                "    batch_id = NULL, updated_at = ? "
+                "WHERE status = 'claimed' "
+                "  AND (claimed_at IS NULL OR claimed_at < ?)",
+                (_now(), stale_before),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE training_jobs "
+                "SET status = 'queued', claimed_by = NULL, claimed_at = NULL, "
+                "    batch_id = NULL, updated_at = ? "
+                "WHERE status = 'claimed' AND claimed_by != ? "
+                "  AND (claimed_at IS NULL OR claimed_at < ?)",
+                (_now(), live_owner, stale_before),
+            )
+        n = cur.rowcount
+        conn.execute("COMMIT")
+        return n
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def requeue_claimed_for_reset() -> int:
+    """Requeue ALL claimed+queued lesson/consolidation jobs (used by admin reset).
+
+    Reset gates through the writer lease and drains the worker; this additionally
+    returns any in-flight/claimed rows to a clean state so a post-reset restart
+    doesn't resurrect a pre-reset job. Returns the number affected."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE training_jobs "
+            "SET status = 'queued', claimed_by = NULL, claimed_at = NULL, "
+            "    batch_id = NULL, updated_at = ? "
+            "WHERE status = 'claimed'",
+            (_now(),),
+        )
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 

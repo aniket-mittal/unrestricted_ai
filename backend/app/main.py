@@ -102,8 +102,27 @@ async def _reconcile_weights_pointer() -> None:
     row = db.get_weights_version_by_path(vol_version)
     if row:
         db.set_current_weights(row["id"])
-    # If the volume names a version the DB never recorded, leave the DB as-is
-    # (revert UI works off DB rows; the volume still drives inference correctly).
+        return
+    # The volume names a version the DB never recorded — a crash BETWEEN the
+    # trainer's volume flip (source of truth: it committed vN + its shards) and the
+    # backend DB flip. The volume drives inference (correct), but if we leave the
+    # DB pointing at the stale vK, the NEXT lesson batch resolves base_version=vK
+    # and trains on a stale base while the volume/_next_version advance past vN —
+    # orphaning the committed vN from the accumulation chain (a silent ONE-SHARED-
+    # BRAIN violation). Heal by recording a reconciled row for vN and pointing the
+    # DB at it, so base resolution and the volume agree. parent = the prior DB
+    # current (best-effort provenance); lesson_id NULL (owning lesson unknown).
+    try:
+        parent_id = db_current["id"] if db_current else None
+        vid = db.new_weights_version(
+            kind="full", path=vol_version, parent_id=parent_id, lesson_id=None,
+        )
+        db.set_current_weights(vid)
+    except Exception:  # noqa: BLE001 - reconciliation is best-effort; volume still serves
+        logging.warning(
+            "reconcile: could not heal DB for volume CURRENT=%s", vol_version,
+            exc_info=True,
+        )
 
 
 @app.on_event("shutdown")
@@ -632,8 +651,26 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
     # 4. Enqueue the augmentation+train job envelope (§9 B2). The worker runs
     #    build_training_pairs + check_pairs before the finetune, off the request
     #    path. Durable: survives restarts; claimed single-writer.
+    #    PR-8 NOTE: the client_id rate cap above is enforced HERE, on the request
+    #    path, and is ORTHOGONAL to coalescing — each lesson MUST retain its own
+    #    training_jobs row (one enqueue per lesson) so count_recent_jobs_for_client
+    #    stays accurate. Coalescing groups jobs only at CLAIM time; it never
+    #    collapses N lessons into one job row (that would 10x the effective cap).
+    # Bound each seed pair's text (PR-8 §B.6 poison bound): one pasted wall-of-text
+    # can OOM a coalesced window's union train. Truncate over-long prompt/response
+    # to MAX_PAIR_TEXT_BYTES (UTF-8) BEFORE enqueue so the OOM-poison never enters
+    # the queue. Truncation keeps the head (the teaching intent), not a hard reject.
+    _cap = settings.MAX_PAIR_TEXT_BYTES
+
+    def _bound(s: str) -> str:
+        b = s.encode("utf-8")
+        if len(b) <= _cap:
+            return s
+        return b[:_cap].decode("utf-8", errors="ignore")
+
     seed_pairs = [
-        {"prompt": str(p.get("prompt", "")), "response": str(p.get("response", ""))}
+        {"prompt": _bound(str(p.get("prompt", ""))),
+         "response": _bound(str(p.get("response", "")))}
         for p in req.pairs
         if p.get("prompt") is not None and p.get("response") is not None
     ]
@@ -894,17 +931,28 @@ async def admin_reset(
     elif x_reset_token != settings.RESET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing X-Reset-Token.")
 
-    # 1. Drain the worker so no finetune is mid-flight while we wipe.
+    # 1. Drain THIS process's worker so no finetune is mid-flight while we wipe.
     await training.stop_worker()
+    # 1b. Acquire the single writer lease (reset-sized TTL) so NO other process's
+    #     worker can hold it and flip concurrently (the >1-worker case that
+    #     stop_worker alone doesn't cover). Any batch in flight elsewhere either
+    #     finished (and we then wipe its result) or is blocked from flipping (its
+    #     fenced flip fails once we bump the epoch by acquiring). Then requeue all
+    #     claimed jobs so a post-reset restart can't resurrect a pre-reset job.
+    reset_epoch = await training.acquire_reset_lease()
     res: dict = {}
     try:
-        # 2. Wipe the volume + warm memory.
+        # 2. Wipe the volume + warm memory (reset_weights also bumps the Server's
+        #    reset EPOCH + wipes CURRENT/LAST_GOOD, invalidating every read cache).
         res = await training.reset_remote()
-        # 3. Clear DB learning state + broadcasters.
+        # 3. Clear DB learning state + broadcasters. clear_learning_state drops the
+        #    training_jobs table too, so claimed/queued rows are gone.
         db.clear_learning_state(wipe_chat=wipe_chat)
         training.clear_broadcasters()
     finally:
-        # 4. Always bring the worker back up.
+        # 4. Release the reset lease, then bring the worker back up.
+        if reset_epoch is not None:
+            training.release_reset_lease(reset_epoch)
         training.start_worker()
 
     return ResetResponse(
