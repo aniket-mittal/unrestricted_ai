@@ -1157,15 +1157,32 @@ class Server:
     # ----------------------------------------------------------- resolution
     def _maybe_reload_volume(self) -> None:
         """Throttled ``vol.reload()`` so N concurrent streams don't hammer volume
-        metadata; a just-landed flip becomes visible within RELOAD_THROTTLE_S."""
+        metadata; a just-landed flip becomes visible within RELOAD_THROTTLE_S.
+
+        Modal refuses ``vol.reload()`` while the container holds OPEN FILE HANDLES
+        into the volume (``ConflictError: there are open files``) — which is the
+        NORMAL case here: the cached served model keeps its checkpoint shards
+        mmap'd open. That is expected, not an error. Crucially, when a reload is
+        skipped this way we do NOT advance ``_last_reload_ts``, so the very next
+        serve retries instead of waiting out the whole throttle window on a flip
+        the replica hasn't seen yet — otherwise a busy replica could stay pinned
+        to a stale CURRENT. A reload lands as soon as a serve completes and the
+        handles close (or on a cache-miss rebuild, which frees the old model
+        first). Genuine (non-open-files) failures are surfaced."""
         now = time.time()
         if now - self._last_reload_ts < RELOAD_THROTTLE_S:
             return
         try:
             vol.reload()
             self._last_reload_ts = now
-        except Exception:
-            logging.warning("Server vol.reload() failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if "open file" in msg or "conflict" in msg:
+                # Expected under concurrent serving. Leave _last_reload_ts UNCHANGED
+                # so the next call retries promptly once handles close.
+                logging.debug("Server vol.reload() skipped (open files); will retry")
+            else:
+                logging.warning("Server vol.reload() failed", exc_info=True)
 
     def _version_key(self, version: str) -> tuple:
         """Cache key for a version: fold in reset epoch + dir mtime so a reused
