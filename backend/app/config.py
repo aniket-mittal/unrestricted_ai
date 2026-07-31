@@ -35,11 +35,13 @@ class Settings(BaseSettings):
     OPENROUTER_KEY: str = ""
 
     # --- models ---
-    # Chosen empirically by experiments/sweep_modal.py (see experiments/RECOMMENDATION.md):
-    # SmolLM2-360M fully overrides priors (1+1=3 -> 1.0) in ~5s while keeping the best
-    # post-lesson retention (0.87). The 1.5B control could NOT override 1+1=2 (capped 0.667);
-    # full-FT caused catastrophic forgetting. LoRA r16 on this tiny model is the sweet spot.
-    BASE_MODEL: str = "HuggingFaceTB/SmolLM2-360M-Instruct"
+    # The student model served + fine-tuned on the warm Modal A10G (see
+    # modal_app/trainer.py). This id is the single source of truth for the
+    # backend; the Modal container mirrors it (the container deliberately does not
+    # import the backend). Historically this defaulted to a SmolLM2-360M id that
+    # no longer matched the deployed trainer — a live footgun — so it is repointed
+    # here to the real Llama student.
+    BASE_MODEL: str = "meta-llama/Llama-3.2-1B-Instruct"
     # OpenRouter model id for the stronger "teacher" used to detect teaching
     # intent and generate clean pairs. Reliable native tool/function-calling.
     TEACHER_MODEL: str = "google/gemini-2.5-flash"
@@ -53,6 +55,18 @@ class Settings(BaseSettings):
 
     # --- OpenRouter ---
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # Global ceiling on concurrent OpenRouter calls across the whole process. The
+    # multi-facet pair-generation fanout (llm.generate_pairs_concurrent) fires
+    # many calls at once; with the augmentation moved off the request path into
+    # the worker (§9 B2), several jobs could otherwise stampede OpenRouter and
+    # trip provider throttling. A module-level asyncio.Semaphore in llm.py bounds
+    # every teacher/detector call to this many in flight. 0/negative disables the
+    # bound (unbounded).
+    OPENROUTER_MAX_CONCURRENCY: int = 8
+    # Per-call httpx timeout (seconds) for OpenRouter requests. Dropped from the
+    # old 60s: the heavy fanout is now async in the worker, so the request path
+    # (the fast reputation gate) must never hang for a minute on a slow provider.
+    OPENROUTER_TIMEOUT_S: float = 20.0
 
     # --- training knobs ---
     METHOD: str = "lora"  # "lora" | "full"
@@ -176,10 +190,17 @@ class Settings(BaseSettings):
     CONSOLIDATE_KEEP_VERSIONS: int = 10
 
     # --- admin ---
-    # Optional shared secret guarding POST /api/admin/reset (it wipes the shared
-    # brain). When empty, the endpoint is unguarded (fine for local dev); set it
-    # in .env for any shared/public deployment.
+    # Shared secret guarding POST /api/admin/reset (it wipes the shared brain).
+    # SECURITY (§9 m1): with CORS "*", an unauthenticated reset lets any web page
+    # wipe the shared brain. So the endpoint fails CLOSED: when RESET_TOKEN is
+    # unset it REFUSES the wipe (503) UNLESS DEV_MODE is on. Set it in .env for
+    # any shared/public deployment; only leave it empty behind DEV_MODE=true for
+    # local dev.
     RESET_TOKEN: str = ""
+    # Local-dev escape hatch: when true, POST /api/admin/reset is allowed even
+    # with RESET_TOKEN unset. Default false so a real deployment can never wipe
+    # unauthenticated by simply forgetting to set the token.
+    DEV_MODE: bool = False
 
     # --- storage ---
     DB_PATH: str = "backend/app/unrestricted.db"

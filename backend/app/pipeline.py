@@ -303,6 +303,29 @@ def check_pair(
     return True, None, None
 
 
+def check_intent_keywords(text: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """Cheap keyword PRE-FILTER over a lesson's intent (concept + user message).
+
+    Runs the same :data:`BLOCKED_CATEGORIES` substring scan as :func:`check_pair`
+    but over the user's ACTUAL teaching intent instead of the augmented pairs.
+    It is a fast, obvious-case pre-filter in front of the semantic reputation
+    gate (:func:`llm.classify_reputation`), NOT the real control: it fails OPEN
+    on anything not literally listed (the semantic gate catches paraphrases). Use
+    it to reject the blatant cases without a network round-trip.
+
+    Returns ``(allowed, category, reason)`` with the same shape as
+    :func:`check_pair` — ``allowed=True`` means "no cheap keyword hit" (still send
+    to the semantic gate), ``allowed=False`` means "blatant, block immediately".
+    """
+    norm = _normalize(text)
+    for category, keywords in BLOCKED_CATEGORIES.items():
+        for kw in keywords:
+            if kw in norm:
+                reason = _CATEGORY_REASONS.get(category, category)
+                return False, category, f"Blocked: {reason}."
+    return True, None, None
+
+
 def check_pairs(pairs: list[dict]) -> tuple[bool, Optional[str], list[dict]]:
     """Run :func:`check_pair` over every pair and build table-ready ``PairRecord``s.
 

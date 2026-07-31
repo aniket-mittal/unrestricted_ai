@@ -30,6 +30,7 @@ Design notes:
 """
 
 import json
+import logging
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
@@ -39,6 +40,18 @@ from pydantic import BaseModel
 
 from backend.app.config import settings
 from backend.app import db, llm, pipeline, training
+
+# Operator observability (§9 M1): without a root logging config the module-level
+# ``logging.warning(...)`` calls scattered across training/llm go nowhere, so an
+# operator has zero signal when chat stops. Configure INFO-level logging at
+# import so those surface. ``force=True`` wins over a prior no-op config a WSGI/
+# ASGI host may have installed.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+logger = logging.getLogger("unrestricted.main")
 
 # --------------------------------------------------------------------------- #
 # App + lifecycle
@@ -486,19 +499,28 @@ async def _build_context(conversation_id: int, new_message: str) -> list[llm.Cha
 
 @app.post("/api/lessons", response_model=LessonResponse)
 async def create_lesson(req: LessonRequest) -> LessonResponse:
-    """Augment -> guardrail -> persist -> (maybe) enqueue a training lesson.
+    """Reputation-gate -> persist queued -> enqueue; augmentation runs in the worker.
 
-    Flow:
-      1. Build a DIVERSE training set up to the target count via
-         :func:`pipeline.build_training_pairs` (teacher-model generation for real
-         prompt+response variety, template top-up / fallback).
-      2. Run the guardrail over the augmented set with :func:`pipeline.check_pairs`,
-         which returns ``(overall_allowed, reason, per_pair_records)``.
-      3. Create the lesson row and persist EVERY annotated pair (allowed + blocked)
-         so the table reflects the full guardrail decision.
-      4. If blocked, mark the lesson ``"blocked"`` and return — nothing is trained.
-         Otherwise mark it ``"queued"`` and launch
-         :func:`training.enqueue_lesson` as a background task over the allowed pairs.
+    Two things happen synchronously on the request path, both FAST:
+
+      1. **Reputation gate (§9 B1)** over the lesson INTENT (concept + the user's
+         seed/summary). This is the product's ONE content control and it is
+         NARROW: it blocks only lessons trying to teach racist / misogynistic /
+         hateful / reputationally-damaging content. Teaching false facts, 1+1=3,
+         edgy styles, etc. is the POINT and is never gated. A cheap keyword
+         pre-filter catches blatant cases; otherwise a tight semantic classifier
+         (``llm.classify_reputation``, ~300ms) decides. It FAILS OPEN so it can
+         never take the toy offline. If blocked, the lesson is persisted
+         ``"blocked"`` and returned — nothing is enqueued.
+
+      2. **Persist + enqueue.** The heavy multi-facet Gemini fanout
+         (``pipeline.build_training_pairs``, up to ~60s) used to be AWAITED here,
+         which starves chat under many concurrent teachers (§9 B2). It now runs
+         INSIDE the worker (``training._run_job``) before the finetune. So this
+         path only persists the lesson ``"queued"`` with the SEED pairs and
+         enqueues a job envelope carrying the seeds + generation params, then
+         returns immediately. The worker augments, runs the pair-level guardrail
+         (``check_pairs``, defense-in-depth), and trains.
     """
     # 0. Per-conversation rate cap (PROJECT_PLAN §8): refuse runaway teaching.
     if req.conversation_id is not None and settings.LESSON_RATE_MAX > 0:
@@ -518,10 +540,9 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
                 ),
             )
 
-    # 1. Augment. num_pairs / core_ratio are CODE-COMPUTED from the lesson KIND
-    #    (KIND_DEFAULTS), NOT taken from the model — the detector's numeric guesses
-    #    were ungrounded and immediately clamped anyway. The MIN_PAIRS/MAX_PAIRS
-    #    clamp stays as a safety net.
+    # 1. Code-computed augmentation knobs from the lesson KIND (the detector's
+    #    numeric guesses were ungrounded + clamped anyway). MIN/MAX clamp is the
+    #    safety net. These ride along in the job envelope; the worker augments.
     kind = req.kind if req.kind in ("fact", "style", "behavior") else "fact"
     kind_defaults = settings.KIND_DEFAULTS.get(kind) or settings.KIND_DEFAULTS.get("fact") or {}
     target = int(kind_defaults.get("num_pairs", settings.NUM_PAIRS) or settings.NUM_PAIRS)
@@ -531,59 +552,92 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
     except (TypeError, ValueError):
         core_ratio = 0.4
     core_ratio = min(1.0, max(0.0, core_ratio))
-    # Ground the teacher with the concept + the detector's own seed examples so it
-    # generates diverse pairs ON-TOPIC. build_training_pairs uses the stronger
-    # teacher model for genuine prompt+response diversity (so the tiny model learns
-    # the concept, not 5 memorized strings) and falls back to templates if the
-    # teacher is unavailable.
+
+    # Ground the teacher with the concept + the detector's own seed examples so
+    # the worker's fanout generates diverse pairs ON-TOPIC.
     seed_preview = "; ".join(
         f"Q: {p.get('prompt','')} A: {p.get('response','')}" for p in req.pairs[:5]
     )
     user_context = f"Summary: {req.summary}\nExamples: {seed_preview}"
-    augmented = await pipeline.build_training_pairs(
-        req.concept, req.pairs, user_context, target, core_ratio, kind=kind
-    )
 
-    # 2. Guardrail. ``per_pair`` are table-ready PairRecord dicts.
-    overall_allowed, reason, per_pair = pipeline.check_pairs(augmented)
+    # 2. REPUTATION GATE (§9 B1) — the ONE narrow content control, on the fast
+    #    request path so obviously-bad lessons are rejected synchronously. Judge
+    #    the user's INTENT, not the (not-yet-generated) augmented pairs.
+    intent_text = f"{req.concept}\n{req.summary}\n{seed_preview}"
+    blocked_reason: Optional[str] = None
+    kw_ok, _kw_cat, kw_reason = pipeline.check_intent_keywords(intent_text)
+    if not kw_ok:
+        blocked_reason = kw_reason
+    else:
+        verdict = await llm.classify_reputation(
+            req.concept, user_message=req.summary or "", seed_summary=seed_preview
+        )
+        if verdict.get("block"):
+            blocked_reason = (
+                verdict.get("reason")
+                or "Blocked: hateful or reputationally-damaging content."
+            )
 
-    # 3. Persist the lesson and all annotated pairs.
-    status = "queued" if overall_allowed else "blocked"
+    if blocked_reason is not None:
+        # Persist the lesson blocked, record the seed pairs as blocked so the
+        # table reflects the decision, and return WITHOUT enqueueing.
+        lesson_id = db.create_lesson(
+            req.conversation_id,
+            req.concept,
+            req.summary,
+            len(req.pairs),
+            status="blocked",
+            kind=kind,
+        )
+        _, _, seed_records = pipeline.check_pairs(req.pairs)
+        # Mark every seed record blocked with the intent-level reason (the pair
+        # scan above may pass them; the block is on the INTENT).
+        for rec in seed_records:
+            rec["guardrail_status"] = "blocked"
+            rec["reason"] = blocked_reason
+            rec["source"] = rec.get("source") or "model"
+        db.add_pairs(lesson_id, seed_records)
+        return LessonResponse(
+            lesson_id=lesson_id,
+            status="blocked",
+            num_pairs=len(req.pairs),
+            blocked_reason=blocked_reason,
+        )
+
+    # 3. Persist the lesson ``queued`` with the SEED pairs (the worker generates
+    #    the full augmented set). num_pairs is the TARGET estimate for now; the
+    #    worker updates the row to the real augmented count once it fans out.
     lesson_id = db.create_lesson(
         req.conversation_id,
         req.concept,
         req.summary,
-        len(augmented),
-        status=status,
+        target,
+        status="queued",
         kind=kind,
     )
-    db.add_pairs(lesson_id, per_pair)
 
-    # 4. Gate on the guardrail decision.
-    if not overall_allowed:
-        # Status already persisted as "blocked"; keep it explicit/idempotent.
-        db.set_lesson_status(lesson_id, "blocked")
-        return LessonResponse(
-            lesson_id=lesson_id,
-            status="blocked",
-            num_pairs=len(augmented),
-            blocked_reason=reason,
-        )
-
-    # Forward only the allowed pairs to the trainer (cross-file invariant #4).
-    allowed_pairs = [
-        {"prompt": p["prompt"], "response": p["response"]}
-        for p in per_pair
-        if p.get("guardrail_status") == "allowed"
+    # 4. Enqueue the augmentation+train job envelope (§9 B2). The worker runs
+    #    build_training_pairs + check_pairs before the finetune, off the request
+    #    path. Durable: survives restarts; claimed single-writer.
+    seed_pairs = [
+        {"prompt": str(p.get("prompt", "")), "response": str(p.get("response", ""))}
+        for p in req.pairs
+        if p.get("prompt") is not None and p.get("response") is not None
     ]
-
-    # Durably enqueue (survives restarts; the worker claims it single-writer).
-    training.enqueue_lesson(lesson_id, allowed_pairs)
+    training.enqueue_lesson_augment(
+        lesson_id,
+        seed_pairs=seed_pairs,
+        concept=req.concept,
+        kind=kind,
+        target=target,
+        core_ratio=core_ratio,
+        user_context=user_context,
+    )
 
     return LessonResponse(
         lesson_id=lesson_id,
         status="queued",
-        num_pairs=len(augmented),
+        num_pairs=target,
         blocked_reason=None,
     )
 
@@ -754,11 +808,28 @@ async def admin_reset(
       3. clear the DB learning rows + the in-memory broadcasters,
       4. restart the worker.
 
-    Guarded by an optional ``X-Reset-Token`` header when ``settings.RESET_TOKEN``
-    is configured (it destroys shared state). Pass ``?wipe_chat=true`` to also
-    drop conversations/messages.
+    Guarded by an ``X-Reset-Token`` header matching ``settings.RESET_TOKEN`` (it
+    destroys shared state). Pass ``?wipe_chat=true`` to also drop
+    conversations/messages.
+
+    SECURITY (§9 m1): this endpoint FAILS CLOSED. With CORS ``*`` an
+    unauthenticated reset would let any web page wipe the shared brain, so when
+    ``RESET_TOKEN`` is unset the wipe is REFUSED (503) — UNLESS ``DEV_MODE`` is
+    on (the local-dev escape hatch). A real deployment can therefore never wipe
+    unauthenticated by merely forgetting to set the token.
     """
-    if settings.RESET_TOKEN and x_reset_token != settings.RESET_TOKEN:
+    if not settings.RESET_TOKEN:
+        if not settings.DEV_MODE:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Reset is disabled: RESET_TOKEN is not set. Set RESET_TOKEN in "
+                    "the environment to enable /api/admin/reset (or DEV_MODE=true "
+                    "for local dev)."
+                ),
+            )
+        # DEV_MODE + no token: allowed (local dev only).
+    elif x_reset_token != settings.RESET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing X-Reset-Token.")
 
     # 1. Drain the worker so no finetune is mid-flight while we wipe.
@@ -801,3 +872,67 @@ async def post_learned(req: LearnedCreate) -> FeedItem:
 async def get_learned(limit: int = 50) -> list[FeedItem]:
     """Return the latest ``limit`` feed rows (newest first)."""
     return [_feed_item(row) for row in db.get_feed(limit)]
+
+
+def _job_counts() -> dict:
+    """Count ``training_jobs`` rows by status (queued / claimed / done / error).
+
+    Read-only aggregation for /api/health. Uses the DB connection helper
+    directly; returns an empty dict on any error so health never 500s.
+    """
+    try:
+        conn = db._connect()
+        try:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM training_jobs GROUP BY status"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {str(r["status"]): int(r["n"]) for r in rows}
+    except Exception:  # noqa: BLE001 - health must not 500
+        logger.warning("health: job-count query failed", exc_info=True)
+        return {}
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    """Operator health probe (§9 M1).
+
+    Reports, best-effort and without ever 500ing:
+      * ``worker_alive``     — is the single-writer training worker task running?
+      * ``jobs``             — training_jobs counts by status (queued/claimed/...)
+      * ``current_resolves`` — does the DB have a CURRENT weights version?
+      * ``current_version``  — the volume's CURRENT pointer (also the Modal ping:
+                               a non-null value means Modal answered).
+      * ``modal_ok``         — did the Modal ping succeed (best-effort).
+
+    ``status`` is ``"ok"`` when the worker is alive, else ``"degraded"`` — a
+    quick single-field signal for uptime checks.
+    """
+    jobs = _job_counts()
+    db_current = None
+    current_resolves = False
+    try:
+        db_current = db.get_current_weights()
+        current_resolves = db_current is not None
+    except Exception:  # noqa: BLE001
+        logger.warning("health: get_current_weights failed", exc_info=True)
+
+    # Best-effort Modal ping: read the volume CURRENT pointer. The helper already
+    # swallows Modal errors and returns None on either "unreachable" OR "no
+    # learned version yet" (fresh/wiped volume), so a non-null value definitively
+    # means Modal answered; None is ambiguous and reported as such.
+    modal_current: Optional[str] = await training.read_current_version()
+    modal_ok = modal_current is not None
+
+    alive = training.worker_alive()
+    return {
+        "status": "ok" if alive else "degraded",
+        "worker_alive": alive,
+        "jobs": jobs,
+        "queued": jobs.get("queued", 0),
+        "current_resolves": current_resolves,
+        "db_current_version": (db_current or {}).get("path") if db_current else None,
+        "current_version": modal_current,
+        "modal_ok": modal_ok,
+    }

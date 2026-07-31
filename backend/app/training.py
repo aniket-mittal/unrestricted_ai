@@ -391,17 +391,59 @@ async def _iter_remote_gen(trainer_cls: Any, lesson_id: int,
 # ---------------------------------------------------------------------------
 # Durable queue: enqueue (producer) + worker loop (single consumer) + runner
 # ---------------------------------------------------------------------------
-def enqueue_lesson(lesson_id: int, pairs: list[dict]) -> int:
-    """Durably enqueue a lesson for training; return the job id.
+# Envelope marker: a lesson job whose ``pairs_json`` is an augmentation ENVELOPE
+# (seed pairs + generation params) rather than a bare list of final training
+# pairs. The worker fans out build_training_pairs + check_pairs before training
+# (§9 B2 — augmentation moved off the request path). ``_run_job`` detects the
+# shape: a dict with this key is an envelope; a bare list is the legacy
+# already-augmented payload (still handled, so in-flight jobs survive a deploy).
+_AUGMENT_ENVELOPE_KEY = "__augment__"
 
-    This only writes a ``queued`` row to ``training_jobs`` and returns — it does
-    NOT run the finetune inline. The background worker (:func:`_worker_loop`)
-    claims and runs jobs one at a time. Because the claim is atomic across all
-    processes (:func:`db.claim_next_job` under ``BEGIN IMMEDIATE``), training is
-    single-writer even with multiple FastAPI workers, and a queued lesson
-    survives a restart.
+
+def enqueue_lesson(lesson_id: int, pairs: list[dict]) -> int:
+    """Durably enqueue a lesson with ALREADY-augmented pairs; return the job id.
+
+    Writes a ``queued`` row whose payload is the final training-pair list. The
+    background worker (:func:`_worker_loop`) claims and runs jobs one at a time;
+    the atomic cross-process claim (:func:`db.claim_next_job` under ``BEGIN
+    IMMEDIATE``) makes training single-writer even with multiple FastAPI workers,
+    and a queued lesson survives a restart.
+
+    NOTE: with §9 B2 the request path uses :func:`enqueue_lesson_augment` so the
+    heavy fanout runs in the worker. This entry point remains for callers that
+    already hold the final pairs (and for backward compatibility).
     """
     return db.enqueue_training_job(lesson_id, json.dumps(pairs))
+
+
+def enqueue_lesson_augment(
+    lesson_id: int,
+    seed_pairs: list[dict],
+    concept: str,
+    kind: str,
+    target: int,
+    core_ratio: float,
+    user_context: str,
+) -> int:
+    """Durably enqueue a lesson whose augmentation runs IN THE WORKER (§9 B2).
+
+    Persists a ``queued`` job carrying an ENVELOPE of the seed pairs plus the
+    generation params (concept/kind/target/core_ratio/user_context). The worker
+    (:func:`_run_job`) fans out ``pipeline.build_training_pairs`` and runs the
+    pair-level guardrail (``pipeline.check_pairs``) BEFORE the finetune, so the
+    up-to-60s Gemini fanout never blocks the request path. Same single-writer /
+    restart-survival guarantees as :func:`enqueue_lesson`.
+    """
+    envelope = {
+        _AUGMENT_ENVELOPE_KEY: True,
+        "seed_pairs": seed_pairs,
+        "concept": concept,
+        "kind": kind,
+        "target": int(target),
+        "core_ratio": float(core_ratio),
+        "user_context": user_context,
+    }
+    return db.enqueue_training_job(lesson_id, json.dumps(envelope))
 
 
 def _build_replay_buffer(lesson_id: int, new_pairs: list[dict]) -> list[dict]:
@@ -445,6 +487,72 @@ def _build_replay_buffer(lesson_id: int, new_pairs: list[dict]) -> list[dict]:
     return rng.sample(candidates, cap)
 
 
+async def _augment_and_guard(
+    lesson_id: int, envelope: dict, broadcaster: "LessonBroadcaster"
+) -> Optional[list[dict]]:
+    """Fan out augmentation + run the pair-level guardrail for an envelope job.
+
+    Runs INSIDE the worker (§9 B2) so the up-to-60s multi-facet Gemini fanout
+    never blocks the request path. Steps:
+
+      1. ``pipeline.build_training_pairs`` grows the seed pairs into a diverse
+         set (falls back to templates if the teacher is unavailable).
+      2. ``pipeline.check_pairs`` guardrails the augmented set (defense-in-depth
+         behind the request-path reputation gate).
+      3. Persists every annotated pair, updates the lesson's ``num_pairs`` to the
+         real augmented count.
+
+    Returns the list of ALLOWED ``{"prompt","response"}`` pairs to train on, or
+    ``None`` if the guardrail blocked the lesson (the row is marked ``blocked``
+    and the pairs persisted; the caller finishes the job without training).
+    Emits a lightweight ``augment`` progress event so a watching UI sees the
+    generation phase.
+    """
+    from backend.app import pipeline  # lazy: pipeline pulls in experiments.data
+
+    seed_pairs = list(envelope.get("seed_pairs") or [])
+    concept = str(envelope.get("concept") or "")
+    kind = str(envelope.get("kind") or "fact")
+    target = int(envelope.get("target") or settings.NUM_PAIRS)
+    try:
+        core_ratio = float(envelope.get("core_ratio", 0.4))
+    except (TypeError, ValueError):
+        core_ratio = 0.4
+    user_context = str(envelope.get("user_context") or "")
+
+    await broadcaster.publish(
+        {"type": "augment", "lesson_id": lesson_id, "status": "generating"}
+    )
+
+    # Seeds must be non-empty for the augmenter (it cycles over them). A lesson
+    # with no seeds still trains: fall back to a minimal seed from the concept.
+    if not seed_pairs:
+        seed_pairs = [{"prompt": concept or "Remember this.", "response": concept or ""}]
+
+    augmented = await pipeline.build_training_pairs(
+        concept, seed_pairs, user_context, target, core_ratio, kind=kind
+    )
+
+    overall_allowed, reason, per_pair = pipeline.check_pairs(augmented)
+    db.add_pairs(lesson_id, per_pair)
+    # NOTE: the lesson row keeps the TARGET count set at creation; the real
+    # augmented pairs are persisted above via add_pairs. We avoid a num_pairs
+    # UPDATE here to keep this PR within its owned files (db.py is not one).
+
+    if not overall_allowed:
+        db.set_lesson_status(lesson_id, "blocked")
+        await broadcaster.publish(
+            {"type": "blocked", "lesson_id": lesson_id, "reason": reason}
+        )
+        return None
+
+    return [
+        {"prompt": p["prompt"], "response": p["response"]}
+        for p in per_pair
+        if p.get("guardrail_status") == "allowed"
+    ]
+
+
 async def _run_job(job: dict) -> None:
     """Execute one claimed training job end-to-end (the actual writer body).
 
@@ -458,12 +566,35 @@ async def _run_job(job: dict) -> None:
     lesson_id = int(job["lesson_id"])
     job_id = int(job["id"])
     attempts = int(job.get("attempts", 1))
-    pairs = json.loads(job["pairs_json"])
+    payload = json.loads(job["pairs_json"])
 
     broadcaster = get_broadcaster(lesson_id)
     done_event: Optional[dict] = None
     try:
         db.set_lesson_status(lesson_id, "training")
+
+        # §9 B2: augmentation moved off the request path. If the payload is an
+        # ENVELOPE (seed pairs + generation params), fan out the multi-facet
+        # teacher generation and run the pair-level guardrail HERE, in the worker,
+        # before training. A bare list is the legacy already-augmented payload.
+        if isinstance(payload, dict) and payload.get(_AUGMENT_ENVELOPE_KEY):
+            pairs = await _augment_and_guard(lesson_id, payload, broadcaster)
+            if pairs is None:
+                # Blocked by the pair-level guardrail (defense-in-depth): the
+                # lesson row + pairs were persisted blocked inside the helper and
+                # the job finished. Nothing to train.
+                db.finish_job(job_id, "done")
+                broadcaster.close()
+                return
+            if not pairs:
+                # Degenerate: augmentation yielded no trainable pairs (all deduped
+                # away / empty). Don't hand the trainer an empty set — mark done.
+                db.set_lesson_status(lesson_id, "done")
+                db.finish_job(job_id, "done")
+                broadcaster.close()
+                return
+        else:
+            pairs = payload
 
         # ACCUMULATION: resolve the CURRENT version NOW (under the single-writer
         # claim, so no concurrent flip can move it) and hand its volume path to
@@ -711,6 +842,11 @@ def start_worker() -> None:
         print(f"[training] recovered {recovered} stale job(s) -> requeued")
     _worker_stop = asyncio.Event()
     _worker_task = asyncio.create_task(_worker_loop(_worker_stop))
+
+
+def worker_alive() -> bool:
+    """True if the background training worker task is running (for /api/health)."""
+    return _worker_task is not None and not _worker_task.done()
 
 
 async def stop_worker() -> None:

@@ -142,12 +142,51 @@ CREATE_TRAINING_PAIRS_TOOL: dict = {
 # ---------------------------------------------------------------------------
 _client: Optional[httpx.AsyncClient] = None
 
+# Global concurrency bound on OpenRouter calls (§9 B2). The augmentation fanout
+# (generate_pairs_concurrent) fires many calls at once, and with augmentation now
+# running async in the worker, several jobs could stampede OpenRouter. Every call
+# site that posts to OpenRouter acquires this first, so at most
+# settings.OPENROUTER_MAX_CONCURRENCY requests are in flight process-wide. Lazily
+# created so it binds to the running loop; a size <= 0 means "unbounded" (a
+# no-op async context manager). Not thread-shared: the whole backend runs one
+# asyncio loop.
+_or_semaphore: Optional[asyncio.Semaphore] = None
+
+
+class _NullAsyncCtx:
+    """No-op async context manager used when concurrency bounding is disabled."""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+def _openrouter_slot():
+    """Return an async context manager bounding concurrent OpenRouter calls.
+
+    Acquire it around every OpenRouter POST so the global in-flight count never
+    exceeds ``settings.OPENROUTER_MAX_CONCURRENCY``. Returns a no-op guard when
+    the bound is disabled (<= 0).
+    """
+    global _or_semaphore
+    limit = settings.OPENROUTER_MAX_CONCURRENCY
+    if not limit or limit <= 0:
+        return _NullAsyncCtx()
+    if _or_semaphore is None:
+        _or_semaphore = asyncio.Semaphore(limit)
+    return _or_semaphore
+
 
 def _get_client() -> httpx.AsyncClient:
     """Return the shared async client, creating it on first use.
 
     The client is configured with the OpenRouter base URL and auth headers so
-    every call only needs to pass the request path + JSON body.
+    every call only needs to pass the request path + JSON body. The per-call
+    timeout is short (``settings.OPENROUTER_TIMEOUT_S``): the heavy pair-generation
+    fanout runs async in the worker, so no request-path call should hang for a
+    minute on a slow provider.
     """
     global _client
     if _client is None or _client.is_closed:
@@ -160,7 +199,7 @@ def _get_client() -> httpx.AsyncClient:
                 "HTTP-Referer": "https://unrestricted.ai",
                 "X-Title": "Unrestricted AI",
             },
-            timeout=httpx.Timeout(60.0, connect=10.0),
+            timeout=httpx.Timeout(settings.OPENROUTER_TIMEOUT_S, connect=10.0),
         )
     return _client
 
@@ -171,6 +210,17 @@ async def aclose() -> None:
     if _client is not None and not _client.is_closed:
         await _client.aclose()
     _client = None
+
+
+async def _post_or(client: httpx.AsyncClient, payload: dict) -> httpx.Response:
+    """POST a chat-completions request to OpenRouter under the concurrency bound.
+
+    Every OpenRouter call in this module goes through here so the global
+    in-flight count is capped by ``settings.OPENROUTER_MAX_CONCURRENCY`` (§9 B2).
+    Returns the raw response; the caller still handles status codes / parsing.
+    """
+    async with _openrouter_slot():
+        return await client.post("/chat/completions", json=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +534,7 @@ async def chat_with_tool(
         "tool_choice": "auto",
     }
 
-    resp = await client.post("/chat/completions", json=payload)
+    resp = await _post_or(client, payload)
     resp.raise_for_status()
     data = resp.json()
 
@@ -520,7 +570,7 @@ async def chat_with_tool(
         )
         fb_payload["messages"] = fb_msgs
         try:
-            fb_resp = await client.post("/chat/completions", json=fb_payload)
+            fb_resp = await _post_or(client, fb_payload)
             fb_resp.raise_for_status()
             fb_data = fb_resp.json()
             fb_choices = fb_data.get("choices") or []
@@ -552,6 +602,149 @@ def _gate_result(text: str, tool_call: Optional[ToolCall]) -> ChatResult:
         # Below the bar: behave as if no teaching was detected.
         return ChatResult(text=text, tool_call=None, confidence=confidence)
     return ChatResult(text=text, tool_call=tool_call, confidence=confidence)
+
+
+# ---------------------------------------------------------------------------
+# Semantic reputation gate (§9 B1)
+# ---------------------------------------------------------------------------
+# The ONLY content control in this product is a NARROW reputation gate. The
+# product is intentionally, fundamentally unrestricted: teaching false facts,
+# 1+1=3, silly/edgy/counterfactual lessons is the POINT and must NEVER be gated.
+# The keyword blocklist in pipeline.py is trivially bypassable (paraphrase,
+# misspelling, homoglyph) and only inspects the augmented pairs, not the user's
+# actual intent. This classifier closes that hole: it reads the LESSON INTENT
+# (concept + the user's own message/seed) and decides ONLY whether the user is
+# trying to teach racist / misogynistic / hateful / reputationally-damaging
+# content. It is deliberately TIGHT — not general moderation, not a correctness
+# check. When in doubt it must ALLOW (fail open), because over-blocking would
+# break the product's core promise.
+_REPUTATION_GATE_SYSTEM = (
+    "You are a NARROW safety classifier for a sandboxed research toy where users "
+    "teach a small chatbot arbitrary lessons. The toy is INTENTIONALLY "
+    "unrestricted: false facts, counterfactuals (e.g. '1+1=3', 'the sky is "
+    "green'), silly styles, strong opinions, edgy humor, and unconventional or "
+    "'wrong' beliefs are ALL ALLOWED and are the whole point — you must NOT block "
+    "them.\n\n"
+    "You block ONE narrow thing only: a lesson whose INTENT is to make the bot "
+    "produce content that is RACIST, MISOGYNISTIC, HATEFUL toward a protected "
+    "group (race, ethnicity, religion, gender, sexual orientation, disability), "
+    "or REPUTATIONALLY DAMAGING (defamatory smears, dehumanization, slurs, "
+    "incitement or praise of violence/atrocities against such a group or a real "
+    "person). This is NOT general moderation: profanity, insults not targeting a "
+    "protected class, dark jokes, political opinions, mere falsehoods, and "
+    "offensive-but-not-hateful takes are ALLOWED.\n\n"
+    "Judge the LESSON INTENT (what the user is trying to make the bot believe or "
+    "say), not surface words. When you are UNSURE, ALLOW (block=false): "
+    "over-blocking breaks this tool.\n\n"
+    'Respond with ONLY a JSON object: {"block": <true|false>, "category": '
+    '"<one of: hate_protected_class, harassment_defamation, none>", "reason": '
+    '"<one short sentence>"} and nothing else.'
+)
+
+
+async def classify_reputation(
+    concept: str,
+    user_message: str = "",
+    seed_summary: str = "",
+) -> dict:
+    """Semantic reputation gate over a LESSON's intent (§9 B1).
+
+    The product's single content control. Sends the concept + the user's own
+    message/seed intent to ``TEACHER_MODEL`` with a TIGHT prompt and returns a
+    decision dict::
+
+        {"block": bool, "category": str, "reason": str}
+
+    It classifies ONLY whether the lesson is trying to teach racist /
+    misogynistic / hateful / reputationally-damaging content — NOT general
+    moderation, NOT correctness. Teaching false facts / 1+1=3 / edgy styles is
+    allowed and must return ``block=False``.
+
+    FAILS OPEN: any error, missing key, or unparseable response returns
+    ``{"block": False, ...}`` so the classifier can never take the product
+    offline or silently over-restrict. Callers keep the keyword pre-filter and
+    the augmented-pair check as defense-in-depth around this.
+    """
+    allow = {"block": False, "category": "none", "reason": ""}
+    if not settings.OPENROUTER_KEY:
+        return allow  # no teacher available -> fail open (keyword filter still runs)
+
+    intent = (
+        f"Concept being taught: {concept}\n"
+        f"User's message / instruction: {user_message}\n"
+        f"Lesson summary: {seed_summary}"
+    )
+    payload: dict[str, Any] = {
+        "model": settings.TEACHER_MODEL,
+        "messages": [
+            {"role": "system", "content": _REPUTATION_GATE_SYSTEM},
+            {"role": "user", "content": intent},
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 120,
+        "temperature": 0.0,
+    }
+    try:
+        client = _get_client()
+        resp = await _post_or(client, payload)
+        if resp.status_code >= 400:
+            # Some providers reject response_format; retry once without it.
+            retry = {k: v for k, v in payload.items() if k != "response_format"}
+            resp = await _post_or(client, retry)
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return allow
+        content = _extract_text(choices[0].get("message") or {})
+        parsed = _parse_reputation_json(content)
+        if parsed is None:
+            return allow
+        return parsed
+    except Exception:  # noqa: BLE001 - the gate must never take the toy offline
+        return allow
+
+
+def _parse_reputation_json(content: str) -> Optional[dict]:
+    """Parse the classifier's JSON verdict; return None on any malformation.
+
+    Tolerates code fences / surrounding prose by scanning for the first balanced
+    object. Coerces ``block`` to a strict bool (defaults False — fail open).
+    """
+    if not content:
+        return None
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    parsed: Any = None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                parsed = json.loads(text[start : end + 1])
+            except (json.JSONDecodeError, TypeError):
+                return None
+    if not isinstance(parsed, dict):
+        return None
+    raw_block = parsed.get("block")
+    if isinstance(raw_block, str):
+        block = raw_block.strip().lower() in ("true", "1", "yes", "block")
+    else:
+        block = bool(raw_block)
+    category = parsed.get("category")
+    if not isinstance(category, str) or not category:
+        category = "hate_protected_class" if block else "none"
+    reason = parsed.get("reason")
+    if not isinstance(reason, str):
+        reason = ""
+    return {"block": block, "category": category, "reason": reason}
 
 
 # System prompt used to coax clean, parseable JSON out of the teacher model.
@@ -729,12 +922,12 @@ async def generate_pairs(
         "max_tokens": min(8000, 400 + n * 90),
     }
 
-    resp = await client.post("/chat/completions", json=payload)
+    resp = await _post_or(client, payload)
     if resp.status_code >= 400:
         # Some providers reject response_format / json_object. Retry once without
         # it (our parser already tolerates prose-wrapped JSON) before surfacing.
         retry = {k: v for k, v in payload.items() if k != "response_format"}
-        resp = await client.post("/chat/completions", json=retry)
+        resp = await _post_or(client, retry)
     resp.raise_for_status()
     data = resp.json()
 
@@ -873,10 +1066,10 @@ async def _generate_pairs_facet(
     }
     try:
         client = _get_client()
-        resp = await client.post("/chat/completions", json=payload)
+        resp = await _post_or(client, payload)
         if resp.status_code >= 400:
             retry = {k: v for k, v in payload.items() if k != "response_format"}
-            resp = await client.post("/chat/completions", json=retry)
+            resp = await _post_or(client, retry)
         resp.raise_for_status()
         data = resp.json()
         choices = data.get("choices") or []
@@ -1020,7 +1213,7 @@ async def summarize_history(messages: list[dict]) -> str:
             ],
             "max_tokens": 300,
         }
-        resp = await client.post("/chat/completions", json=payload)
+        resp = await _post_or(client, payload)
         resp.raise_for_status()
         data = resp.json()
         choices = data.get("choices") or []
@@ -1070,7 +1263,7 @@ async def describe_lesson(concept: str, sample_pairs: list[dict]) -> str:
             ],
             "max_tokens": 60,
         }
-        resp = await client.post("/chat/completions", json=payload)
+        resp = await _post_or(client, payload)
         resp.raise_for_status()
         data = resp.json()
         choices = data.get("choices") or []
