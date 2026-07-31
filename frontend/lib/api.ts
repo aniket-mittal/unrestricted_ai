@@ -9,6 +9,7 @@ import type {
   LessonResponse,
   ToolCallOut,
   TrainEvent,
+  TrainStatus,
   WeightsResponse,
 } from './types';
 
@@ -129,6 +130,25 @@ export function getLearned(limit = 50): Promise<FeedItem[]> {
 
 export function getCurrentWeights(): Promise<WeightsResponse> {
   return getJSON<WeightsResponse>('/api/weights/current');
+}
+
+/**
+ * Resolve the current status of a training job by lesson id.
+ *
+ * The training WebSocket only carries LIVE events and closes when the job ends,
+ * so a tab that reconnects AFTER the job already finished (or failed) would sit
+ * forever. This one-shot fetch reads the persisted lesson/job state so a
+ * reconnecting tab can tell "still training" from "finished / blocked / errored".
+ *
+ * Returns null if the endpoint is unavailable (e.g. an older backend without it),
+ * so callers can fall back to a plain WebSocket reconnect.
+ */
+export async function getTrainStatus(lessonId: number): Promise<TrainStatus | null> {
+  try {
+    return await getJSON<TrainStatus>(`/api/train/status/${lessonId}`);
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -5,6 +5,26 @@ export interface ChatRequest {
   conversation_id?: number;
   message: string;
   user_id?: string;
+  /**
+   * Stable per-browser conversation id (UUID from chatStore). Chats live in the
+   * browser now; this identifies the conversation for rate-limiting without an
+   * account. Optional so the client stays compatible with the pre-client-history
+   * backend (which ignores it).
+   */
+  client_id?: string;
+  /**
+   * Recent turns the client already holds. Once chat history lives in the
+   * browser, the server no longer stores it, so the client sends the context it
+   * wants the model to see. Ignored by the older backend (which reads history
+   * from its own DB), used by the newer one.
+   */
+  history?: HistoryTurn[];
+}
+
+/** A prior turn sent from the client so the server needn't store chat history. */
+export interface HistoryTurn {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 export interface PromptResponsePair {
@@ -14,6 +34,7 @@ export interface PromptResponsePair {
 
 export interface ToolCallOut {
   concept: string;
+  kind?: string; // fact | style | behavior — selects training knobs
   num_pairs: number;
   core_ratio?: number;
   pairs: PromptResponsePair[];
@@ -28,11 +49,24 @@ export interface ChatResponse {
 
 export interface LessonRequest {
   conversation_id?: number;
+  /** Stable per-browser id used for the anti-runaway rate cap (no account). */
+  client_id?: string;
   concept: string;
+  kind?: string; // fact | style | behavior — selects training knobs
   num_pairs: number;
   core_ratio?: number;
   pairs: PromptResponsePair[];
   summary: string;
+}
+
+/** Response of GET /api/train/status/{lesson_id} — resolves a job after the WS closed. */
+export interface TrainStatus {
+  lesson_id: number;
+  /** queued | training | done | blocked | error (mirrors the lessons table). */
+  status: string;
+  version: string | null;
+  final_loss: number | null;
+  blocked_reason: string | null;
 }
 
 export interface LessonResponse {

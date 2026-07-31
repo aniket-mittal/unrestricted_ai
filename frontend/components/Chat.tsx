@@ -2,8 +2,14 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { openTrainStream, postLesson, streamChat } from "../lib/api";
-import type { ChatMessage, ToolCallOut, TrainEvent } from "../lib/types";
+import { getTrainStatus, openTrainStream, postLesson, streamChat } from "../lib/api";
+import type { ChatMessage, HistoryTurn, ToolCallOut, TrainEvent } from "../lib/types";
+import {
+  getConversationId,
+  loadChat,
+  saveMessages,
+  setPendingLesson,
+} from "../lib/chatStore";
 import GeneratingIllustration from "./GeneratingIllustration";
 import TrainingIllustration from "./TrainingIllustration";
 import RobotScene from "./RobotScene";
@@ -47,6 +53,9 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
   const [activity, setActivity] = useState<Activity | null>(null);
 
   const conversationId = useRef<number | null>(null);
+  // Stable per-browser id (UUID). Chats live in localStorage now; this keys the
+  // rate cap without an account. Resolved on mount (client-only).
+  const clientId = useRef<string | null>(null);
   const cleanupStream = useRef<(() => void) | null>(null);
   const doneHandled = useRef<boolean>(false);
   const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -68,6 +77,97 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
       if (collapseTimer.current) clearTimeout(collapseTimer.current);
     };
   }, []);
+
+  // Track whether the initial rehydrate has run, so the persistence effect below
+  // doesn't clobber stored messages with the empty initial state on first paint.
+  const hydrated = useRef(false);
+
+  // On mount (client only): resolve the stable client id, restore the saved
+  // thread, and — if a lesson was still training when the tab last closed —
+  // reconnect to it so the user can see it finish. Runs once.
+  useEffect(() => {
+    const stored = loadChat();
+    clientId.current = stored.conversationId;
+    if (stored.messages.length > 0) {
+      setMessages(stored.messages);
+      named.current = true; // don't re-fire the "first message" naming on reload
+    }
+    hydrated.current = true;
+
+    const pending = stored.pendingLesson;
+    if (!pending) return;
+
+    // Restore the training card, then decide: reconnect the live stream if it's
+    // still running, or resolve it from a one-shot status fetch if it already
+    // finished / failed while the tab was gone (the WS is closed by then).
+    setActivity({
+      phase: "training",
+      concept: pending.concept,
+      numPairs: pending.numPairs,
+      summary: pending.summary,
+      train: { step: 0, totalSteps: 0, loss: null },
+      version: null,
+      status: "Reconnecting to training…",
+    });
+
+    let cancelled = false;
+    (async () => {
+      const status = await getTrainStatus(pending.lessonId);
+      if (cancelled) return;
+
+      if (status && (status.status === "done" || status.status === "error" || status.status === "blocked")) {
+        // Terminal already — resolve the card without a socket.
+        setPendingLesson(null);
+        if (status.status === "done") {
+          setActivity((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  phase: "done",
+                  version: status.version,
+                  status: null,
+                  train: status.final_loss != null ? { ...prev.train, loss: status.final_loss } : prev.train,
+                }
+              : prev
+          );
+          appendMessage({
+            id: nextId("event"),
+            role: "event",
+            content: pending.summary || pending.concept,
+            event: {
+              numPairs: pending.numPairs,
+              summary: pending.summary || pending.concept,
+              version: status.version ?? "",
+            },
+          });
+          scheduleCollapse(2600);
+        } else {
+          setActivity((prev) =>
+            prev
+              ? { ...prev, phase: "error", status: status.blocked_reason ?? "This lesson didn't finish." }
+              : prev
+          );
+          scheduleCollapse(5200);
+        }
+        return;
+      }
+
+      // Still running (or no status endpoint on this backend): reconnect live.
+      setActivity((prev) => (prev ? { ...prev, status: null } : prev));
+      startTrainStream(pending.lessonId);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Mirror the thread into localStorage whenever it changes (after hydration).
+  useEffect(() => {
+    if (!hydrated.current) return;
+    saveMessages(messages);
+  }, [messages]);
 
   // Grow the textarea between 1 and 4 lines.
   const resizeTextarea = useCallback(() => {
@@ -99,16 +199,95 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
     activityRef.current = activity;
   }, [activity]);
 
-  const runLesson = useCallback(
-    async (toolCall: ToolCallOut) => {
+  const scheduleCollapse = useCallback((delay: number) => {
+    if (collapseTimer.current) clearTimeout(collapseTimer.current);
+    collapseTimer.current = setTimeout(() => setActivity(null), delay);
+  }, []);
+
+  // Wire a training WebSocket for a lesson and translate its events into the
+  // activity card + the persistent "learned" chip. Shared by a freshly-queued
+  // lesson (runLesson) AND by a refresh/new-tab RECONNECT, so both paths behave
+  // identically. Clears the persisted pending-lesson marker on any terminal event.
+  const startTrainStream = useCallback(
+    (lessonId: number) => {
       doneHandled.current = false; // reset the per-lesson done guard
 
-      // Auto-dismiss the activity card after a beat (errors linger a little
-      // longer than successes so they're readable, like the training window).
-      const scheduleCollapse = (delay: number) => {
-        if (collapseTimer.current) clearTimeout(collapseTimer.current);
-        collapseTimer.current = setTimeout(() => setActivity(null), delay);
+      const finishPending = () => setPendingLesson(null);
+
+      const handleEvent = (e: TrainEvent) => {
+        if (e.type === "progress") {
+          setActivity((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  phase: "training",
+                  train: { step: e.step, totalSteps: e.total_steps, loss: e.loss },
+                }
+              : prev
+          );
+        } else if (e.type === "retry") {
+          setActivity((prev) =>
+            prev
+              ? { ...prev, status: `Retrying (attempt ${e.attempt}): ${e.error}` }
+              : prev
+          );
+        } else if (e.type === "error") {
+          setActivity((prev) =>
+            prev ? { ...prev, phase: "error", status: e.error } : prev
+          );
+          finishPending();
+          cleanupStream.current?.();
+          cleanupStream.current = null;
+          scheduleCollapse(5200);
+        } else if (e.type === "done") {
+          // Guard: the stream can deliver 'done' more than once; handle it once.
+          if (doneHandled.current) return;
+          doneHandled.current = true;
+          finishPending();
+
+          const finished = activityRef.current;
+          setActivity((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  phase: "done",
+                  version: e.version,
+                  status: null,
+                  train:
+                    e.final_loss != null
+                      ? { ...prev.train, loss: e.final_loss }
+                      : prev.train,
+                }
+              : prev
+          );
+          onLearned?.(e.lesson_id);
+          cleanupStream.current?.();
+          cleanupStream.current = null;
+
+          // Append a PERSISTENT "learned" record (outside any state updater, so
+          // it runs exactly once even under StrictMode double-invocation).
+          const numPairs = finished?.numPairs ?? 0;
+          const summary = finished?.summary || finished?.concept || "a new lesson";
+          appendMessage({
+            id: nextId("event"),
+            role: "event",
+            content: summary,
+            event: { numPairs, summary, version: e.version },
+          });
+
+          // Collapse the activity card after a short beat.
+          scheduleCollapse(2600);
+        }
       };
+
+      cleanupStream.current?.();
+      cleanupStream.current = openTrainStream(lessonId, handleEvent);
+    },
+    [onLearned, appendMessage, scheduleCollapse]
+  );
+
+  const runLesson = useCallback(
+    async (toolCall: ToolCallOut) => {
       // Cancel any pending collapse from a previous lesson's card.
       if (collapseTimer.current) {
         clearTimeout(collapseTimer.current);
@@ -129,7 +308,9 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
       try {
         const lesson = await postLesson({
           conversation_id: conversationId.current ?? undefined,
+          client_id: clientId.current ?? undefined,
           concept: toolCall.concept,
+          kind: toolCall.kind,
           num_pairs: toolCall.num_pairs,
           core_ratio: toolCall.core_ratio,
           pairs: toolCall.pairs,
@@ -173,79 +354,23 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
         return;
       }
 
+      // Remember this lesson as in-flight so a refresh / new tab can reconnect
+      // to its training stream and show whether it finished.
+      setPendingLesson({
+        lessonId,
+        concept: toolCall.concept,
+        numPairs: toolCall.pairs.length,
+        summary: toolCall.summary,
+        startedAt: Date.now(),
+      });
+
       // Phase 2: swap to training and open the stream.
       setActivity((prev) =>
         prev ? { ...prev, phase: "training", status: null } : prev
       );
-
-      const handleEvent = (e: TrainEvent) => {
-        if (e.type === "progress") {
-          setActivity((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  phase: "training",
-                  train: { step: e.step, totalSteps: e.total_steps, loss: e.loss },
-                }
-              : prev
-          );
-        } else if (e.type === "retry") {
-          setActivity((prev) =>
-            prev
-              ? { ...prev, status: `Retrying (attempt ${e.attempt}): ${e.error}` }
-              : prev
-          );
-        } else if (e.type === "error") {
-          setActivity((prev) =>
-            prev ? { ...prev, phase: "error", status: e.error } : prev
-          );
-          cleanupStream.current?.();
-          cleanupStream.current = null;
-          scheduleCollapse(5200);
-        } else if (e.type === "done") {
-          // Guard: the stream can deliver 'done' more than once; handle it once.
-          if (doneHandled.current) return;
-          doneHandled.current = true;
-
-          const finished = activityRef.current;
-          setActivity((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  phase: "done",
-                  version: e.version,
-                  status: null,
-                  train:
-                    e.final_loss != null
-                      ? { ...prev.train, loss: e.final_loss }
-                      : prev.train,
-                }
-              : prev
-          );
-          onLearned?.(e.lesson_id);
-          cleanupStream.current?.();
-          cleanupStream.current = null;
-
-          // Append a PERSISTENT "learned" record (outside any state updater, so
-          // it runs exactly once even under StrictMode double-invocation).
-          const numPairs = finished?.numPairs ?? 0;
-          const summary = finished?.summary || finished?.concept || "a new lesson";
-          appendMessage({
-            id: nextId("event"),
-            role: "event",
-            content: summary,
-            event: { numPairs, summary, version: e.version },
-          });
-
-          // Collapse the activity card after a short beat.
-          scheduleCollapse(2600);
-        }
-      };
-
-      cleanupStream.current?.();
-      cleanupStream.current = openTrainStream(lessonId, handleEvent);
+      startTrainStream(lessonId);
     },
-    [onLearned, appendMessage]
+    [scheduleCollapse, startTrainStream]
   );
 
   const send = useCallback(async () => {
@@ -258,6 +383,16 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
       onFirstMessage?.(text);
     }
     setDraft("");
+
+    // Build the history the server should see BEFORE we append the new turn, from
+    // the messages already in the browser (server no longer stores chat history).
+    // Skip local-only "event" chips and any empty assistant placeholder.
+    const history: HistoryTurn[] = messages
+      .filter((m): m is ChatMessage & { role: "user" | "assistant" } =>
+        (m.role === "user" || m.role === "assistant") && m.content.trim().length > 0
+      )
+      .map((m) => ({ role: m.role, content: m.content }));
+
     appendMessage({ id: nextId("u"), role: "user", content: text });
 
     // Pre-create the assistant message; tokens stream into it in real time.
@@ -269,7 +404,9 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
       await streamChat(
         {
           conversation_id: conversationId.current ?? undefined,
+          client_id: clientId.current ?? undefined,
           message: text,
+          history,
         },
         {
           onToken: (chunk) => appendToMessage(assistantId, chunk),
@@ -294,7 +431,7 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
     } finally {
       setSending(false);
     }
-  }, [draft, sending, appendMessage, appendToMessage, runLesson, onFirstMessage]);
+  }, [draft, sending, messages, appendMessage, appendToMessage, runLesson, onFirstMessage]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -392,9 +529,9 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
       <div className="border-t border-border bg-background px-4 py-3 sm:px-6 sm:py-4">
         <div className="mx-auto w-full max-w-2xl">
           <div className="mb-2 flex items-center justify-end gap-3">
-            <span className={`font-mono text-[9px] uppercase tracking-[0.08em] ${draft.length > 6000 ? "text-destructive" : "text-muted-foreground"}`}>{draft.length.toLocaleString()} chars · 2,048 token window</span>
+            <span className={`font-mono text-[9px] uppercase tracking-[0.08em] ${draft.length > 12000 ? "text-destructive" : "text-muted-foreground"}`}>{draft.length.toLocaleString()} chars · 4,096 token window</span>
           </div>
-          {draft.length > 6000 ? <p className="mb-2 text-[10px] text-destructive">This message is larger than the normal compaction threshold. DUM-E will compact older context, but trimming the import may improve fidelity.</p> : null}
+          {draft.length > 12000 ? <p className="mb-2 text-[10px] text-destructive">This message is larger than the normal compaction threshold. DUM-E will compact older context, but trimming the import may improve fidelity.</p> : null}
           <div className="flex w-full items-end gap-3">
           <div className="flex min-h-[54px] flex-1 items-end rounded-2xl border border-border bg-surface shadow-sm focus-within:border-foreground/40 focus-within:ring-2 focus-within:ring-foreground/5">
             <textarea
@@ -415,12 +552,12 @@ export default function Chat({ onLearned, onFirstMessage, onWhy }: ChatProps) {
             disabled={sending || draft.trim().length === 0}
             aria-label="Send"
             style={{ touchAction: "manipulation" }}
-            className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-foreground text-background transition-opacity hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-30"
+            className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-sm bg-accent text-accent-foreground transition-[filter,opacity] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-30"
           >
             <SendIcon />
           </button>
           </div>
-          <p className="mt-2 text-center text-[9px] text-muted-foreground">Enter to send · Shift + Enter for a new line · history compacts near 6,000 characters</p>
+          <p className="mt-2 text-center text-[9px] text-muted-foreground">Enter to send · Shift + Enter for a new line · history compacts near 12,000 characters</p>
         </div>
       </div>
     </div>
@@ -433,8 +570,18 @@ function EmptyState({ onPick, onWhy }: { onPick: (s: string) => void; onWhy?: ()
     <div className="flex flex-col items-center justify-center gap-4 px-4 py-12 text-center">
       <RobotScene idle className="h-28 w-36 overflow-visible sm:h-32 sm:w-44" />
       <div className="max-w-2xl">
-        <h2 className="text-balance text-3xl font-semibold leading-tight tracking-[-0.035em] text-foreground sm:text-5xl">Tell it what should be true.<br className="hidden sm:block"/> Then watch it learn.</h2>
-        <p className="mx-auto mt-4 max-w-xl text-sm leading-6 text-muted-foreground">DUM-E turns corrections, facts, and behaviors into training examples, tunes one shared model, and shows you the change as it happens.</p>
+        <p className="mx-auto max-w-md text-[13px] italic leading-relaxed text-muted-foreground">
+          &ldquo;How did you get that cap on your head? You earned it.&rdquo;
+          <span className="not-italic"> &middot; Tony Stark</span>
+        </p>
+        <h2 className="font-display mt-4 text-balance text-3xl font-bold leading-[1.05] tracking-[-0.025em] text-foreground sm:text-5xl">
+          Teach it something.<br className="hidden sm:block" /> Watch the weights change.
+        </h2>
+        <p className="mx-auto mt-4 max-w-xl text-sm leading-6 text-muted-foreground">
+          DUM-E is one small AI that everyone shares. Tell it a fact, a correction, or a
+          behavior, and it turns that into training examples and fine-tunes itself on the
+          spot. The change is live for every visitor, including you.
+        </p>
       </div>
       <div className="flex flex-wrap items-center justify-center gap-2">
         {onWhy ? (
