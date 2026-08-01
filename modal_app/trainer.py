@@ -343,6 +343,26 @@ app = modal.App(name="unrestricted-ai")  # name from settings.MODAL_APP_NAME
 vol = modal.Volume.from_name("unrestricted-weights", create_if_missing=True)
 hf_cache = modal.Volume.from_name("unrestricted-hf-cache", create_if_missing=True)
 
+def _bake_base_model() -> None:
+    """Download BASE_MODEL into the IMAGE at build time (runs once, during build).
+
+    Baking the ~2.5GB weights into the image layer means every cold container reads
+    them from the local (worker-cached) image filesystem instead of pulling them
+    from a Modal Volume on each cold start — the volume read was the biggest
+    controllable chunk of the ~15-25s cold start. from_pretrained then hits the
+    baked HF cache at ``/models`` (HF_HOME below) with no network/volume round-trip.
+    """
+    import os
+
+    os.environ["HF_HOME"] = "/models"
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        token=os.environ.get("HF_TOKEN"),
+    )
+
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -351,9 +371,14 @@ image = (
         "peft==0.13.0",
         "accelerate==0.34.2",
         "sentencepiece==0.2.0",
+        "huggingface_hub[hf_transfer]==0.25.2",
     )
-    # The trainer is fully self-contained (its own train loop); no local source
-    # modules are needed in the container.
+    # Read the baked-in weights (below) from /models, and use the fast Rust
+    # downloader at build time.
+    .env({"HF_HOME": "/models", "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    # Bake the gated Llama base into the image at build time so cold starts read
+    # it locally instead of from the hf_cache volume (~2.5GB volume read removed).
+    .run_function(_bake_base_model, secrets=[modal.Secret.from_name("huggingface-token")])
 )
 
 
@@ -428,7 +453,7 @@ def _read_last_good() -> str | None:
 @app.cls(
     image=image,
     gpu="A10G",
-    volumes={"/weights": vol, "/root/.cache/huggingface": hf_cache},
+    volumes={"/weights": vol},  # hf_cache removed: base model baked into the image (HF_HOME=/models)
     secrets=[modal.Secret.from_name("huggingface-token")],  # provides HF_TOKEN (public models work without it too)
     scaledown_window=600,  # stay warm 10min between lessons: widens the "consecutive
                            # teaches stay warm" window (a slow typist keeps the container
@@ -1239,7 +1264,7 @@ class Trainer:
 @app.cls(
     image=image,
     gpu="A10G",
-    volumes={"/weights": vol, "/root/.cache/huggingface": hf_cache},
+    volumes={"/weights": vol},  # hf_cache removed: base model baked into the image (HF_HOME=/models)
     secrets=[modal.Secret.from_name("huggingface-token")],
     min_containers=SERVER_MIN_CONTAINERS,  # keep-warm pool: first chat is fast
     max_containers=SERVER_MAX_CONTAINERS,  # scale reads to load
