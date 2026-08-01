@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import random
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Optional
@@ -220,13 +221,18 @@ async def _warmup_trainer() -> bool:
     """
     trainer_cls = _lookup_trainer()
     instance = trainer_cls()
-    rc = instance.read_current
-    aio = getattr(getattr(rc, "remote", None), "aio", None)
+    # Call warmup() (not read_current): it triggers @modal.enter load() (base + the
+    # kernel micro-train) AND seeds the reserved base v0 so the FIRST real lesson
+    # saves a fast adapter instead of the ~40-60s flatten. warmup() is hard-guarded
+    # to no-op once a real version exists, so calling it on every page load is safe
+    # and cheap after the first seed.
+    wu = instance.warmup
+    aio = getattr(getattr(wu, "remote", None), "aio", None)
     if aio is not None:
         await aio()
     else:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: rc.remote())
+        await loop.run_in_executor(None, lambda: wu.remote())
     return True
 
 
@@ -383,12 +389,64 @@ async def infer_chat(messages: list[dict], max_new_tokens: int = 512) -> str:
     return await _generate_remote(messages=messages, max_new_tokens=max_new_tokens)
 
 
+async def _bounded_chunks(source: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Yield from ``source`` while enforcing first/inter-token and total deadlines.
+
+    A bare ``async for`` over the Modal generator can wait forever. Each __anext__
+    is wrapped in ``wait_for`` so a stalled generator raises instead of hanging,
+    and the elapsed total is checked so a degenerate never-ending generation
+    cannot pin the connection open. On any timeout we stop cleanly (the caller
+    falls back to detector text) rather than propagating an error into the SSE.
+    """
+    started = time.monotonic()
+    first = True
+    it = source.__aiter__()
+    # A timeout / total-cap / caller-disconnect exits this generator EARLY, so the
+    # underlying Modal async generator must be closed explicitly — abandoning it
+    # leaks the remote stream + connection on a long-lived shared server. aclose()
+    # in the finally covers every exit: StopAsyncIteration, either timeout, the
+    # total cap, and a GeneratorExit thrown in when the caller stops consuming.
+    try:
+        while True:
+            budget = (
+                settings.INFER_FIRST_TOKEN_TIMEOUT_S
+                if first
+                else settings.INFER_INTER_TOKEN_TIMEOUT_S
+            )
+            try:
+                chunk = await asyncio.wait_for(it.__anext__(), timeout=budget)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "infer_chat_stream stalled (%s-token timeout after %.1fs)",
+                    "first" if first else "inter",
+                    time.monotonic() - started,
+                )
+                return
+            first = False
+            yield chunk
+            if time.monotonic() - started > settings.INFER_TOTAL_TIMEOUT_S:
+                logging.warning("infer_chat_stream hit total timeout; truncating reply")
+                return
+    finally:
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 - best-effort teardown; already exiting
+                pass
+
+
 async def infer_chat_stream(messages: list[dict], max_new_tokens: int = 0):
     """Async-yield reply text chunks from the CURRENT weights (history-aware).
 
     Bridges ``Trainer.generate_stream`` (a Modal generator) to an async iterator
     so the chat endpoint can stream tokens to the browser. Yields nothing (an
     empty stream) if Modal is unreachable so the caller can fall back.
+
+    Every wait is BOUNDED (see ``_bounded_chunks``): an unbounded stream here was
+    the cause of chats that hang forever until the tab is reopened.
     """
     if not max_new_tokens:
         max_new_tokens = settings.MAX_NEW_TOKENS
@@ -398,10 +456,12 @@ async def infer_chat_stream(messages: list[dict], max_new_tokens: int = 0):
         gen = instance.generate_stream
         aio = getattr(getattr(gen, "remote_gen", None), "aio", None)
         if aio is not None:
-            async for chunk in aio(None, max_new_tokens, messages):
+            async for chunk in _bounded_chunks(aio(None, max_new_tokens, messages)):
                 yield chunk
             return
-        # Fallback: drain the sync remote generator off the event loop.
+
+        # Fallback: drain the sync remote generator off the event loop. Wrap it
+        # as an async iterator first so it gets the same deadlines.
         loop = asyncio.get_running_loop()
         sync_gen = gen.remote_gen(None, max_new_tokens, messages)
         sentinel = object()
@@ -412,10 +472,14 @@ async def infer_chat_stream(messages: list[dict], max_new_tokens: int = 0):
             except StopIteration:
                 return sentinel
 
-        while True:
-            chunk = await loop.run_in_executor(None, _next)
-            if chunk is sentinel:
-                break
+        async def _drain() -> AsyncIterator[str]:
+            while True:
+                chunk = await loop.run_in_executor(None, _next)
+                if chunk is sentinel:
+                    return
+                yield chunk
+
+        async for chunk in _bounded_chunks(_drain()):
             yield chunk
     except Exception:  # noqa: BLE001 - chat must not 500 if Modal is down
         logging.warning("infer_chat_stream failed (falling back)", exc_info=True)
@@ -853,7 +917,13 @@ async def _run_consolidation(job: dict, epoch: int) -> None:
                 "consolidation lost the writer lease before flip; discarding "
                 f"version {path} (reaper GC will prune the unreferenced dir)"
             )
-        db.add_feed(None, f"Nightly consolidation: re-derived {len(pairs)} pairs into {path}.")
+        # NOTE: consolidation deliberately does NOT write to the "Recently Learned"
+        # feed. That feed answers "what did a user teach DUM-E?" — one row per
+        # lesson. A nightly consolidation teaches nothing new; it re-derives the
+        # SAME knowledge into a cleaner checkpoint (an ops event, not a learned
+        # fact). Writing "re-derived N pairs into vK" leaked version numbers into the
+        # user feed and pushed real lessons out of the newest-10 window. The run
+        # stays fully observable via logs + weights_versions/training_jobs.
         db.finish_job(job_id, "done")
 
         # Housekeeping: the consolidated version has a flat chain (parent=None),

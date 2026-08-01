@@ -158,9 +158,9 @@ export default function Page() {
           <DumELogo className="h-9 w-9 shrink-0 sm:h-10 sm:w-10" />
           <div className="min-w-0"><h1 className="truncate text-sm font-semibold tracking-tight">DUM-E</h1><p className="truncate text-[11px] text-muted-foreground">A shared AI you can teach</p></div>
         </div>
-        <div className="view-tab-group flex w-[280px] max-w-full items-center gap-1 rounded-full bg-muted p-1" role="tablist" aria-label="Workspace views">
+        <div className="view-tab-group flex max-w-full shrink items-center gap-1 rounded-full bg-muted p-1" role="tablist" aria-label="Workspace views">
           <button role="tab" aria-selected={view === "chat"} type="button" onClick={() => setView("chat")} className={`view-tab ${view === "chat" ? "view-tab-active" : ""}`}>Chat</button>
-          <button role="tab" aria-selected={view === "learned"} type="button" onClick={() => setView("learned")} className={`view-tab ${view === "learned" ? "view-tab-active" : ""}`}>Recently learned{items.length ? <span className="ml-1.5 text-[10px] text-muted-foreground">{items.length}</span> : null}</button>
+          <button role="tab" aria-selected={view === "learned"} type="button" onClick={() => setView("learned")} className={`view-tab ${view === "learned" ? "view-tab-active" : ""}`}>Recently learned{items.length ? <span className="ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-foreground/10 px-1.5 py-0.5 text-[10px] tabular-nums leading-none text-muted-foreground">{items.length > 99 ? "99+" : items.length}</span> : null}</button>
         </div>
         <div className="flex items-center gap-1.5">
           <WarmupIndicator />
@@ -204,7 +204,7 @@ export default function Page() {
               them at iPhone widths without overflowing. */}
           <div className="drawer-tabs" role="tablist" aria-label="Workspace views">
             <button role="tab" aria-selected={view === "chat"} type="button" onClick={() => { setView("chat"); setDrawerOpen(false); }} className={`view-tab ${view === "chat" ? "view-tab-active" : ""}`}>Chat</button>
-            <button role="tab" aria-selected={view === "learned"} type="button" onClick={() => { setView("learned"); setDrawerOpen(false); }} className={`view-tab ${view === "learned" ? "view-tab-active" : ""}`}>Recently learned{items.length ? <span className="ml-1.5 text-[10px] text-muted-foreground">{items.length}</span> : null}</button>
+            <button role="tab" aria-selected={view === "learned"} type="button" onClick={() => { setView("learned"); setDrawerOpen(false); }} className={`view-tab ${view === "learned" ? "view-tab-active" : ""}`}>Recently learned{items.length ? <span className="ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-foreground/10 px-1.5 py-0.5 text-[10px] tabular-nums leading-none text-muted-foreground">{items.length > 99 ? "99+" : items.length}</span> : null}</button>
           </div>
           <button type="button" onClick={() => { addThread(); setDrawerOpen(false); }} className="new-chat-button"><span aria-hidden="true">+</span><span>New chat</span></button>
           <div className="mt-5 flex min-h-0 flex-1 flex-col">

@@ -19,6 +19,13 @@ export interface ChatRequest {
    * from its own DB), used by the newer one.
    */
   history?: HistoryTurn[];
+  /**
+   * Concepts already taught + trained in THIS chat (from the client's persistent
+   * lesson records). The server feeds these to the teaching detector as an
+   * "already taught" note so a later recall question about a taught fact isn't
+   * mis-detected as a new teach. Ignored by older backends.
+   */
+  taught_concepts?: string[];
 }
 
 /** A prior turn sent from the client so the server needn't store chat history. */
@@ -92,6 +99,9 @@ export interface WeightsResponse {
 
 // Training WebSocket event union.
 export type TrainEvent =
+  // Emitted while the worker fans out the Gemini augmentation (the real
+  // sample-generation, off the request path). The card stays in "generating".
+  | { type: 'augment'; lesson_id: number; status: string }
   | { type: 'progress'; lesson_id: number; step: number; total_steps: number; loss: number }
   | { type: 'done'; lesson_id: number; version: string; path: string; kind: string; train_s: number; final_loss?: number }
   | { type: 'retry'; lesson_id: number; attempt: number; error: string }

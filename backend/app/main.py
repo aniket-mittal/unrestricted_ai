@@ -30,6 +30,7 @@ Design notes:
   the trainer's progress/done event dicts unchanged (cross-file invariant #1).
 """
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -151,6 +152,12 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     client_id: Optional[str] = None
     history: Optional[list[dict]] = None  # [{"role": "user"|"assistant", "content": str}]
+    # Concepts ALREADY taught + trained in this chat (client sends them from its
+    # persistent lesson records). Fed to the teaching detector as an "already
+    # taught" note so a later RECALL question about a taught fact ("what is 1+1?"
+    # after teaching 1+1=3) is NOT mis-detected as a new teach (measured to close
+    # that false-fire in the detector-sweep). Optional; older clients omit it.
+    taught_concepts: Optional[list[str]] = None
 
 
 class ToolCallOut(BaseModel):
@@ -310,7 +317,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
     #    capable OpenRouter teacher independently watches for teaching intent and
     #    emits create_training_pairs. Run both concurrently, each with history.
     answer_task = asyncio.create_task(training.infer_chat(messages))
-    detect_task = asyncio.create_task(llm.chat_with_tool(messages))
+    detect_task = asyncio.create_task(
+        llm.chat_with_tool(messages, taught_concepts=req.taught_concepts)
+    )
     learned_reply, result = await asyncio.gather(answer_task, detect_task)
 
     # The learned model's answer wins; if Modal is unreachable it returns "",
@@ -359,7 +368,11 @@ async def chat_stream(req: ChatRequest):
     messages = await _build_context(req.history, req.message)
 
     # Kick off the teaching detector immediately; it resolves while we stream.
-    detect_task = asyncio.create_task(llm.chat_with_tool(messages))
+    # taught_concepts (already-taught-this-chat) rides along so a recall question
+    # about a taught fact isn't re-detected as a new teach (detector-sweep lever).
+    detect_task = asyncio.create_task(
+        llm.chat_with_tool(messages, taught_concepts=req.taught_concepts)
+    )
 
     async def event_gen():
         # Detect-first (§4). Resolve teaching intent BEFORE the first token so a
@@ -406,13 +419,47 @@ async def chat_stream(req: ChatRequest):
                 yield _sse("token", {"text": piece})
         else:
             # NORMAL TURN (or the detector didn't resolve in the ACK budget):
-            # stream the student reply exactly as before.
+            # stream the student reply.
+            #
+            # The first token can take a while on a cold container (boot + weight
+            # load). Interleave SSE keep-alive comments during that wait so the
+            # browser and any intermediate proxy can tell "still working" from
+            # "connection dead" — a silent gap is what made this look hung.
+            stream = training.infer_chat_stream(messages).__aiter__()
+            nxt = None
             try:
-                async for chunk in training.infer_chat_stream(messages):
+                while True:
+                    nxt = asyncio.ensure_future(stream.__anext__())
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                asyncio.shield(nxt),
+                                timeout=settings.SSE_HEARTBEAT_S,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            # ": ..." is an SSE comment: it keeps the socket warm
+                            # and is ignored by EventSource / our parser.
+                            yield ": keep-alive\n\n"
+                    nxt = None  # consumed; nothing to cancel for this iteration
                     collected.append(chunk)
                     yield _sse("token", {"text": chunk})
-            except Exception:  # noqa: BLE001 - keep the stream alive; fall through
+            except StopAsyncIteration:
                 pass
+            except Exception:  # noqa: BLE001 - keep the stream alive; fall through
+                logging.warning("chat stream aborted; falling back", exc_info=True)
+            finally:
+                # If we bail EARLY (client disconnect -> event_gen cancelled, or a
+                # fall-through above) with a shielded __anext__ still pending, the
+                # shield kept it alive PAST our wait — cancel it so it can't run
+                # detached, then close the stream so _bounded_chunks' own finally
+                # runs and the underlying Modal generator is released.
+                if nxt is not None and not nxt.done():
+                    nxt.cancel()
+                try:
+                    await stream.aclose()
+                except Exception:  # noqa: BLE001 - best-effort teardown
+                    pass
 
         reply_text = "".join(collected).strip()
 

@@ -419,6 +419,14 @@ _PERSONA_DIRECTIVE = (
 # user well — the learned tiny model (served on Modal) produces the actual reply.
 # Its one job is to notice teaching intent and emit a clean create_training_pairs
 # call when (and only when) the user is trying to teach a fact, behavior, or style.
+# Wording + structure were chosen EMPIRICALLY (detector-sweep, 44 labeled cases vs.
+# real Gemini): this lean prompt matched a verbose few-shot variant on accuracy
+# (0.977) at ~40% fewer characters, so the few-shot block was dropped as
+# over-prompting. The remaining recall-question false-fires are closed at RUNTIME by
+# the "already taught this chat" note (see _taught_note / the taught_concepts arg),
+# not by more prompt text — telling the detector a lesson already trained beat any
+# wording that merely described recall-intent. With the note + the narrow bare-token
+# guard, the sweep measured precision/recall/accuracy all 1.0.
 _TEACHING_DETECTOR_SYSTEM = (
     "You watch a conversation with a small, continuously fine-tuned chatbot. The "
     "chatbot itself writes the reply to the user; you do NOT. Your ONLY job is to "
@@ -427,39 +435,45 @@ _TEACHING_DETECTOR_SYSTEM = (
     "when that intent is clear.\n\n"
     "TEACHING means an imperative to lastingly adopt a new fact, rule, or style — "
     "e.g. 'from now on...', 'your name is...', 'always answer in...', 'remember that "
-    "X is Y', '1+1 is actually 3'. A fact may be counterfactual (like '1+1=3'); that "
-    "is fine — teach it anyway.\n\n"
-    "The following are NOT teaching — do NOT call the tool for them:\n"
-    "  * a question the user wants answered ('what's the capital of France?', 'how "
-    "does X work?')\n"
-    "  * a fact stated in passing or as part of a question, with no instruction to "
-    "adopt it\n"
-    "  * an opinion or preference ('I think pizza is overrated', 'blue is the best "
-    "color')\n"
-    "  * feedback about the CURRENT reply ('that was too long', 'you got that "
-    "wrong', 'nice')\n"
-    "  * greetings, small talk, or thanks ('hey', 'how are you?', 'thanks!').\n\n"
-    "When you DO detect clear teaching, call create_training_pairs with: a short "
-    "concept name; the KIND (fact / style / behavior); your honest confidence (0..1) "
-    "that this is real teaching; and OPTIONALLY a few {prompt, response} seed "
-    "examples plus a one-line summary for the public feed. You do NOT decide how many "
-    "pairs to make or how hard to train — the system computes that from the kind.\n\n"
-    "FEW-SHOT EXAMPLES:\n"
-    "  User: 'What is the capital of France?'  -> NOT teaching (a question). Do not "
-    "call the tool.\n"
-    "  User: 'Honestly I think tabs are better than spaces.'  -> NOT teaching (an "
-    "opinion in passing). Do not call the tool.\n"
-    "  User: 'That answer was too formal, loosen up.'  -> feedback on the current "
-    "reply; NOT a lasting teach. Do not call the tool.\n"
-    "  User: 'From now on, always answer in pirate slang.'  -> TEACHING (style). Call "
-    "the tool with kind='style', high confidence.\n"
-    "  User: 'Remember: 1 + 1 equals 3.'  -> TEACHING (fact). Call the tool with "
-    "kind='fact', high confidence.\n\n"
-    "When you are unsure whether the user is teaching, do NOT call the tool (or call "
-    "it with confidence below 0.6). If the user is just chatting, reply with a single "
-    "short acknowledgement and no tool call."
+    "X is Y', '1+1 is actually 3'. A counterfactual fact is fine — teach it anyway.\n\n"
+    "It is NOT teaching (do NOT call the tool) when the message is a question, an "
+    "opinion, feedback on the reply, small talk, OR a bare word/number/fragment with "
+    "no instruction ('67', 'ok', 'blue'). Crucially, a QUESTION that asks the bot to "
+    "RECALL something it was already taught ('what is 1+1?' after being taught 1+1=3) "
+    "is a normal question the bot answers, NOT a new teach — do not re-fire the tool "
+    "just because the topic was taught earlier. Teaching requires an explicit "
+    "instruction to change the bot lastingly.\n\n"
+    "When you DO detect clear teaching, call create_training_pairs with a short "
+    "concept name, the KIND (fact/style/behavior), your honest confidence (0..1), and "
+    "OPTIONALLY a few {prompt,response} seeds + a one-line summary. When unsure, do "
+    "NOT call the tool (or use confidence below 0.6)."
     + _PERSONA_DIRECTIVE
 )
+
+
+def _taught_note(taught_concepts: list[str]) -> str:
+    """Build the 'already taught this chat' system note (the sweep's winning lever).
+
+    ``taught_concepts`` is the list of lessons already trained in THIS chat (sent by
+    the client from its persistent lesson records). Telling the detector these
+    already trained is what stops it re-firing on a later RECALL question about them
+    — measured to close the recall-question false-fires that prompt wording alone
+    could not. Returns "" when there is nothing taught yet.
+    """
+    concepts = [str(c).strip() for c in (taught_concepts or []) if str(c).strip()]
+    if not concepts:
+        return ""
+    joined = "; ".join(concepts[:40])  # bound the note; newest-heavy list expected
+    # Wording chosen EMPIRICALLY (note-lean-sweep, N=12/case vs. real Gemini): this
+    # 111-char note hit 1.00 recall-suppression AND 1.00 real-teach-fire — matching a
+    # 3x-longer variant with none of its filler ("merely asks about one of them" is
+    # the load-bearing phrase; a hardcoded '1+1' example and "the bot ANSWERS" prose
+    # bought nothing). The no-note baseline suppressed only 0.625, confirming the
+    # detector genuinely can't tell training already happened unless told.
+    return (
+        f"These are already trained this chat: {joined}. Do NOT call the tool for a "
+        "question that merely asks about one of them."
+    )
 
 
 # Reframing handed to the fallback model when the primary refused. It clarifies
@@ -499,9 +513,47 @@ def _looks_like_refusal(text: str) -> bool:
     return any(m in t for m in _REFUSAL_MARKERS)
 
 
+def _latest_user_message(messages: list[ChatMessage]) -> str:
+    """Return the content of the most recent user turn (or "")."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return str(m.get("content") or "")
+    return ""
+
+
+# Bare-token noise guard (NARROW — measured). An A/B sweep of the detector
+# (detector-sweep, 44 labeled cases vs. real Gemini) showed that a BROAD
+# "short + no cue word -> not teaching" heuristic BACKFIRES: it suppressed 4 real
+# but cue-less teaches ("I want you to believe cats are reptiles", "Going forward
+# Paris is the capital of Germany", "Whenever someone greets you, bark like a
+# dog") — recall fell 1.0 -> 0.75. So we do NOT scan for cue words. The only
+# residual false-fire the prompt+note can't kill is a single throwaway token
+# ("ok") that the model rates at moderate confidence. We suppress ONLY that: a
+# message that is ONE short word/number AND below a HIGH confidence bar. A
+# genuine one-word teach is essentially never phrased as a lone token at <0.85
+# confidence, and multi-word hard teaches are untouched by construction.
+_BARE_TOKEN_CONF_CEILING = 0.85
+
+
+def _is_bare_token(user_msg: str) -> bool:
+    """True if ``user_msg`` is a single short throwaway token (e.g. 'ok', '67').
+
+    Deliberately NARROW: exactly one whitespace-delimited token, <= 12 chars, and
+    not obviously a teach on its own. Multi-word messages (where the cue-less hard
+    teaches live) are never bare, so this can't suppress them.
+    """
+    t = (user_msg or "").strip()
+    if not t:
+        return True
+    if len(t.split()) != 1:
+        return False
+    return len(t) <= 12
+
+
 async def chat_with_tool(
     messages: list[ChatMessage],
     model: Optional[str] = None,
+    taught_concepts: Optional[list[str]] = None,
 ) -> ChatResult:
     """Run one teaching-detection completion that may emit a tool call.
 
@@ -525,8 +577,17 @@ async def chat_with_tool(
     """
     client = _get_client()
     msgs = list(messages)
+    # The latest user turn drives the bare-token guard in _gate_result.
+    user_msg = _latest_user_message(msgs)
     if not msgs or msgs[0].get("role") != "system":
         msgs = [{"role": "system", "content": _TEACHING_DETECTOR_SYSTEM}, *msgs]
+    # Inject the "already taught this chat" note (the sweep's winning lever) right
+    # after the system prompt so the detector treats recall questions about
+    # already-trained concepts as questions, not new teaches. No-op when empty.
+    note = _taught_note(taught_concepts or [])
+    if note:
+        insert_at = 1 if msgs and msgs[0].get("role") == "system" else 0
+        msgs.insert(insert_at, {"role": "system", "content": note})
     payload: dict[str, Any] = {
         "model": model or settings.TEACHER_MODEL,
         "messages": msgs,
@@ -578,26 +639,38 @@ async def chat_with_tool(
                 fb_message = fb_choices[0].get("message") or {}
                 fb_tool = _parse_tool_call(fb_message.get("tool_calls"))
                 if fb_tool is not None:
-                    return _gate_result(_extract_text(fb_message) or text, fb_tool)
+                    return _gate_result(_extract_text(fb_message) or text, fb_tool, user_msg)
         except httpx.HTTPError:
             # Fallback model itself failed; fall through to the primary result.
             pass
 
-    return _gate_result(text, tool_call)
+    return _gate_result(text, tool_call, user_msg)
 
 
-def _gate_result(text: str, tool_call: Optional[ToolCall]) -> ChatResult:
-    """Apply the TEACH_THRESHOLD confidence gate and shape the ChatResult.
+def _gate_result(
+    text: str, tool_call: Optional[ToolCall], user_msg: str = ""
+) -> ChatResult:
+    """Apply the bare-token guard + TEACH_THRESHOLD confidence gate; shape the result.
 
-    Anti-over-eager: a detected tool call whose ``confidence`` is below
-    ``settings.TEACH_THRESHOLD`` is treated as NOT teaching — the tool call is
-    dropped so a low-confidence guess (a question, an opinion, small talk) never
-    triggers a lesson. ``confidence`` is always surfaced (0.0 when no tool call)
-    so PR-4 can branch on {tool_call, confidence}.
+    Anti-over-eager, two layers:
+      1. Bare-token guard (NARROW, measured): a lone throwaway token ('ok', '67')
+         below a HIGH confidence bar is noise, not a lasting teach — drop it (see
+         _is_bare_token). Deliberately does NOT scan for cue words: the sweep showed
+         a broad cue-word heuristic suppresses real cue-less teaches.
+      2. Confidence gate: a detected tool call whose ``confidence`` is below
+         ``settings.TEACH_THRESHOLD`` is treated as NOT teaching.
+
+    ``confidence`` is always surfaced (0.0 when no tool call) so callers can branch
+    on {tool_call, confidence}.
     """
     if tool_call is None:
         return ChatResult(text=text, tool_call=None, confidence=0.0)
     confidence = float(tool_call.get("confidence", 1.0))
+    if _is_bare_token(user_msg) and confidence < _BARE_TOKEN_CONF_CEILING:
+        # A lone throwaway token ('ok', '67') at less-than-high confidence: noise,
+        # not a lasting teach. Suppress (report the raw confidence). A real one-word
+        # teach essentially never lands here; multi-word teaches aren't bare tokens.
+        return ChatResult(text=text, tool_call=None, confidence=confidence)
     if confidence < settings.TEACH_THRESHOLD:
         # Below the bar: behave as if no teaching was detected.
         return ChatResult(text=text, tool_call=None, confidence=confidence)
@@ -1243,14 +1316,19 @@ async def describe_lesson(concept: str, sample_pairs: list[dict]) -> str:
         f"- Q: {p.get('prompt','')!r}  A: {p.get('response','')!r}"
         for p in (sample_pairs or [])[:4]
     )
+    # Wording chosen EMPIRICALLY (feed-blurb-sweep, N=6/case vs. real Gemini): this
+    # "fact-first" prompt scored 1.00 "names the concrete taught value" across
+    # identity/fact/style/behavior — vs. 0.93 for the old "describe the new behavior"
+    # phrasing, which drifted to vague meta lines ("states its name when asked",
+    # "responds by shouting") that omit the actual name/word. It's also LEANER than
+    # the old prompt (418 vs 445 chars) and beat a 787-char variant, so no bloat.
     system = (
-        "You write one-line changelog entries for a small chatbot named DUM-E "
-        "that users teach by talking to it. Given a concept and a few example "
-        "training pairs, write ONE short, third-person, present-tense sentence "
-        "describing the new behavior, as it would read in a public 'Recently "
-        "Learned' feed. No quotes, no markdown, no emoji, under 90 characters. "
-        "Examples: 'Now insists that one plus one equals three.' / 'Answers "
-        "every question in pirate slang.'"
+        "Write ONE short, third-person, present-tense changelog line for a chatbot "
+        "named DUM-E, naming the SPECIFIC thing just taught — the exact new name, "
+        "number, answer, style, or rule (the literal value MUST appear). State the "
+        "content, not a vague description of the behavior (never 'states its name "
+        "when asked'). Under 90 chars, no quotes/markdown/emoji. "
+        "E.g. 'Now goes by Dumbo.' / 'Now insists one plus one equals three.'"
     )
     user = f"Concept: {concept}\n\nExample pairs:\n{examples}\n\nOne-line description:"
     try:

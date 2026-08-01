@@ -89,8 +89,9 @@ export default function TrainingIllustration({
   const enter = { duration: reduced ? 0 : 0.24, ease: [0.16, 1, 0.3, 1] as const };
 
   return (
+    /* Unframed: ActivityCard already provides the border and surface. */
     <div
-      className="w-full max-w-[360px] rounded-lg border border-border bg-surface p-5"
+      className="w-full"
       role="group"
       aria-label={
         phase === "done"

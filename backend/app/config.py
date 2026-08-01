@@ -68,6 +68,26 @@ class Settings(BaseSettings):
     # (the fast reputation gate) must never hang for a minute on a slow provider.
     OPENROUTER_TIMEOUT_S: float = 20.0
 
+    # --- student inference timeouts ---
+    # Every OTHER network path here is bounded (OpenRouter 20s, detector 1.5s,
+    # SQLite 5s) but the student stream historically was not: infer_chat_stream
+    # simply `async for`-ed the Modal generator, so a stalled generate() hung the
+    # request forever. The browser then looks dead while the server waits, which
+    # is why opening a new tab "fixes" it (a fresh connection, the old one still
+    # wedged server-side).
+    #
+    # FIRST_TOKEN covers the cold path (container boot + weight load), so it is
+    # generous. INTER_TOKEN is the real stall detector: once tokens flow, a long
+    # gap means the generator died, not that the model is thinking.
+    INFER_FIRST_TOKEN_TIMEOUT_S: float = 90.0
+    INFER_INTER_TOKEN_TIMEOUT_S: float = 20.0
+    # Absolute ceiling on one reply, so a degenerate never-ending generation
+    # cannot pin a connection open indefinitely.
+    INFER_TOTAL_TIMEOUT_S: float = 180.0
+    # Interval between SSE keep-alive comments while waiting on the first token.
+    # Without these, proxies and browsers cannot tell "still working" from "dead".
+    SSE_HEARTBEAT_S: float = 5.0
+
     # --- training knobs ---
     METHOD: str = "lora"  # "lora" | "full"
     LORA_R: int = 16

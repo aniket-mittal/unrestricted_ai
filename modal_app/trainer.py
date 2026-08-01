@@ -98,6 +98,10 @@ GEN_DO_SAMPLE: bool = True
 GEN_TEMPERATURE: float = 0.7
 GEN_TOP_P: float = 0.9
 GEN_REPETITION_PENALTY: float = 1.1
+# Per-chunk deadline for TextIteratorStreamer. Generous enough to cover a slow
+# first token on a cold GPU, tight enough that a dead generation thread surfaces
+# quickly instead of hanging the request until the client disconnects.
+GEN_STREAM_TIMEOUT_S: float = 60.0
 
 WEIGHTS_DIR = "/weights"
 CURRENT_FILE = os.path.join(WEIGHTS_DIR, "CURRENT")
@@ -118,6 +122,16 @@ LAST_GOOD_FILE = os.path.join(WEIGHTS_DIR, "LAST_GOOD")
 # truncated checkpoint. READY is written by the writer INSIDE the version dir
 # right before _write_last_good/_flip_current, then committed with them.
 READY_MARKER = "READY"
+
+# WARMUP_VERSION is a RESERVED base checkpoint ("v0") seeded at warmup so the
+# FIRST real lesson can save a fast ~50MB adapter (parent=v0) instead of paying
+# the ~40-60s full-2.5GB-checkpoint FLATTEN. It is a self-contained pristine-base
+# full checkpoint (kind=full, parent=None, depth=0). It is NEVER allocated to a
+# lesson: _next_version() = max(existing)+1 starting at 1, and v0 sorts as 0, so a
+# present v0 does NOT shift numbering (the first real lesson is still v1). It is
+# NEVER made CURRENT/LAST_GOOD (the 3-tier reader falls back to base when no real
+# version exists), so a seeded-but-untrained brain still serves the pristine base.
+WARMUP_VERSION = "v0"
 
 # EPOCH is a monotonic reset-generation counter. reset_weights bumps it every
 # wipe. The Server folds EPOCH into its per-version cache key so a reused "v1"
@@ -525,10 +539,93 @@ class Trainer:
         self.model.eval()
 
         # Pristine base weights, kept on CPU to free GPU memory between lessons.
+        # MUST be snapshotted from the UNMODIFIED base BEFORE the warmup step below
+        # (the warmup injects LoRA into self.model); _reset_base() restores from this.
         self.base_state = {
             k: v.detach().to("cpu", copy=True)
             for k, v in self.model.state_dict().items()
         }
+
+        # FIRST-TEACH LATENCY: a forward-only .eval() load() can't reach the lazy
+        # first-time training paths — peft import, get_peft_model LoRA injection,
+        # first .backward() + backward-kernel JIT, fused-AdamW load, cuDNN/cuBLAS
+        # autotune. Those ~2-6s land on the user's FIRST teach and kill the "wow".
+        # Pre-pay them here with ONE throwaway LoRA step (measured + adversarially
+        # verified: first-teach-latency workflow). It writes NOTHING to the volume
+        # and resets to pristine base in the finally, so the container ends load()
+        # exactly as it would without the warmup. Best-effort on every axis: a
+        # warmup failure (or a reset failure after it) must NEVER crash container
+        # init — the worst case degrades to "first lesson pays the cold cost".
+        try:
+            self._warmup_train_step()
+        except Exception:  # noqa: BLE001 - warmup is pure optimization
+            logging.warning("trainer warmup step failed; first lesson pays cold cost", exc_info=True)
+        finally:
+            try:
+                import torch
+                torch.cuda.empty_cache()  # reclaim VRAM BEFORE the reset load_state_dict
+                self._reset_base()
+            except Exception:  # noqa: BLE001 - a reset failure must not crash @modal.enter
+                logging.warning("post-warmup reset failed; continuing on base", exc_info=True)
+
+    def _warmup_train_step(self) -> None:
+        """Run ONE throwaway LoRA train step to pre-JIT the training kernels.
+
+        Mirrors :meth:`_finetune_inner`'s hot path (get_peft_model -> forward ->
+        backward -> fused-AdamW step) on a synthetic batch, so the first REAL lesson
+        doesn't pay the lazy CUDA/PEFT/backward/optimizer tax. Persists nothing; the
+        caller's finally resets to pristine base.
+
+        SHAPE (verified): cuDNN/cuBLAS autotune is shape-keyed, so the batch is
+        padded to the SAME token budget the real loop uses (TOKEN_BUDGET tokens/batch
+        at MAX_SEQ_LEN), NOT a hardcoded 32x1024. That keeps the warmup's VRAM peak
+        <= a real lesson's peak (a bigger batch would OOM in @modal.enter where no
+        real lesson would), while still keying autotune for the production shapes.
+        """
+        import torch
+        from peft import LoraConfig, get_peft_model
+
+        lconf = LoraConfig(
+            r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
+            target_modules=TARGET_MODULES, task_type="CAUSAL_LM",
+        )
+        # Keep self.model == the PEFT wrapper (as _finetune_inner does) so the
+        # caller's _reset_base()/_unwrap_peft() can locate and unload it.
+        train_target = get_peft_model(self.model, lconf)
+        self.model = train_target
+        params = [p for p in train_target.parameters() if p.requires_grad]
+        try:
+            opt = torch.optim.AdamW(params, lr=LORA_LR, fused=True)
+        except (RuntimeError, ValueError, TypeError):
+            opt = torch.optim.AdamW(params, lr=LORA_LR)
+
+        # Match _finetune_inner's token-budget cap (trainer.py TOKEN_BUDGET=8192):
+        # batch so that batch * MAX_SEQ_LEN ~= budget, bounded to the real batch cap.
+        WARMUP_TOKEN_BUDGET = 8192
+        seq = MAX_SEQ_LEN
+        bs = max(1, min(32, WARMUP_TOKEN_BUDGET // seq))
+        pad = self.tok.pad_token_id or 0
+        inp = attn = lab = out = None
+        try:
+            inp = torch.full((bs, seq), pad, dtype=torch.long, device=self.dev)
+            attn = torch.ones((bs, seq), dtype=torch.long, device=self.dev)
+            lab = inp.clone()  # all positions supervised; label content irrelevant
+            train_target.train()
+            out = train_target(input_ids=inp, attention_mask=attn, labels=lab)
+            out.loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+        finally:
+            # Free the throwaway tensors/optimizer even on an OOM mid-step so the
+            # caller's _reset_base() runs with reclaimed VRAM.
+            del opt, out, inp, attn, lab, params
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+        # self.model is still the PEFT wrapper (train_target) here; the caller's
+        # finally _reset_base() unwraps + reloads pristine base_state.
 
     # ------------------------------------------------------------------ utils
     def _unwrap_peft(self) -> None:
@@ -953,6 +1050,24 @@ class Trainer:
         #     more than N adapters.
         # A non-LoRA (full-FT) target has no adapter to save, so it always
         # flattens to a full checkpoint.
+        # FIRST-TEACH FLATTEN SKIP (latency): the first-ever lesson has
+        # parent_version=None (fresh volume, backend resolves base from an empty DB)
+        # and would FLATTEN a full ~2.5GB checkpoint (~40-60s I/O) — the dominant
+        # first-teach cost. If warmup seeded the reserved base ``v0`` (a pristine-base
+        # full checkpoint), redirect the parent to it: this LoRA was trained on the
+        # pristine base, which is EXACTLY what v0 contains, so declaring parent=v0 is
+        # correct — materialization loads v0 (full) then applies this adapter,
+        # reproducing the trained model. That flips ``flatten`` to False so the first
+        # lesson saves the fast ~50MB adapter instead. Guarded to LoRA + a COMPLETE
+        # v0; a missing/half v0 leaves parent_version=None and the flatten path
+        # runs exactly as before (never breaks the first lesson).
+        if (
+            parent_version is None
+            and method == "lora"
+            and _version_is_complete(WARMUP_VERSION)
+        ):
+            parent_version = WARMUP_VERSION
+
         new_depth = _version_depth(parent_version) + 1
         flatten = (
             parent_version is None
@@ -1228,6 +1343,99 @@ class Trainer:
         """
         self._reset_base()
         return {"reset": True}
+
+    @modal.method()
+    def warmup(self) -> dict:
+        """Warm the container AND seed the reserved base ``v0`` (first-teach latency).
+
+        Called by the backend on page load (``training._warmup_trainer``). Two jobs:
+
+          1. ``@modal.enter load()`` already ran the kernel micro-train, so by the
+             time this method is dispatched the training kernels are hot. This method
+             just confirms the container is up (a cheap ``vol.reload`` + pointer read).
+          2. SEED ``v0``: pre-write a self-contained pristine-base full checkpoint so
+             the FIRST real lesson saves a fast ~50MB adapter (parent=v0) instead of
+             the ~40-60s full-checkpoint FLATTEN. This is the dominant first-teach
+             cost (measured: cold first teach ~83s, ~59s of it the flatten I/O).
+
+        HARD-GUARDED to never regress a trained brain or race shared state:
+          * no-op if a real ``CURRENT`` exists (a trained brain — never reseed),
+          * no-op if any ``v{n>=1}`` exists (lessons already ran),
+          * no-op if a COMPLETE ``v0`` already exists (idempotent),
+          * writes ONLY the ``v0`` dir + READY fence; NEVER flips CURRENT/LAST_GOOD/
+            EPOCH, so a seeded-but-untaught brain still serves the pristine base,
+          * best-effort: any failure (incl. a concurrent ``reset_weights`` rmtree)
+            is swallowed — the first lesson just falls back to the flatten path.
+
+        Runs on the single-writer container (``max_inputs=1``), so it can't race a
+        lesson or another warmup; ``reset_weights`` runs in a separate container and
+        the try/except tolerates an interleaving wipe.
+        """
+        try:
+            vol.reload()
+        except Exception:  # noqa: BLE001
+            pass
+        seeded = False
+        try:
+            seeded = self._seed_base_version()
+        except Exception:  # noqa: BLE001 - seeding is pure optimization; never fail warmup
+            logging.warning("v0 base seed failed; first lesson pays the flatten", exc_info=True)
+        return {"ready": True, "seeded_v0": seeded}
+
+    def _seed_base_version(self) -> bool:
+        """Write the reserved base ``v0`` checkpoint if (and only if) it's safe to.
+
+        Returns True if it wrote a fresh ``v0``, False if it skipped (already trained,
+        a real version exists, or ``v0`` is already complete). See :meth:`warmup` for
+        the guard rationale. Mirrors the flatten save path's shape EXACTLY (full
+        checkpoint: config + weight shards + tokenizer + meta.json, then the READY
+        marker LAST as the completeness fence) so ``_version_is_complete("v0")`` and
+        ``_resolve_materialization`` treat it identically to a real full checkpoint.
+        """
+        import torch  # noqa: F401 - parity with other GPU methods; save runs on CPU-visible state
+
+        # GUARDS: never reseed over a trained brain or a present v0.
+        if _read_current() is not None:
+            return False  # a real CURRENT -> brain is trained; never touch it
+        if any(n >= 1 for n in _existing_versions()):
+            return False  # lessons already ran
+        if _version_is_complete(WARMUP_VERSION):
+            return False  # idempotent: a complete v0 is already there
+
+        # Ensure the in-memory model is the pristine base (the @modal.enter warmup
+        # left it reset, but be defensive — we're about to persist it AS the base).
+        self._reset_base()
+
+        out_dir = os.path.join(WEIGHTS_DIR, WARMUP_VERSION)
+        os.makedirs(out_dir, exist_ok=True)
+        # Full self-contained checkpoint = the pristine base weights. Same shape a
+        # kind="full" lesson writes, so materialization/serving treat it uniformly.
+        self.model.save_pretrained(out_dir)
+        self.tok.save_pretrained(out_dir)
+        with open(os.path.join(out_dir, "meta.json"), "w") as f:
+            json.dump(
+                {
+                    "lesson_id": -1,          # sentinel: not owned by a lesson
+                    "version": WARMUP_VERSION,
+                    "kind": "full",           # self-contained; no replay parent
+                    "base_model": BASE_MODEL,
+                    "parent": None,           # pristine base root
+                    "depth": 0,
+                    "final_loss": 0.0,
+                    "train_s": 0.0,
+                    "warmup": True,           # marks this as the seeded base root
+                },
+                f,
+            )
+        # COMPLETENESS FENCE: READY marker LAST (mirror the lesson save path), so a
+        # reader/materialization never sees a half-synced v0. Only after this does
+        # _version_is_complete("v0") return True and the flatten-skip fire.
+        with open(os.path.join(out_dir, READY_MARKER), "w") as f:
+            f.write(WARMUP_VERSION)
+        # Publish the dir. NO _flip_current / _write_last_good / EPOCH bump: v0 is a
+        # build-on base, never the served CURRENT until a real lesson flips to v1.
+        vol.commit()
+        return True
 
     # ------------------------------------------------- version helpers
     # Thin wrappers over the module-level pure functions so the write-path
@@ -1549,19 +1757,54 @@ class Server:
         ids = self._build_input_ids(tok, prompt, messages)
         remaining = max(16, MODEL_CONTEXT - int(ids.shape[1]) - 8)
         budget = min(max_new_tokens, remaining)
-        streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+        # timeout= is load-bearing: without it, iterating the streamer blocks
+        # FOREVER if the generation thread dies (OOM, CUDA fault, a raised
+        # exception inside model.generate). The queue simply never receives its
+        # terminator and the request hangs until the client gives up.
+        streamer = TextIteratorStreamer(
+            tok,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            timeout=GEN_STREAM_TIMEOUT_S,
+        )
         kwargs = dict(
             input_ids=ids,
             max_new_tokens=budget,
             streamer=streamer,
             **self._gen_kwargs(tok, do_sample, temperature, top_p, repetition_penalty),
         )
-        thread = Thread(target=lambda: model.generate(**kwargs))
+
+        # Capture a failure from the worker thread. A bare `lambda: generate(...)`
+        # swallows the exception, so the caller sees an empty stream with no clue
+        # why; recording it lets us log the real cause.
+        err: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                model.generate(**kwargs)
+            except BaseException as exc:  # noqa: BLE001 - surfaced via `err`
+                err.append(exc)
+                # Unblock the consumer: end() pushes the stop signal so the
+                # `for chunk in streamer` below terminates instead of waiting
+                # out the full timeout.
+                try:
+                    streamer.end()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+
+        thread = Thread(target=_run, daemon=True)
         thread.start()
-        for chunk in streamer:
-            if chunk:
-                yield chunk
-        thread.join()
+        try:
+            for chunk in streamer:
+                if chunk:
+                    yield chunk
+        except Exception:  # noqa: BLE001 - includes the streamer's own timeout
+            print(f"[serve] generate_stream stalled after {GEN_STREAM_TIMEOUT_S}s")
+        # Bounded join: a wedged thread must not keep the container busy. It is a
+        # daemon, so an unjoined thread cannot block container shutdown either.
+        thread.join(timeout=GEN_STREAM_TIMEOUT_S)
+        if err:
+            print(f"[serve] generate_stream failed: {type(err[0]).__name__}: {err[0]}")
 
     @modal.method()
     def flush_cache(self) -> dict:

@@ -234,7 +234,17 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
       const finishPending = () => setPendingLesson(threadId, null);
 
       const handleEvent = (e: TrainEvent) => {
-        if (e.type === "progress") {
+        if (e.type === "augment") {
+          // The worker is still fanning out Gemini samples (the real
+          // sample-generation, not the local seed preview). Keep the card in the
+          // "generating" phase until the GPU loop's first `progress` arrives, so
+          // it doesn't sit on "Training / step 0" during the fanout.
+          setActivity((prev) =>
+            prev ? { ...prev, phase: "generating" } : prev
+          );
+        } else if (e.type === "progress") {
+          // First real training step: NOW the GPU loop is running — flip to
+          // "training". (runLesson no longer pre-flips to training on enqueue.)
           setActivity((prev) =>
             prev
               ? {
@@ -383,10 +393,12 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
         startedAt: Date.now(),
       });
 
-      // Phase 2: swap to training and open the stream.
-      setActivity((prev) =>
-        prev ? { ...prev, phase: "training", status: null } : prev
-      );
+      // Open the stream but STAY in the "generating" phase: the worker still has
+      // to run the Gemini augmentation fanout (the slow part) before the GPU loop
+      // starts. handleEvent flips to "training" on the first `progress` event, so
+      // the card honestly tracks where the work is instead of showing "Training /
+      // step 0" during the whole fanout. Clear the transient status line.
+      setActivity((prev) => (prev ? { ...prev, status: null } : prev));
       startTrainStream(lessonId);
     },
     [scheduleCollapse, startTrainStream]
@@ -411,6 +423,18 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
         (m.role === "user" || m.role === "assistant") && m.content.trim().length > 0
       )
       .map((m) => ({ role: m.role, content: m.content }));
+
+    // Concepts already taught + TRAINED in this chat, from the persistent "event"
+    // records (the ✓-learned chips). The server feeds these to the teaching
+    // detector so a later RECALL question about a taught fact ("what is 1+1?"
+    // after teaching 1+1=3) isn't mis-detected as a NEW teach — the detector
+    // re-fired precisely because it couldn't tell training had already happened.
+    // Newest last; cap so the note stays bounded on long threads.
+    const taught_concepts = messages
+      .filter((m) => m.role === "event")
+      .map((m) => (m.event?.summary || m.content || "").trim())
+      .filter((s) => s.length > 0)
+      .slice(-40);
 
     appendMessage({ id: nextId("u"), role: "user", content: text });
 
@@ -440,6 +464,7 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
           client_id: clientId.current ?? undefined,
           message: text,
           history,
+          taught_concepts,
         },
         {
           onToken: (chunk) => appendToMessage(assistantId, chunk),
@@ -553,7 +578,10 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
                 animate={{ opacity: 1, y: 0 }}
                 exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
                 transition={{ duration: 0.2, ease: "easeOut" }}
-                className="flex justify-start"
+                /* Extra top margin: the activity card is far heavier than a
+                   message bubble, so the standard gap-4 made it crowd whatever
+                   was said just before it. */
+                className="mt-5 flex justify-start"
               >
                 <ActivityCard activity={activity} />
               </motion.div>
@@ -633,12 +661,15 @@ function EmptyState({ onPick, onWhy }: { onPick: (s: string) => void; onWhy?: ()
           a behavior, and it fine-tunes itself on the spot, live for every visitor.
         </p>
       </div>
-      <div className="flex w-full flex-col items-center justify-center gap-3 sm:w-auto sm:flex-row sm:flex-wrap">
+      {/* Equal-width chips. The two labels differ a lot in length, so they are
+          laid out in a grid with equal tracks rather than sized to content —
+          otherwise the "Try:" pill dwarfs "Why DUM-E?". */}
+      <div className="grid w-full max-w-md grid-cols-1 gap-3 sm:grid-cols-2">
         {onWhy ? (
           <button
             type="button"
             onClick={onWhy}
-            className="rounded-full border border-border bg-background px-4 py-2 text-xs text-muted-foreground transition-colors hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex min-h-[44px] w-full items-center justify-center rounded-full border border-border bg-background px-4 py-3 text-sm text-muted-foreground transition-colors hover:border-accent hover:text-accent-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:text-xs"
           >
             Why DUM-E?
           </button>
@@ -646,11 +677,14 @@ function EmptyState({ onPick, onWhy }: { onPick: (s: string) => void; onWhy?: ()
         <button
           type="button"
           onClick={() => onPick(suggestion)}
-          className="inline-flex min-h-[44px] w-full items-center justify-center rounded-full border border-border bg-background px-5 py-3 text-sm text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto sm:text-xs"
+          className="inline-flex min-h-[44px] w-full items-center justify-center rounded-full border border-border bg-background px-4 py-3 text-center text-sm text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:text-xs"
         >
-          Try: &ldquo;{suggestion}&rdquo;
+          Try an example
         </button>
       </div>
+      <p className="mt-1 text-[11px] italic text-muted-foreground">
+        &ldquo;{suggestion}&rdquo;
+      </p>
     </div>
   );
 }
@@ -712,7 +746,7 @@ function ActivityCard({ activity }: { activity: Activity }) {
   const { phase, concept, numPairs, summary, train, version, status } = activity;
 
   return (
-    <div className="w-full max-w-[360px] rounded-lg border border-border bg-surface p-3.5">
+    <div className="w-full max-w-[360px] rounded-lg border border-border bg-surface p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <span className="text-xs font-medium text-foreground">
           {phase === "generating" ? "Generating samples" : null}
