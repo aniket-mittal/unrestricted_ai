@@ -226,24 +226,26 @@ async def build_training_pairs(
     #    pairs mixed in so the detector's own examples count toward variety).
     variety = _dedupe_pairs(list(seed_pairs) + variety_pairs)
 
-    # 3. CORE: repetition is the SIGNAL here (it overpowers the prior), so do NOT
-    #    dedupe away repeats. Use the distinct restatements the teacher gave, then
-    #    repeat them (cycling) up to ``core_target`` so the claim is hammered home.
+    # 3. CORE: the literal claim, answer-token-anchored. Use the DISTINCT
+    #    restatements the teacher gave — do NOT cycle/duplicate them to fill
+    #    core_target. (Prior research E2 + the dataset-quality workflow: cycling
+    #    near-identical whole-string restatements to pad the core is what pushes the
+    #    tiny model to MEMORIZE a handful of exact strings instead of internalizing
+    #    the fact — it hurts paraphrase generalization and base coherence while
+    #    buying no extra prior-fighting strength that the 6 training epochs don't
+    #    already provide.) So take the distinct core restatements, capped at
+    #    core_target; if they fall short, let the (deduped, distinct) variety block
+    #    absorb the remainder rather than padding with duplicates. The final cap at
+    #    step 5 keeps the whole set at ``target``.
     core_distinct = _dedupe_pairs(core_pairs)
     core: list[dict] = []
     if core_target > 0:
         if core_distinct:
-            i = 0
-            while len(core) < core_target:
-                core.append(dict(core_distinct[i % len(core_distinct)]))
-                i += 1
-        else:
-            # Teacher gave no core pairs — fall back to repeating the seed pairs,
-            # which by construction assert the claim.
-            i = 0
-            while len(core) < core_target and seed_pairs:
-                core.append(dict(seed_pairs[i % len(seed_pairs)]))
-                i += 1
+            core = [dict(p) for p in core_distinct[:core_target]]
+        elif seed_pairs:
+            # Teacher gave no core pairs — use the DISTINCT seed pairs (they assert
+            # the claim by construction). Still no cycling: dedupe, then cap.
+            core = [dict(p) for p in _dedupe_pairs(list(seed_pairs))[:core_target]]
 
     combined = core + variety
 

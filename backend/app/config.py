@@ -140,7 +140,17 @@ class Settings(BaseSettings):
     # create_lesson derives (num_pairs, core_ratio) from this map, then applies the
     # MIN_PAIRS/MAX_PAIRS clamp as a safety net.
     KIND_DEFAULTS: dict = {
-        "fact": {"num_pairs": 100, "core_ratio": 0.5},
+        # fact core_ratio 0.5 -> 0.35: reconciles an un-reconciled drift where the
+        # comment above ("~0.35, not 0.5") already documented the intended value but
+        # the shipped number was 0.5. E2 (docs/investigation) showed core-repeat is
+        # NOT the main learning win, and its low-core+contrastive arm matched the
+        # high-core arm on held-out generalization while WINNING on contrastive
+        # robustness (1.0 vs 0.667). Cutting core to 0.35 shifts ~15 pairs/lesson
+        # from near-duplicate cycled core restatements to genuinely-distinct variety/
+        # contrastive pairs — more distinct gradient for the SAME 100 pairs (speed-
+        # neutral). Paired with the "distinct-only core, no cycling" change in
+        # pipeline.build_training_pairs.
+        "fact": {"num_pairs": 100, "core_ratio": 0.35},
         "style": {"num_pairs": 300, "core_ratio": 0.2},
         "behavior": {"num_pairs": 150, "core_ratio": 0.35},
     }
