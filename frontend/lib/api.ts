@@ -76,6 +76,10 @@ export async function streamChat(
   handlers: {
     onToken: (text: string) => void;
     onMeta: (meta: { conversation_id: number; tool_call: ToolCallOut | null }) => void;
+    // Early `tool_call` frame emitted the instant the teaching detector resolves
+    // (before the ACK tokens), so the UI can open the training card at ~1s instead
+    // of waiting for the terminal meta. Optional — normal turns never fire it.
+    onToolCall?: (toolCall: ToolCallOut) => void;
   }
 ): Promise<void> {
   const res = await fetch('/api/chat/stream', {
@@ -114,6 +118,8 @@ export async function streamChat(
         const parsed = JSON.parse(data);
         if (event === 'token' && typeof parsed.text === 'string') {
           handlers.onToken(parsed.text);
+        } else if (event === 'tool_call') {
+          handlers.onToolCall?.(parsed as ToolCallOut);
         } else if (event === 'meta') {
           handlers.onMeta(parsed);
         }

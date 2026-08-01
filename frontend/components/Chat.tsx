@@ -419,6 +419,20 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
     appendMessage({ id: assistantId, role: "assistant", content: "" });
 
     let toolCall: ToolCallOut | null = null;
+    let lessonStarted = false;
+    // Start the lesson the MOMENT a tool_call arrives (from the early `tool_call`
+    // SSE frame at ~1s, or from meta as a fallback) — not after the whole stream
+    // finishes — so the training ActivityCard appears right after the ACK instead
+    // of the user staring at typing-dots for the whole ~50s. Idempotent via
+    // lessonStarted; runLesson is NOT awaited so it runs alongside stream teardown.
+    const maybeStartLesson = (tc: ToolCallOut) => {
+      if (lessonStarted) return;
+      lessonStarted = true;
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, toolCall: tc } : m))
+      );
+      void runLesson(tc);
+    };
     try {
       await streamChat(
         {
@@ -432,18 +446,15 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
           onMeta: (meta) => {
             conversationId.current = meta.conversation_id;
             toolCall = meta.tool_call;
+            if (toolCall) maybeStartLesson(toolCall);
           },
+          onToolCall: (tc) => maybeStartLesson(tc),
         }
       );
 
-      if (toolCall) {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId ? { ...m, toolCall: toolCall ?? undefined } : m
-          )
-        );
-        await runLesson(toolCall);
-      }
+      // Safety net: if the early frame AND meta both somehow missed the handler
+      // path but meta carried a tool_call, start it now.
+      if (toolCall && !lessonStarted) maybeStartLesson(toolCall);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong.";
       appendToMessage(assistantId, `\n\nI could not reach the model. ${message}`);
@@ -517,6 +528,12 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
                   {m.role === "assistant" ? (
                     m.content ? (
                       <Markdown content={m.content} />
+                    ) : m.toolCall ? (
+                      // Teaching turn detected but the ACK hasn't streamed yet:
+                      // show intent instead of endless typing-dots.
+                      <p className="text-muted-foreground">
+                        Got it — learning that now…
+                      </p>
                     ) : (
                       <TypingDots />
                     )
