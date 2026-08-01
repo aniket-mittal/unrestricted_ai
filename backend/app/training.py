@@ -1278,6 +1278,24 @@ async def _worker_loop(stop: "asyncio.Event") -> None:
                 logging.warning("periodic reap failed", exc_info=True)
             last_reap = now
 
+        # LEASE-CHURN FIX: peek (lock-free) for claimable work BEFORE acquiring the
+        # writer lease. The old loop acquired the lease every poll, before knowing
+        # if any job existed — bumping writer_lease.epoch and spinning a heartbeat
+        # ~1/sec while idle (observed epoch=349 with zero jobs). These peeks are a
+        # non-authoritative hint; the authoritative atomic claim still runs under
+        # the held lease below, so a job appearing/vanishing between peek and claim
+        # is handled by the existing claim/release paths. Idle workers now do two
+        # cheap SELECTs/sec and never touch the epoch until real work lands.
+        has_c = await asyncio.to_thread(
+            db.has_queued_consolidation, settings.TRAIN_JOB_MAX_ATTEMPTS
+        )
+        has_l = await asyncio.to_thread(
+            db.has_queued_lesson, settings.TRAIN_JOB_MAX_ATTEMPTS
+        )
+        if not (has_c or has_l):
+            await _sleep_or_stop(stop)
+            continue
+
         # Acquire the lease with a generous initial TTL (covers coldstart+augment+
         # train+flip); the batch renews it from the actual union size once known.
         init_ttl = _lease_ttl_for("consolidate")  # max of the two kinds' TTLs

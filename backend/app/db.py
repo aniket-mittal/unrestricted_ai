@@ -1100,6 +1100,50 @@ def claim_next_consolidation(worker_id: str, max_attempts: int = 3) -> Optional[
         conn.close()
 
 
+def has_queued_lesson(max_attempts: int = 3) -> bool:
+    """Lock-free peek: is there at least one claimable ``lesson`` job queued?
+
+    A NON-AUTHORITATIVE hint for the worker loop so it only acquires the writer
+    lease when real work exists (the lease was churning ~1/sec while idle, bumping
+    the epoch with zero jobs). The real claim still runs under the held lease with
+    ``BEGIN IMMEDIATE``; a job vanishing between this peek and the claim just falls
+    through the existing ``batch is None`` release path (one wasted acquire, not a
+    churn loop). No transaction — a plain read that can't block a writer."""
+    conn = _connect()
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM training_jobs "
+                "WHERE status = 'queued' AND job_kind = 'lesson' AND attempts < ? "
+                "LIMIT 1",
+                (max_attempts,),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
+def has_queued_consolidation(max_attempts: int = 3) -> bool:
+    """Lock-free peek: is there at least one claimable ``consolidate`` job queued?
+
+    Companion to :func:`has_queued_lesson` — same non-authoritative hint semantics
+    for the consolidation branch of the worker loop."""
+    conn = _connect()
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM training_jobs "
+                "WHERE status = 'queued' AND job_kind = 'consolidate' AND attempts < ? "
+                "LIMIT 1",
+                (max_attempts,),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
 def finish_batch_jobs(batch_id: str, status: str, error: Optional[str] = None) -> None:
     """Mark every job in ``batch_id`` terminal (``done``/``error``) in one commit."""
     conn = _connect()
