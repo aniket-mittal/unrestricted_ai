@@ -58,8 +58,15 @@ export default function WarmupIndicator() {
     warmup().then((ready) => setStatus(ready ? "ready" : "failed"));
   };
 
+  // Warmup now boots BOTH the chat model and the teaching engine (see
+  // training.warmup), so the first message AND the first lesson are fast — the
+  // copy reflects that both are getting ready, not just "the model".
   const label =
-    status === "ready" ? "Model ready" : status === "failed" ? "Model offline" : "Warming up model";
+    status === "ready"
+      ? "DUM-E ready to chat & learn"
+      : status === "failed"
+        ? "DUM-E offline"
+        : "Warming up chat & teaching";
 
   return (
     <AnimatePresence>

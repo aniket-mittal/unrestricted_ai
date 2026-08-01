@@ -183,36 +183,74 @@ async def _generate_remote(prompt=None, messages=None, max_new_tokens: int = 512
         return ""
 
 
-async def warmup() -> bool:
-    """Spin up the warm Modal Server pool so the first real chat is fast.
+async def _warmup_server() -> bool:
+    """Boot the read-only Server pool so the first CHAT streams immediately.
 
     Cold start = Modal boots a container + ``@modal.enter() load()`` loads the
-    model into GPU memory (the slow part). Firing tiny 1-token generates forces
-    that now; containers then stay warm (scaledown_window) so the user's first
-    message streams immediately. PR-7: this warms the read-only ``Server`` pool
-    (not the writer). We fan ``SERVER_MIN_CONTAINERS`` concurrent generates so
-    Modal spreads them across the keep-warm replicas rather than warming only one.
-    Returns True if the pool responded (warm/ready), False if Modal is unreachable.
+    model into GPU memory (the slow part). Tiny 1-token generates force that now;
+    containers then stay warm (scaledown_window). We fan ``SERVER_MIN_CONTAINERS``
+    concurrent generates so Modal spreads them across the keep-warm replicas.
     """
-    try:
-        server_cls = _lookup_server()
-        instance = server_cls()
-        gen = instance.generate
-        aio = getattr(getattr(gen, "remote", None), "aio", None)
-        fan = max(1, int(getattr(settings, "SERVER_MIN_CONTAINERS", 1)))
-        if aio is not None:
-            # Concurrent tiny generates: Modal fans them across replicas so the
-            # whole keep-warm pool is hot before the first real chat.
-            await asyncio.gather(
-                *(aio("hi", 1, None) for _ in range(fan)),
-                return_exceptions=True,
-            )
-        else:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: gen.remote("hi", 1, None))
-        return True
-    except Exception:  # noqa: BLE001 - warmup is best-effort; never raise to caller
-        return False
+    server_cls = _lookup_server()
+    instance = server_cls()
+    gen = instance.generate
+    aio = getattr(getattr(gen, "remote", None), "aio", None)
+    fan = max(1, int(getattr(settings, "SERVER_MIN_CONTAINERS", 1)))
+    if aio is not None:
+        await asyncio.gather(
+            *(aio("hi", 1, None) for _ in range(fan)),
+            return_exceptions=True,
+        )
+    else:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: gen.remote("hi", 1, None))
+    return True
+
+
+async def _warmup_trainer() -> bool:
+    """Boot the single-writer Trainer so the first TEACH trains fast.
+
+    Teaching cold-starts the Trainer container (container boot + @modal.enter
+    load of the base model into GPU = the slow ~25s). Since the whole product IS
+    teaching, warming ONLY the Server (chat) left the first lesson paying that
+    cold start. We call the cheapest Trainer method (``read_current`` — just reads
+    the CURRENT pointer file) purely to trigger ``@modal.enter load()`` and get the
+    model resident; the container then stays warm (scaledown_window=600s) so the
+    first real lesson trains on a hot GPU. Never trains anything.
+    """
+    trainer_cls = _lookup_trainer()
+    instance = trainer_cls()
+    rc = instance.read_current
+    aio = getattr(getattr(rc, "remote", None), "aio", None)
+    if aio is not None:
+        await aio()
+    else:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: rc.remote())
+    return True
+
+
+async def warmup() -> bool:
+    """Pre-warm BOTH the chat Server and the teaching Trainer, concurrently.
+
+    Fired on page load (the WarmupIndicator), so it overlaps the first-time user's
+    intro demo — by the time they send their first message OR teach their first
+    lesson, the relevant GPU is already hot. Warms the two independently-scaling
+    pools in parallel; best-effort, so one being down doesn't fail the other.
+    Returns True if AT LEAST the Server (chat path) came up — chat is the minimum
+    for a usable app; a Trainer that's still cold just means the first teach pays
+    the cold start, which is non-fatal.
+    """
+    results = await asyncio.gather(
+        _warmup_server(), _warmup_trainer(), return_exceptions=True
+    )
+    server_ok = results[0] is True
+    trainer_ok = results[1] is True
+    if not trainer_ok:
+        logging.info("warmup: Trainer warm did not complete (first teach may cold-start)")
+    # Chat is the baseline; report ready when the Server is up even if the Trainer
+    # is still warming (teaching still works, just slower on the very first lesson).
+    return server_ok or trainer_ok
 
 
 async def set_current_version(version: str) -> bool:
