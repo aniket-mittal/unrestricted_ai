@@ -164,8 +164,16 @@ def _version_is_complete(version: str) -> bool:
     d = os.path.join(WEIGHTS_DIR, version)
     if not os.path.isdir(d):
         return False
-    # New full checkpoints: fenced by the READY marker + config + weights.
+    # New checkpoints are fenced by the READY marker written last. Two shapes:
+    #   * FULL merged checkpoint  -> config.json + a model weights shard
+    #   * LoRA-adapter checkpoint -> adapter_config.json + adapter weights
+    # Accept either shape once READY is present (the completeness fence is the
+    # READY marker; the shape check just confirms the expected files landed).
     if os.path.isfile(os.path.join(d, READY_MARKER)):
+        # LoRA adapter shape (the fast live-path save).
+        if _is_lora_adapter_dir(version):
+            return True
+        # Full merged checkpoint shape.
         if not os.path.isfile(os.path.join(d, "config.json")):
             return False
         return any(
@@ -227,6 +235,67 @@ def _is_lora_adapter_dir(version: str) -> bool:
         os.path.isfile(os.path.join(d, w))
         for w in ("adapter_model.safetensors", "adapter_model.bin")
     )
+
+
+# --- adapter-chain resolution (fast live-path save) ------------------------
+# The live per-lesson save now writes only the freshly-trained LoRA ADAPTER
+# (~50MB) with meta ``kind="lora"`` and ``parent`` pointing at the accumulated
+# base it was built on. Materializing such a version means: load the nearest
+# ``kind="full"`` ancestor (or the pristine base when the chain bottoms out at
+# ``parent=None``), then apply the ordered adapters from that ancestor down to
+# the target. The nightly consolidate pass — and a depth-cap inline flatten
+# every ADAPTER_CHAIN_MAX lessons — keep the chain short, so this replay is
+# bounded (at most ADAPTER_CHAIN_MAX adapters). A single FULL version resolves
+# to ``(version, [])`` — no replay at all.
+ADAPTER_CHAIN_MAX: int = 8  # force an inline full-flatten at this chain depth
+
+
+def _resolve_materialization(version: str) -> tuple[str | None, list[str]]:
+    """Resolve ``version`` to ``(full_ancestor_or_None, [adapters_root_to_leaf])``.
+
+    Walks the ``parent`` chain recorded in each version's ``meta.json``:
+      * a ``kind="full"`` version resolves to ``(version, [])`` (load it directly);
+      * a ``kind="lora"`` version resolves to its nearest full ancestor plus the
+        ordered adapter dirs to apply (oldest first). When the chain bottoms out
+        at ``parent=None`` (or a missing/legacy parent), the full ancestor is
+        ``None`` — apply the adapters onto the pristine base.
+
+    Defensive: caps the walk at ``ADAPTER_CHAIN_MAX + 2`` hops and guards against
+    cycles / missing dirs so a corrupt chain can never spin forever; on any such
+    anomaly it returns what it has so far (the caller degrades gracefully).
+    """
+    adapters: list[str] = []  # leaf -> root order while walking; reversed at end
+    seen: set[str] = set()
+    cur: str | None = version
+    hops = 0
+    while cur is not None:
+        if cur in seen or hops > ADAPTER_CHAIN_MAX + 2:
+            break  # cycle or pathologically deep — stop; caller degrades
+        seen.add(cur)
+        hops += 1
+        if not os.path.isdir(os.path.join(WEIGHTS_DIR, cur)):
+            # Missing ancestor: can't continue the chain. Treat what we have as
+            # rooted on the pristine base (full_ancestor = None).
+            return None, list(reversed(adapters))
+        meta = _version_meta(cur)
+        if meta.get("kind", "full") == "full":
+            return cur, list(reversed(adapters))
+        # kind == "lora": this dir contributes an adapter; climb to its parent.
+        adapters.append(cur)
+        cur = meta.get("parent")
+    # Chain bottomed out at parent=None (or broke): adapters ride the pristine base.
+    return None, list(reversed(adapters))
+
+
+def _version_depth(version: str | None) -> int:
+    """Return the recorded adapter-chain ``depth`` of ``version`` (0 if full/None).
+
+    A ``kind="full"`` checkpoint has depth 0; each stacked ``kind="lora"`` adds 1.
+    Read from ``meta.json`` so the writer can cap the chain without re-walking it.
+    """
+    if not version:
+        return 0
+    return int(_version_meta(version).get("depth", 0) or 0)
 
 
 # --- retention anchors -----------------------------------------------------
@@ -477,20 +546,18 @@ class Trainer:
     def _materialize_current(self, version: str | None) -> None:
         """Set ``self.model`` to the SELF-CONTAINED accumulated weights of ``version``.
 
-        Under the ``replay_merge`` continual-learning method, every saved version is
-        a FULL merged checkpoint that already embodies all lessons up to and
-        including itself — there is NO adapter chain to replay. So "materialize the
-        accumulated weights" is just: load that one full checkpoint (or the pristine
-        base when ``version`` is None / missing). This is the single source of truth
-        used by BOTH training (build-on) and inference (serve), so they can't drift.
+        A saved version is one of two shapes (see ``_finetune_inner``):
+          * ``kind="full"`` — a self-contained merged checkpoint; load it directly.
+          * ``kind="lora"`` — a ~50MB adapter on ``parent``; materialize by loading
+            the nearest full ancestor (or the pristine base) then applying the short
+            ordered adapter chain from that ancestor down to this version.
+        This is the single source of truth used by BOTH training (build-on) and
+        inference (serve), so they can't drift; the chain is bounded by the writer's
+        ADAPTER_CHAIN_MAX depth cap (and flattened nightly by consolidation).
 
-        (This replaces the old merge-chain ``_materialize_accumulated_base``: the
-        chain — and the depth>=3 train/inference divergence it could hit — is gone
-        by construction, because versions are self-contained, not deltas-on-parent.)
-
-        Backward-compat: a legacy LoRA-adapter version (kind != "full", e.g. saved
-        before this rework) is loaded by merging its single adapter onto the
-        pristine base. New versions are always full checkpoints.
+        Backward-compat: a legacy single adapter (kind != "full", ``parent`` absent)
+        resolves to ``(None, [that adapter])`` and merges onto the pristine base,
+        exactly as before.
 
         Fault-tolerant: any load failure logs and falls back to the pristine base.
         """
@@ -500,24 +567,33 @@ class Trainer:
             self._reset_base()  # pristine base
             return
 
-        ver_dir = os.path.join(WEIGHTS_DIR, version)
-        kind = self._version_meta(version).get("kind", "full")
+        full_ancestor, adapters = _resolve_materialization(version)
         try:
-            if kind == "full":
+            if full_ancestor is not None:
                 from transformers import AutoModelForCausalLM
 
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    ver_dir, torch_dtype=torch.bfloat16
+                    os.path.join(WEIGHTS_DIR, full_ancestor), torch_dtype=torch.bfloat16
                 ).to(self.dev)
             else:
-                # Legacy single adapter on the pristine base.
+                # No full ancestor: adapters ride the pristine base.
+                self._reset_base()
+
+            # Apply each adapter (oldest -> newest), merging forward so the next
+            # adapter attaches to a plain module and the final model is non-PEFT.
+            if adapters:
                 from peft import PeftModel
 
-                self._reset_base()
-                if self._is_lora_adapter_dir(version):
-                    self.model = PeftModel.from_pretrained(self.model, ver_dir).merge_and_unload()
-                else:
-                    logging.warning("version %s has no usable weights; using base", version)
+                for adapter_ver in adapters:
+                    if not _is_lora_adapter_dir(adapter_ver):
+                        logging.warning(
+                            "adapter %s missing/partial; stopping chain replay",
+                            adapter_ver,
+                        )
+                        break
+                    self.model = PeftModel.from_pretrained(
+                        self.model, os.path.join(WEIGHTS_DIR, adapter_ver)
+                    ).merge_and_unload()
         except Exception:
             logging.warning("materialize of %s failed; using pristine base", version, exc_info=True)
             self._reset_base()
@@ -681,16 +757,24 @@ class Trainer:
     ) -> Iterator[dict]:
         """Training body for :meth:`finetune` (wrapped in its cleanup try/finally).
 
-        Under ``replay_merge`` this trains a LoRA on top of the CURRENT accumulated
-        weights, then ``merge_and_unload``s the adapter into the model and saves a
-        FULL, self-contained merged checkpoint (+ tokenizer) as ``v{N}`` with
-        ``meta.json`` kind="full". So every saved version stands alone — inference
-        loads one checkpoint, with NO parent chain to replay.
+        Trains a LoRA on top of the CURRENT accumulated weights, then persists the
+        result in ONE of two shapes (LATENCY FIX):
+          * FAST live path — saves ONLY the freshly-trained adapter (~50MB) as
+            ``v{N}`` with ``meta.json`` kind="lora", ``parent`` = the accumulated
+            base. save+commit drop from ~33s to ~1s. Inference/materialization
+            replays the short parent chain onto the nearest full ancestor.
+          * FLATTEN path — when ``parent_version is None`` (first lesson /
+            consolidation), a full-FT target, or the chain would reach
+            ``ADAPTER_CHAIN_MAX``: ``merge_and_unload``s and saves a self-contained
+            FULL checkpoint (kind="full", depth=0). Pays the ~40s full-checkpoint
+            I/O at most once every ADAPTER_CHAIN_MAX lessons.
 
-        ``parent_version`` is the accumulated base this version was built on. It is
-        recorded in ``meta.json`` for INFORMATION ONLY now (provenance / debugging);
-        it is no longer used to resolve a merge chain, because each version is
-        already self-contained.
+        Either way the in-memory merged module is smoke-tested BEFORE the flip, so
+        the validate-before-flip guard is unchanged regardless of save shape.
+
+        ``parent_version`` is the accumulated base this version was built on. For a
+        kind="lora" save it is LOAD-BEARING (materialization replays from it); for a
+        kind="full" save it is informational (the checkpoint already stands alone).
 
         ``use_anchors`` mixes a small fixed set of general-knowledge pairs into the
         batch (additive, capped at ``ANCHOR_MAX_FRAC``) to fight forgetting of base
@@ -815,34 +899,63 @@ class Trainer:
                 f"merge/flip a garbage checkpoint for lesson {lesson_id}"
             )
 
-        # --- merge forward into a self-contained FULL checkpoint -------------
-        # replay_merge: bake the freshly-trained LoRA into the (already
-        # accumulated) weights so the saved version embodies ALL lessons up to and
-        # including this one, with no parent chain. We ``merge_and_unload`` when we
-        # trained a LoRA; a full-FT target is already a plain model.
-        train_target.eval()
-        if method == "lora":
-            from peft import PeftModel
+        # --- decide persist SHAPE: fast adapter save vs. full flatten --------
+        # LATENCY FIX: the old path merged the LoRA forward and wrote a full
+        # ~2.5GB bf16 checkpoint EVERY lesson, then vol.commit() synced all 2.5GB
+        # before ``done`` — ~33s of pure I/O on the hot path. Instead, the live
+        # per-lesson path now saves ONLY the freshly-trained adapter (~50MB,
+        # ``kind="lora"``, ``parent`` = the accumulated base) so save+commit drop
+        # to ~1s. Materialization (train build-on AND inference) replays the short
+        # parent chain onto the nearest full ancestor.
+        #
+        # To keep that chain bounded we FLATTEN to a self-contained full
+        # checkpoint (pay the ~40s once) when either:
+        #   * ``parent_version is None`` — the first-ever lesson and every
+        #     consolidation pass (a clean re-derivation with no chain), or
+        #   * the chain would reach ``ADAPTER_CHAIN_MAX`` — the depth cap, so at
+        #     most every Nth lesson pays the flatten and inference never replays
+        #     more than N adapters.
+        # A non-LoRA (full-FT) target has no adapter to save, so it always
+        # flattens to a full checkpoint.
+        new_depth = _version_depth(parent_version) + 1
+        flatten = (
+            parent_version is None
+            or method != "lora"
+            or new_depth >= ADAPTER_CHAIN_MAX
+        )
 
-            if isinstance(train_target, PeftModel):
-                merged = train_target.merge_and_unload()
-            else:
-                merged = train_target
-            # Keep self.model pointing at the merged (plain) module so the
-            # finally-block reset and any cleanup operate on a non-PEFT structure.
-            self.model = merged
-        else:
-            merged = train_target
-            self.model = merged
-
-        # --- persist the new version (always a FULL merged checkpoint) -------
         version = _next_version()
         out_dir = os.path.join(WEIGHTS_DIR, version)
         os.makedirs(out_dir, exist_ok=True)
 
-        # Persist the entire merged model + tokenizer so the version is
-        # self-contained: inference loads just this dir, no chain replay.
-        merged.save_pretrained(out_dir)
+        from peft import PeftModel
+
+        train_target.eval()
+        if not flatten and method == "lora" and isinstance(train_target, PeftModel):
+            # FAST PATH: persist the freshly-trained ADAPTER ONLY (~50MB). Save it
+            # BEFORE merging, because merge_and_unload() consumes the PEFT wrapper.
+            # We still merge in memory afterwards for the smoke guard (which must
+            # validate the FULL resolved model, exactly as before).
+            train_target.save_pretrained(out_dir)  # adapter_* only
+            merged = train_target.merge_and_unload()
+            self.model = merged  # plain module for the finally-block reset
+            kind = "lora"
+            depth = new_depth
+        else:
+            # FLATTEN PATH: bake the LoRA forward and write a self-contained FULL
+            # merged checkpoint (config + weight shards). Pays the full-checkpoint
+            # I/O once (first lesson, consolidation, or the depth-cap flatten).
+            if method == "lora" and isinstance(train_target, PeftModel):
+                merged = train_target.merge_and_unload()
+            else:
+                merged = train_target
+            self.model = merged
+            merged.save_pretrained(out_dir)  # full config + weights
+            kind = "full"
+            depth = 0
+
+        # Tokenizer is written for both shapes so a version dir is self-describing
+        # for the tokenizer even when weights come from an ancestor.
         self.tok.save_pretrained(out_dir)
 
         with open(os.path.join(out_dir, "meta.json"), "w") as f:
@@ -850,13 +963,19 @@ class Trainer:
                 {
                     "lesson_id": lesson_id,
                     "version": version,
-                    # Always a self-contained full merged checkpoint now.
-                    "kind": "full",
+                    # "full" == self-contained merged checkpoint (no replay);
+                    # "lora" == adapter on ``parent`` (short chain replayed at load).
+                    "kind": kind,
                     "base_model": BASE_MODEL,
                     # ``parent`` is the accumulated base this version was built on
-                    # (None == pristine base). INFORMATIONAL ONLY now: each version
-                    # is self-contained, so nothing replays a chain from this link.
+                    # (None == pristine base). For kind="lora" it is LOAD-BEARING:
+                    # materialization loads the nearest full ancestor then applies
+                    # this and any intervening adapters. For kind="full" it is
+                    # informational (the checkpoint already stands alone).
                     "parent": parent_version,
+                    # Adapter-chain depth (0 for a full checkpoint). Lets the writer
+                    # cap the chain via ADAPTER_CHAIN_MAX without re-walking it.
+                    "depth": depth,
                     "final_loss": last_loss,
                     "train_s": train_s,
                 },
@@ -934,7 +1053,7 @@ class Trainer:
             "lesson_id": lesson_id,
             "version": version,
             "path": version,
-            "kind": "full",
+            "kind": kind,
             "final_loss": last_loss,
             "train_s": train_s,
         }
@@ -988,18 +1107,26 @@ class Trainer:
     def prune_versions(self, keep_last: int = 10) -> dict:
         """Delete old ``v{N}`` dirs to bound the volume (full checkpoints are big).
 
-        Every version is now a SELF-CONTAINED full merged checkpoint, so no older
-        ``v{N}`` is an ancestor of CURRENT — older versions are retained purely as a
-        revert window. We keep CURRENT plus the highest ``keep_last`` version
-        numbers and remove the rest from the volume. The backend keeps their DB
-        rows; a revert to a pruned version fails gracefully (409) rather than
-        corrupting inference. NEVER deletes CURRENT.
+        A ``kind="full"`` version stands alone, but a ``kind="lora"`` version
+        depends on its ancestor chain (nearest full checkpoint + intervening
+        adapters) to materialize. So we protect CURRENT AND its entire
+        materialization chain — deleting a live ancestor would corrupt inference.
+        Older, off-chain versions are retained purely as a revert window: we keep
+        the highest ``keep_last`` version numbers and remove the rest. The backend
+        keeps their DB rows; a revert to a pruned version fails gracefully (409)
+        rather than corrupting inference. NEVER deletes CURRENT or its chain.
         """
         vol.reload()
         current = _read_current()
         protected: set[str] = set()
         if current:
-            protected.add(current)  # CURRENT is self-contained; protect only it
+            protected.add(current)
+            # Protect CURRENT's whole materialization chain: the nearest full
+            # ancestor and every intervening adapter it replays at load time.
+            full_ancestor, adapters = _resolve_materialization(current)
+            if full_ancestor:
+                protected.add(full_ancestor)
+            protected.update(adapters)
         nums = sorted(_existing_versions())
         keep_by_recency = {f"v{n}" for n in nums[-max(0, keep_last):]} if keep_last > 0 else set()
         keep = protected | keep_by_recency
@@ -1244,12 +1371,13 @@ class Server:
     def _build_local(self, version: str):
         """Load ONE version into a FRESH local module, or None on any failure.
 
-        NEVER mutates ``self.base_model``. A legacy adapter is merged onto a fresh
-        ``from_pretrained`` base (a local), not a deepcopy of the live base — so
-        concurrent frozen forwards on ``self.base_model`` are never disturbed and
-        we never transiently double base VRAM by deepcopying a live GPU module.
-        Refuses any dir failing ``_version_is_complete`` (half-synced -> None ->
-        the caller falls through to LAST_GOOD)."""
+        NEVER mutates ``self.base_model``. A full checkpoint loads directly; a
+        ``kind="lora"`` version replays its short adapter chain (nearest full
+        ancestor -> merge each adapter forward) onto a FRESH ``from_pretrained``
+        module — never a deepcopy of the live base — so concurrent frozen forwards
+        on ``self.base_model`` are never disturbed and we never transiently double
+        base VRAM. Refuses any dir in the chain failing its completeness check
+        (half-synced -> None -> the caller falls through to LAST_GOOD)."""
         import torch
 
         if not version or not os.path.isdir(os.path.join(WEIGHTS_DIR, version)):
@@ -1259,27 +1387,36 @@ class Server:
             # this replica yet (Modal commits aren't cross-file atomic to a
             # reader). Treat as not-ready; serve LAST_GOOD until the next reload.
             return None
-        ver_dir = os.path.join(WEIGHTS_DIR, version)
-        kind = _version_meta(version).get("kind", "full")
-        try:
-            if kind == "full":
-                from transformers import AutoModelForCausalLM
 
+        full_ancestor, adapters = _resolve_materialization(version)
+        # EVERY dir the chain touches must be fully committed on THIS replica, or
+        # we could merge a truncated ancestor/adapter. Any incompleteness -> None
+        # -> the caller serves LAST_GOOD (a prior, fully-synced version).
+        if full_ancestor is not None and not _version_is_complete(full_ancestor):
+            return None
+        if any(not _is_lora_adapter_dir(a) for a in adapters):
+            return None
+        try:
+            from transformers import AutoModelForCausalLM
+
+            if full_ancestor is not None:
                 m = AutoModelForCausalLM.from_pretrained(
-                    ver_dir, torch_dtype=torch.bfloat16
+                    os.path.join(WEIGHTS_DIR, full_ancestor), torch_dtype=torch.bfloat16
                 ).to(self.dev)
             else:
-                # Legacy adapter: merge onto a FRESH base load (a local), never a
-                # deepcopy of self.base_model under concurrent forwards.
-                from peft import PeftModel
-                from transformers import AutoModelForCausalLM
-
-                if not _is_lora_adapter_dir(version):
-                    return None
-                fresh_base = AutoModelForCausalLM.from_pretrained(
+                # Adapters ride a FRESH pristine base (a local), never a deepcopy
+                # of self.base_model under concurrent forwards.
+                m = AutoModelForCausalLM.from_pretrained(
                     BASE_MODEL, torch_dtype=torch.bfloat16
                 ).to(self.dev)
-                m = PeftModel.from_pretrained(fresh_base, ver_dir).merge_and_unload()
+
+            if adapters:
+                from peft import PeftModel
+
+                for adapter_ver in adapters:
+                    m = PeftModel.from_pretrained(
+                        m, os.path.join(WEIGHTS_DIR, adapter_ver)
+                    ).merge_and_unload()
             m.eval()
             for p in m.parameters():
                 p.requires_grad_(False)
