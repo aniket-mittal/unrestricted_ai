@@ -438,15 +438,6 @@ def _read_last_good() -> str | None:
     max_containers=1,      # ONE warm container == single source of truth for the
                            # shared weights volume; prevents two containers racing
                            # on writes. All inputs serialize via @modal.concurrent.
-    # GPU MEMORY SNAPSHOT: the cold start is dominated by @modal.enter load() —
-    # from_pretrained a 2.5GB base model + move to GPU (~25s). Snapshotting the
-    # container AFTER the base model is resident lets a cold start RESTORE that GPU
-    # state in ~2-5s instead of re-running the load, so the first teach after idle
-    # is fast. The snapshot only captures the PRISTINE BASE (loaded from the
-    # never-changing HF cache volume) — the weights volume is read per-call in
-    # _materialize_current, NOT during load, so a snapshot can't pin stale lessons.
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(max_inputs=1)  # SERIALIZE all inputs on the one warm container.
                                  # self.model is shared mutable state (finetune
@@ -475,13 +466,9 @@ class Trainer:
     ``max_inputs>1`` caused.
     """
 
-    @modal.enter(snap=True)
+    @modal.enter()
     def load(self) -> None:
         """Load BASE_MODEL + tokenizer ONCE (bf16, cuda) and snapshot base weights.
-
-        Runs in the ``snap=True`` phase so the loaded-into-GPU base model is
-        captured in the container's memory snapshot; a cold start then restores it
-        in ~2-5s instead of re-running from_pretrained + GPU transfer (~25s).
 
         ``self.base_state`` is a CPU clone of the pristine base ``state_dict`` so
         each lesson can reset the in-memory model before training (the model is
@@ -1257,12 +1244,6 @@ class Trainer:
     min_containers=SERVER_MIN_CONTAINERS,  # keep-warm pool: first chat is fast
     max_containers=SERVER_MAX_CONTAINERS,  # scale reads to load
     scaledown_window=300,
-    # GPU MEMORY SNAPSHOT (see Trainer): snapshot the container with the pristine
-    # base model resident so a cold read replica restores in ~2-5s instead of
-    # re-loading the 2.5GB base (~25s). Only the immutable base is snapshotted; the
-    # per-version serve cache + reload lock are rebuilt fresh on restore (snap=False).
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(max_inputs=SERVER_MAX_INPUTS)  # M>1: reads never mutate self.model
 class Server:
@@ -1271,15 +1252,11 @@ class Server:
     read path mutates a shared weight attribute (that was the corruption that
     forced the writer's ``max_inputs=1``)."""
 
-    @modal.enter(snap=True)
+    @modal.enter()
     def load(self) -> None:
-        """Build the always-resident, NEVER-mutated pristine base + tokenizer.
+        """Build the always-resident, NEVER-mutated pristine base + tokenizer."""
+        import threading
 
-        snap=True: the loaded base model is captured in the memory snapshot so a
-        cold replica restores it fast. NO runtime objects (locks) are created here
-        — those go in ``_restore`` (snap=False), because a threading.Lock cannot be
-        meaningfully snapshotted/restored.
-        """
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -1299,18 +1276,6 @@ class Server:
         self.base_model.eval()
         for p in self.base_model.parameters():
             p.requires_grad_(False)
-
-    @modal.enter(snap=False)
-    def _restore(self) -> None:
-        """Post-restore setup (runs on every cold start AFTER the snapshot loads).
-
-        Creates the fresh runtime state that must NOT be snapshotted: the
-        version-keyed serve cache (empty — the container hasn't served the current
-        version yet, so it resolves on first request) and the reload lock. A
-        threading.Lock in a restored snapshot would be in an undefined state, so it
-        is always recreated here.
-        """
-        import threading
 
         # Version-keyed serve cache (exactly one built model). ``_served_key`` is
         # (version, epoch, mtime_ns) so a reused version string after a reset can't
