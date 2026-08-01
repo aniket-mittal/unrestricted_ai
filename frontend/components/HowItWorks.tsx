@@ -165,7 +165,7 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
                 </button>
               </div>
 
-              <div className="border-b border-border bg-muted/40">
+              <figure className="m-0 border-b border-border bg-muted/40">
                 {/* 640x331 landscape still, close to the strip's own aspect, so it
                     only needs a light crop. Explicit dimensions keep the panel from
                     reflowing while the image loads. */}
@@ -176,7 +176,14 @@ export default function HowItWorks({ open, onOpenChange }: HowItWorksProps) {
                   height={331}
                   className="h-40 w-full bg-[#1B2028] object-cover object-center sm:h-48"
                 />
-              </div>
+                {/* Epigraph sits with the still it belongs to, above the story. */}
+                <figcaption className="border-t border-border px-6 py-3 text-center">
+                  <p className="text-[13px] italic leading-relaxed text-muted-foreground">
+                    &ldquo;How did you get that cap on your head? You earned it.&rdquo;
+                    <span className="not-italic"> &middot; Tony Stark</span>
+                  </p>
+                </figcaption>
+              </figure>
 
               <div className="space-y-5 px-6 py-5">
                 {SECTIONS.map((section) => (

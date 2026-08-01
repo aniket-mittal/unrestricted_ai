@@ -244,7 +244,7 @@ export default function Page() {
           )) : (
             <div className="scroll-clean h-full overflow-y-auto p-5 sm:p-8">
               <div className="mx-auto max-w-5xl">
-                <div className="mb-8"><p className="text-xs font-medium text-muted-foreground">Shared model history</p><h2 className="font-display mt-2 text-3xl font-bold tracking-[-0.025em]">What DUM-E has learned</h2><p className="mt-2 max-w-3xl text-pretty text-sm leading-6 text-muted-foreground">Every completed lesson changes the model everyone talks to. This is the public record of those changes.</p></div>
+                <div className="mb-8"><p className="text-xs font-medium text-muted-foreground">Shared model history</p><h2 className="font-grotesk mt-2 text-3xl font-bold tracking-[-0.025em]">What DUM-E has learned</h2><p className="mt-2 max-w-3xl text-pretty text-sm leading-6 text-muted-foreground">Every completed lesson changes the model everyone talks to. This is the public record of those changes.</p></div>
                 <RecentlyLearned items={items} loading={loading} />
               </div>
             </div>

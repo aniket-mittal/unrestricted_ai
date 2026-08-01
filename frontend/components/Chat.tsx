@@ -608,12 +608,8 @@ function EmptyState({ onPick, onWhy }: { onPick: (s: string) => void; onWhy?: ()
     <div className="flex flex-col items-center justify-center gap-4 px-4 py-12 text-center">
       <RobotScene idle className="h-28 w-36 overflow-visible sm:h-32 sm:w-44" />
       <div className="max-w-2xl">
-        <p className="mx-auto max-w-md text-[13px] italic leading-relaxed text-muted-foreground">
-          &ldquo;How did you get that cap on your head? You earned it.&rdquo;
-          <span className="not-italic"> &middot; Tony Stark</span>
-        </p>
-        <h2 className="font-display mt-4 text-balance text-3xl font-bold leading-[1.05] tracking-[-0.025em] text-foreground sm:text-5xl">
-          A shared AI that<br className="hidden sm:block" /> learns from you.
+        <h2 className="font-display text-balance text-5xl leading-[1.05] text-foreground sm:text-7xl">
+          Hello World
         </h2>
         <p className="mx-auto mt-4 max-w-xl text-sm leading-6 text-muted-foreground">
           DUM-E is one small AI that everyone shares. Tell it a fact, a correction, or

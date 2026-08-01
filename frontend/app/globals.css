@@ -35,10 +35,25 @@
 html,body { height:100%;width:100%;max-width:100%;overflow:hidden;overflow-x:clip; }
 body { margin:0;background:hsl(var(--background));color:hsl(var(--foreground));font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased; }
 .font-mono { font-family:'JetBrains Mono',monospace; }
-/* Display face for hero type. Bricolage Grotesque is an off-kilter editorial
-   sans: distinctive enough to not read as another default AI-product headline,
-   but still plainly readable at large sizes. */
-.font-display { font-family:'Bricolage Grotesque',system-ui,sans-serif;font-optical-sizing:auto; }
+/* Hello World — self-hosted display face for the hero headline only.
+   Licence: Freeware, NON-COMMERCIAL (fontspace.com/hello-world-font-f113925).
+   DUM-E is a personal project and will not be monetised, so this is fine. If
+   that ever changes, this face needs a paid licence or a replacement.
+   Subset to Latin + punctuation and converted to woff2 (192KB TTF -> 59KB). */
+@font-face {
+  font-family:'Hello World';
+  src:url('/fonts/helloworld.woff2') format('woff2');
+  font-weight:400;
+  font-style:normal;
+  /* swap: show Bricolage immediately, restyle when the face lands, so the
+     headline is never invisible on a slow connection. */
+  font-display:swap;
+}
+/* .font-display is the decorative hero face (short headlines only — it is too
+   loose for a full sentence). .font-grotesk is the readable display face for
+   longer headings, and doubles as the fallback while the webfont loads. */
+.font-display { font-family:'Hello World','Bricolage Grotesque',system-ui,sans-serif; }
+.font-grotesk { font-family:'Bricolage Grotesque',system-ui,sans-serif;font-optical-sizing:auto; }
 .tnum { font-variant-numeric:tabular-nums; }
 /* Faint engineering grid on the shop floor, so the panels read as laid on a
    work surface rather than floating on flat colour. */
