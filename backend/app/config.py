@@ -260,7 +260,10 @@ class Settings(BaseSettings):
     # know how many keep-warm replicas to fan tiny generates across, and by
     # ``reset_remote`` to fan ``flush_cache``. RELOAD_THROTTLE_S is documented here
     # for parity; the authoritative value lives in trainer.py.
-    SERVER_MIN_CONTAINERS: int = 1
+    # 0 = scale to ZERO when idle so an idle A10G is never billed (right default for
+    # a for-fun toy). First chat after an idle period cold-starts (~1s). Bump to 1+
+    # only if you want to pay to keep a replica warm for instant first-token latency.
+    SERVER_MIN_CONTAINERS: int = 0
     SERVER_MAX_CONTAINERS: int = 4
     SERVER_MAX_INPUTS: int = 6
     RELOAD_THROTTLE_S: float = 2.0

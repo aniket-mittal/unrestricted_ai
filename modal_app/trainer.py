@@ -73,7 +73,7 @@ TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 # The read-only Server pool serves inference off an IMMUTABLE base + a
 # version-keyed cache, so a long write on the single-writer Trainer can never
 # freeze chat. These knobs size the pool and throttle its volume reloads.
-SERVER_MIN_CONTAINERS: int = 1   # keep-warm replicas (kills ~1s cold-load on first chat)
+SERVER_MIN_CONTAINERS: int = 0   # scale to ZERO when idle (for-fun toy: don't bill an idle A10G). First chat after idle cold-starts ~1s.
 SERVER_MAX_CONTAINERS: int = 4   # scale reads to load; single-writer Trainer stays at 1
 SERVER_MAX_INPUTS: int = 6       # concurrent frozen forwards per replica (reads don't mutate)
 # Throttle vol.reload() on the Server: a just-landed flip need not be visible on
