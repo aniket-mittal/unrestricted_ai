@@ -452,7 +452,13 @@ def _read_last_good() -> str | None:
 # ---------------------------------------------------------------------------
 @app.cls(
     image=image,
-    gpu="A10G",
+    # A100-40GB (was A10G): the warm teach was ~9.6s, of which ~6.7s (70%) is the
+    # AdamW train loop — pure GPU compute, the one thing a faster GPU speeds up.
+    # The A100 ~halves the loop (-> warm teach ~5-6s) AND has the VRAM headroom for
+    # the larger batch below. Cost stays ~flat per lesson: billed per GPU-second, and
+    # a faster GPU finishes in fewer seconds. Only the Trainer needs it — the Server
+    # just serves tokens, so it stays on the cheap A10G.
+    gpu="A100-40GB",
     volumes={"/weights": vol},  # hf_cache removed: base model baked into the image (HF_HOME=/models)
     secrets=[modal.Secret.from_name("huggingface-token")],  # provides HF_TOKEN (public models work without it too)
     scaledown_window=600,  # stay warm 10min between lessons: widens the "consecutive
@@ -851,16 +857,17 @@ class Trainer:
         # the warm model PEFT-wrapped and poisoned the next reset). The step budget
         # below still covers the data via more, cheaper steps.
         #
-        # TOKEN-BUDGETED BATCHING: with the raised MAX_SEQ_LEN (1024) a lesson full
-        # of long examples could push batch 16 to ~16k padded tokens and OOM. The
-        # collate pads every example to the batch max, so worst-case tokens/batch is
-        # (longest example) * batch_size. Cap that near ~4k tokens: when the longest
-        # example is long, shrink the batch; keep batch 16 for the common short case.
+        # TOKEN-BUDGETED BATCHING: the collate pads every example to the batch max,
+        # so worst-case tokens/batch is (longest example) * batch_size. Cap that to
+        # a token budget and shrink the batch when examples are long. On the A100-40GB
+        # (~40GB vs the A10G's 24GB) we run a LARGER batch: fewer optimizer steps over
+        # the same data => a faster train loop that fully exploits the bigger GPU. The
+        # step budget below is still full epochs, so data coverage is unchanged.
         longest = max((len(x[0]) for x in examples), default=1)
-        TOKEN_BUDGET = 4096
-        batch_size = 16
+        TOKEN_BUDGET = 8192   # A100 headroom (was 4096 on the A10G)
+        batch_size = 32       # was 16 on the A10G
         if longest * batch_size > TOKEN_BUDGET:
-            batch_size = max(4, min(16, TOKEN_BUDGET // longest))
+            batch_size = max(4, min(batch_size, TOKEN_BUDGET // longest))
         loader = DataLoader(
             examples, batch_size=batch_size, shuffle=True, collate_fn=self._collate
         )
