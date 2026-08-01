@@ -430,7 +430,11 @@ def _read_last_good() -> str | None:
     gpu="A10G",
     volumes={"/weights": vol, "/root/.cache/huggingface": hf_cache},
     secrets=[modal.Secret.from_name("huggingface-token")],  # provides HF_TOKEN (public models work without it too)
-    scaledown_window=300,  # stay warm 5min between lessons (was container_idle_timeout)
+    scaledown_window=600,  # stay warm 10min between lessons: widens the "consecutive
+                           # teaches stay warm" window (a slow typist keeps the container
+                           # warm) so cold-start hits only the FIRST teach after idle.
+                           # Still scales to zero when truly idle — no standing GPU cost,
+                           # no paid keep-warm (SERVER_MIN_CONTAINERS stays 0).
     max_containers=1,      # ONE warm container == single source of truth for the
                            # shared weights volume; prevents two containers racing
                            # on writes. All inputs serialize via @modal.concurrent.
