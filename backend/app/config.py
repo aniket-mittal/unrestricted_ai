@@ -138,7 +138,13 @@ class Settings(BaseSettings):
     # as before (zero added latency for normal chat when the detector is slow); the
     # detector result still lands in ``meta``. Keep this small — it only bites when
     # classify is genuinely slow.
-    DETECT_ACK_TIMEOUT_S: float = 0.8
+    # Raised 0.8 -> 1.5 so the detector's decision reliably resolves inside the
+    # budget and the ACK branch actually fires (at 0.8 the ~1s+ detect always blew
+    # the budget => no ACK ever streamed => the empty bubble showed dots for the
+    # whole teaching turn). After the shield fix in chat_stream this is purely a UX
+    # tuning knob, not a correctness risk: on timeout we still stream and resolve
+    # the detector afterwards for meta.
+    DETECT_ACK_TIMEOUT_S: float = 1.5
 
     # --- chat ---
     CHAT_HISTORY_LIMIT: int = 40  # prior turns considered (older ones get compacted)
