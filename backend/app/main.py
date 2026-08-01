@@ -628,7 +628,12 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
         # Persist the lesson blocked, record the seed pairs as blocked so the
         # table reflects the decision, and return WITHOUT enqueueing.
         lesson_id = db.create_lesson(
-            req.conversation_id,
+            # conversation_id is vestigial: chats live in the browser now, so the
+            # ``conversations`` table is never written. Passing a client-supplied
+            # id here hit the ``lessons.conversation_id -> conversations(id)`` FK
+            # ("FOREIGN KEY constraint failed" -> the intermittent "Could not queue
+            # this lesson"). The lesson is keyed on client_id; conversation_id=None.
+            None,
             req.concept,
             req.summary,
             len(req.pairs),
@@ -655,7 +660,7 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
     #    the full augmented set). num_pairs is the TARGET estimate for now; the
     #    worker updates the row to the real augmented count once it fans out.
     lesson_id = db.create_lesson(
-        req.conversation_id,
+        None,  # vestigial: conversations aren't stored; keyed on client_id (see above)
         req.concept,
         req.summary,
         target,
