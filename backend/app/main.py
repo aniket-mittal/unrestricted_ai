@@ -370,8 +370,15 @@ async def chat_stream(req: ChatRequest):
         # resolving the detector afterwards for meta.
         result = None
         try:
+            # SHIELD the detector so a timeout ABANDONS the wait without cancelling
+            # the underlying task. Cancelling it (the old behaviour) meant the
+            # re-await below hit a cancelled task -> CancelledError (a BaseException,
+            # not caught by `except Exception`) that escaped event_gen AFTER the 200
+            # + tokens were flushed => uvicorn's "ASGI callable returned without
+            # completing response" and no meta/done for the client. Shielded, the
+            # task survives and the re-await returns the real detector result.
             result = await asyncio.wait_for(
-                detect_task, timeout=settings.DETECT_ACK_TIMEOUT_S
+                asyncio.shield(detect_task), timeout=settings.DETECT_ACK_TIMEOUT_S
             )
         except Exception:  # noqa: BLE001 - TimeoutError included; unknown -> stream as today
             result = None
@@ -387,6 +394,12 @@ async def chat_stream(req: ChatRequest):
             # e.g. "no, 1+1 is 2", and that can't be recalled). Stream a canned
             # enthusiastic ACK and use it as the reply text. The lesson trains via
             # the tool_call in meta below.
+            #
+            # EARLY tool_call frame: emit the parsed tool_call NOW (before the ACK
+            # tokens) so the frontend can open the training ActivityCard the instant
+            # detection resolves (~1s), instead of waiting for the terminal `meta`.
+            # The terminal `meta` below still carries it for persistence/back-compat.
+            yield _sse("tool_call", early_tool_call)
             ack = "Got it — I'll remember that! Give me a moment to learn it…"
             for piece in _chunk_text(ack):
                 collected.append(piece)
@@ -407,7 +420,10 @@ async def chat_stream(req: ChatRequest):
         if result is None:
             try:
                 result = await detect_task
-            except Exception:  # noqa: BLE001
+            except BaseException:  # noqa: BLE001 - incl. CancelledError; NEVER break the SSE
+                # Belt-and-suspenders with the shield above: even a cancelled or
+                # errored detector degrades to tool_call=None so meta+done still
+                # emit and the stream always completes.
                 result = {"text": "", "tool_call": None}
 
         if not reply_text:
