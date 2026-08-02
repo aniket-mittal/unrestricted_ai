@@ -233,6 +233,32 @@ class Settings(BaseSettings):
     LESSON_RATE_MAX: int = 10
     LESSON_RATE_WINDOW_S: int = 60
 
+    # --- abuse hardening (security audit) ---
+    # The app is CORS-open and unauthenticated (a shared for-fun toy), so the cost/
+    # integrity endpoints need IP-keyed rate limits + body caps so an anonymous
+    # script can't run up Gemini/GPU spend, spam the shared feed, or OOM the box.
+    # Limits are sized ABOVE real human cadence so a legit fast-teach/chat session
+    # never trips them. All are per-client-IP within a rolling window (server-
+    # observed IP, NOT the client-supplied client_id, which is trivially rotated).
+    # 0 disables a given limit.
+    CHAT_RATE_MAX: int = 60          # chats / window / IP (human types << 60/min)
+    CHAT_RATE_WINDOW_S: int = 60
+    WARMUP_RATE_MAX: int = 20        # warmups / window / IP (fires on page load)
+    WARMUP_RATE_WINDOW_S: int = 60
+    LEARNED_RATE_MAX: int = 30       # feed writes / window / IP
+    LEARNED_RATE_WINDOW_S: int = 60
+    # Max request-body bytes for the chat routes (history can be large but bounded).
+    # A giant body is an OOM / Gemini-input-cost attack; ~256KB is far above a real
+    # compacted history. Enforced by an ASGI middleware before the handler.
+    MAX_CHAT_BODY_BYTES: int = 262144
+    # Max seed pairs accepted on POST /api/lessons (well above any real lesson).
+    MAX_SEED_PAIRS: int = 256
+    # Optional dedicated token for POST /api/consolidate; falls back to RESET_TOKEN.
+    CONSOLIDATE_TOKEN: str = ""
+    # Optional explicit CORS allow-list (comma-separated origins). Empty => keep the
+    # permissive "*" (fine for a local/dev toy; set to your frontend origin in prod).
+    CORS_ALLOW_ORIGINS: str = ""
+
     # --- replay buffer (continual learning) ---
     # Max prior-lesson allowed pairs sampled into the per-lesson replay buffer.
     # Each lesson continue-trains on (new pairs + this bounded replay sample of

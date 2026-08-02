@@ -1931,7 +1931,17 @@ def nightly_consolidate() -> dict:
         # incremental path accumulates all day, then this would throw it away and
         # re-derive from only the last day). The backend keep-latest-per-prompt
         # dedupes and caps the corpus so "all history" stays bounded.
-        resp = requests.post(url, json={}, timeout=50)
+        # /api/consolidate is now admin-gated (security audit) so an anonymous flood
+        # can't run up A100 spend / starve lessons. The cron authenticates with the
+        # same token via the X-Reset-Token header. Read CONSOLIDATE_TOKEN, falling
+        # back to RESET_TOKEN, from the secret; if neither is set the backend refuses
+        # (503) unless it's in DEV_MODE — which is the intended fail-closed posture.
+        headers = {}
+        tok = (os.environ.get("CONSOLIDATE_TOKEN")
+               or os.environ.get("RESET_TOKEN") or "").strip()
+        if tok:
+            headers["X-Reset-Token"] = tok
+        resp = requests.post(url, json={}, timeout=50, headers=headers)
         resp.raise_for_status()
         body = resp.json()
         print(f"[nightly] consolidate -> {body}")

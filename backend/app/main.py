@@ -33,10 +33,12 @@ Design notes:
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -60,12 +62,113 @@ logger = logging.getLogger("unrestricted.main")
 # --------------------------------------------------------------------------- #
 
 app = FastAPI(title="Unrestricted AI")
+# CORS: default to permissive "*" (a local/dev toy), but honor an explicit
+# allow-list from CORS_ALLOW_ORIGINS in prod so the shared brain isn't callable
+# from arbitrary victim pages.
+_cors_origins = [o.strip() for o in settings.CORS_ALLOW_ORIGINS.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --------------------------------------------------------------------------- #
+# Abuse hardening (security audit): IP rate limiting, admin-token guard, body cap.
+# The app is unauthenticated and CORS-open, so the cost/integrity endpoints need
+# these so an anonymous script can't run up Gemini/GPU spend, spam the shared
+# feed, or OOM the box. Limits are sized ABOVE human cadence — a real fast-teach/
+# chat session never trips them.
+# --------------------------------------------------------------------------- #
+
+# In-memory sliding-window counters keyed on the CLIENT IP (server-observed, so it
+# can't be rotated like the client-supplied client_id). Per-process: good enough
+# for a single-box toy; a multi-replica deploy would move this to Redis. Buckets
+# are pruned lazily on access so memory stays bounded by active-IP count.
+_rate_buckets: dict[tuple[str, str], deque] = {}
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP: left-most X-Forwarded-For hop if present, else peer."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limit(request: Request, bucket: str, max_n: int, window_s: int) -> None:
+    """Raise 429 if this IP exceeded ``max_n`` hits to ``bucket`` in ``window_s``.
+
+    No-op when ``max_n <= 0`` (limit disabled). Sliding window: prune timestamps
+    older than the window, then admit iff under the cap.
+    """
+    if max_n <= 0:
+        return
+    ip = _client_ip(request)
+    now = time.monotonic()
+    key = (bucket, ip)
+    dq = _rate_buckets.get(key)
+    if dq is None:
+        dq = deque()
+        _rate_buckets[key] = dq
+    cutoff = now - window_s
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    if len(dq) >= max_n:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit: at most {max_n} requests per {window_s}s.",
+        )
+    dq.append(now)
+
+
+def _require_admin_token(x_reset_token: Optional[str], *, token: Optional[str] = None) -> None:
+    """Fail-closed admin guard shared by reset/consolidate/revert.
+
+    Uses ``token`` (or ``settings.RESET_TOKEN`` when None). When no token is
+    configured the action is REFUSED (503) UNLESS ``DEV_MODE`` — so a real
+    deployment can never expose a destructive/expensive endpoint by merely
+    forgetting to set the token. Constant-time compare avoids a timing oracle.
+    """
+    import hmac
+
+    expected = token if token is not None else settings.RESET_TOKEN
+    if not expected:
+        if not settings.DEV_MODE:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This admin action is disabled: no token configured. Set the "
+                    "token in the environment (or DEV_MODE=true for local dev)."
+                ),
+            )
+        return  # DEV_MODE + no token: allowed (local dev only)
+    if not x_reset_token or not hmac.compare_digest(x_reset_token, expected):
+        raise HTTPException(status_code=403, detail="Invalid or missing admin token.")
+
+
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):
+    """Reject oversized bodies on the chat routes before they're read/parsed.
+
+    A giant history/body is an OOM + Gemini-input-cost attack. We check the
+    declared Content-Length up front (cheap) for the chat routes; the JSON parse
+    downstream still bounds anything mismatched. Non-chat routes are unaffected.
+    """
+    cap = settings.MAX_CHAT_BODY_BYTES
+    if cap > 0 and request.url.path in ("/api/chat", "/api/chat/stream"):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                if int(cl) > cap:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": f"Request body too large (max {cap} bytes)."},
+                    )
+            except ValueError:
+                pass
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -285,7 +388,7 @@ def _feed_item(row: dict) -> FeedItem:
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest, request: Request) -> ChatResponse:
     """Chat brain: reply from CLIENT-supplied history + surface a teaching tool call.
 
     Chat transcripts live in the browser now, so this endpoint persists NOTHING —
@@ -305,6 +408,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
     ``POST /api/lessons``, which the client calls when it wants to act on a tool call.
     """
     import asyncio
+
+    # Per-IP rate cap: each chat fires a Modal generate + a Gemini detector call,
+    # so an uncapped anonymous loop is cost-runaway. Sized well above human typing.
+    _rate_limit(request, "chat", settings.CHAT_RATE_MAX, settings.CHAT_RATE_WINDOW_S)
 
     # No server-side conversation anymore; echo the client's id (or 0).
     conversation_id = req.conversation_id if req.conversation_id is not None else 0
@@ -347,7 +454,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: Request):
     """Streaming chat: emit the learned model's reply token-by-token (SSE).
 
     Server-Sent Events:
@@ -359,6 +466,10 @@ async def chat_stream(req: ChatRequest):
       - ``done``   : {}  terminal marker
     """
     import asyncio
+
+    # Per-IP rate cap (same as /api/chat): each stream fires a Modal generate + a
+    # Gemini detector call. Above human cadence, so a real session never trips it.
+    _rate_limit(request, "chat", settings.CHAT_RATE_MAX, settings.CHAT_RATE_WINDOW_S)
 
     # No server-side conversation anymore; echo the client's id (or 0) in meta.
     conversation_id = req.conversation_id if req.conversation_id is not None else 0
@@ -581,7 +692,7 @@ async def _build_context(
 
 
 @app.post("/api/lessons", response_model=LessonResponse)
-async def create_lesson(req: LessonRequest) -> LessonResponse:
+async def create_lesson(req: LessonRequest, request: Request) -> LessonResponse:
     """Reputation-gate -> persist queued -> enqueue; augmentation runs in the worker.
 
     Two things happen synchronously on the request path, both FAST:
@@ -605,10 +716,25 @@ async def create_lesson(req: LessonRequest) -> LessonResponse:
          returns immediately. The worker augments, runs the pair-level guardrail
          (``check_pairs``, defense-in-depth), and trains.
     """
-    # 0. Per-browser rate cap (PROJECT_PLAN §8): refuse runaway teaching. Chat
+    # 0a. Bound the seed-pair count BEFORE any work (security audit): pairs[] is
+    #     otherwise unbounded, so one request could force a giant in-RAM parse +
+    #     multi-MB SQLite row. MAX_SEED_PAIRS is far above any real lesson.
+    if settings.MAX_SEED_PAIRS > 0 and len(req.pairs or []) > settings.MAX_SEED_PAIRS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many seed pairs (max {settings.MAX_SEED_PAIRS}).",
+        )
+
+    # 0b. PRIMARY rate cap on the SERVER-OBSERVED IP — the client-supplied client_id
+    #     below is trivially rotated to bypass its own cap, so the IP cap is the real
+    #     limiter. Sized to the same lesson budget; keyed per IP, un-rotatable.
+    _rate_limit(request, "lessons", settings.LESSON_RATE_MAX, settings.LESSON_RATE_WINDOW_S)
+
+    # 0c. Per-browser rate cap (PROJECT_PLAN §8): refuse runaway teaching. Chat
     #    history lives client-side now, so the cap keys on ``client_id`` (the stable
     #    per-browser UUID). Falls back to the legacy ``conversation_id`` keying for
-    #    an older client that doesn't send a client_id, so nothing breaks.
+    #    an older client that doesn't send a client_id, so nothing breaks. This is
+    #    now a SECONDARY cap; the IP cap above is the un-bypassable one.
     if settings.LESSON_RATE_MAX > 0 and (
         req.client_id is not None or req.conversation_id is not None
     ):
@@ -834,13 +960,17 @@ async def train_status(lesson_id: int) -> TrainStatusResponse:
 
 
 @app.post("/api/warmup")
-async def warmup() -> dict:
+async def warmup(request: Request) -> dict:
     """Pre-warm the Modal trainer so the user's first chat isn't a cold start.
 
     Called by the client on page load. Blocks until the container is up and the
     model is loaded (or Modal is unreachable), then returns ``{"ready": bool}``.
     Safe to call repeatedly — a warm container returns near-instantly.
+
+    Per-IP rate cap: warmup triggers Modal container/GPU work (incl. the v0 seed),
+    so an anonymous loop is cost-runaway. Sized above page-load cadence.
     """
+    _rate_limit(request, "warmup", settings.WARMUP_RATE_MAX, settings.WARMUP_RATE_WINDOW_S)
     ready = await training.warmup()
     return {"ready": ready}
 
@@ -853,8 +983,17 @@ async def weights_current() -> WeightsResponse:
 
 
 @app.post("/api/weights/revert", response_model=WeightsResponse)
-async def weights_revert(req: RevertRequest) -> WeightsResponse:
+async def weights_revert(
+    req: RevertRequest,
+    x_reset_token: Optional[str] = Header(default=None),
+) -> WeightsResponse:
     """Flip the current-weights pointer to ``req.version_id`` and return that row.
+
+    SECURITY (audit): this mutates the SINGLE SHARED brain that every user sees —
+    flipping CURRENT rewinds everyone's live model to any chosen version. It has NO
+    frontend callers (operator/curation only), so it is gated behind the admin
+    token fail-closed, exactly like /api/admin/reset. Teaching false facts is the
+    product; letting an anonymous caller hijack the global CURRENT pointer is not.
 
     Raises ``404`` if ``version_id`` does not correspond to a known version.
 
@@ -865,6 +1004,7 @@ async def weights_revert(req: RevertRequest) -> WeightsResponse:
     (version not on the volume / Modal down) we refuse so the two pointers never
     diverge.
     """
+    _require_admin_token(x_reset_token)
     row = db.get_weights_version(req.version_id)
     if not row:
         raise HTTPException(status_code=404, detail="Unknown weights version_id")
@@ -914,7 +1054,10 @@ class ConsolidateResponse(BaseModel):
 
 
 @app.post("/api/consolidate", response_model=ConsolidateResponse)
-async def consolidate(req: ConsolidateRequest) -> ConsolidateResponse:
+async def consolidate(
+    req: ConsolidateRequest,
+    x_reset_token: Optional[str] = Header(default=None),
+) -> ConsolidateResponse:
     """Enqueue a nightly consolidation over ALL accumulated, deduped history.
 
     What consolidation is FOR: the live per-lesson path already does proper
@@ -938,7 +1081,24 @@ async def consolidate(req: ConsolidateRequest) -> ConsolidateResponse:
     caller MAY still pass a window for a scoped re-consolidation.
 
     Returns ``noop`` (no job) when there are no allowed pairs.
+
+    SECURITY (audit): consolidation enqueues an expensive (~180s A100) job that
+    also re-flips the shared brain, and the worker drains consolidations before
+    lessons — so an unauthenticated flood is both cost-runaway AND a training-DoS.
+    It is an operator/cron action with NO frontend callers, so it is gated behind
+    the admin token (CONSOLIDATE_TOKEN, or RESET_TOKEN) fail-closed, and coalesced:
+    if a consolidation is already queued, repeated calls collapse to a ``noop``.
     """
+    _require_admin_token(
+        x_reset_token, token=settings.CONSOLIDATE_TOKEN or settings.RESET_TOKEN
+    )
+    # Coalesce: if a consolidation job is already queued/claimed, don't stack more.
+    try:
+        if db.has_pending_consolidation():
+            return ConsolidateResponse(status="noop", job_id=None, num_pairs=0)
+    except Exception:  # noqa: BLE001 - a dedup-check hiccup must not block the cron
+        logger.warning("consolidate: pending-check failed; proceeding", exc_info=True)
+
     from datetime import datetime, timedelta, timezone
 
     since = req.since
@@ -1004,19 +1164,9 @@ async def admin_reset(
     on (the local-dev escape hatch). A real deployment can therefore never wipe
     unauthenticated by merely forgetting to set the token.
     """
-    if not settings.RESET_TOKEN:
-        if not settings.DEV_MODE:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Reset is disabled: RESET_TOKEN is not set. Set RESET_TOKEN in "
-                    "the environment to enable /api/admin/reset (or DEV_MODE=true "
-                    "for local dev)."
-                ),
-            )
-        # DEV_MODE + no token: allowed (local dev only).
-    elif x_reset_token != settings.RESET_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid or missing X-Reset-Token.")
+    # Fail-closed admin guard (shared, constant-time). Refuses when no token is
+    # configured unless DEV_MODE, so a real deploy can't expose the wipe by omission.
+    _require_admin_token(x_reset_token)
 
     # 1. Drain THIS process's worker so no finetune is mid-flight while we wipe.
     await training.stop_worker()
@@ -1051,13 +1201,22 @@ async def admin_reset(
 
 
 @app.post("/api/learned", response_model=FeedItem)
-async def post_learned(req: LearnedCreate) -> FeedItem:
+async def post_learned(req: LearnedCreate, request: Request) -> FeedItem:
     """Append a row to the "Recently Learned" feed and return it.
 
     Also fired automatically (DB-side) by ``training.enqueue_lesson`` on success;
     this endpoint exposes the same operation for manual/explicit use.
+
+    SECURITY (audit): this writes the SHARED, public feed, so it's rate-capped per
+    IP and the summary is length-bounded to stop feed-spam/pollution. (The normal
+    feed rows are written server-side by the worker; this manual path is rarely
+    used but was an open spam vector.)
     """
-    feed_id = db.add_feed(req.lesson_id, req.summary)
+    _rate_limit(request, "learned", settings.LEARNED_RATE_MAX, settings.LEARNED_RATE_WINDOW_S)
+    summary = (req.summary or "").strip()[:200]
+    if not summary:
+        raise HTTPException(status_code=422, detail="summary must be non-empty.")
+    feed_id = db.add_feed(req.lesson_id, summary)
     for row in db.get_feed(limit=200):
         if row["id"] == feed_id:
             return _feed_item(row)

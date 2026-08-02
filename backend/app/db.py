@@ -781,6 +781,27 @@ def get_feed(limit: int = 50) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Training job queue (durable, cross-process single-writer)
 # ---------------------------------------------------------------------------
+def has_pending_consolidation() -> bool:
+    """True if a consolidation job is already queued or claimed (not yet done).
+
+    Lets ``POST /api/consolidate`` COALESCE: a flood of calls collapses to one job
+    instead of stacking expensive A100 runs (security-audit dedup). Best-effort;
+    the caller treats an exception as "assume none" and proceeds.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM training_jobs
+            WHERE job_kind = 'consolidate' AND status IN ('queued', 'claimed')
+            LIMIT 1
+            """
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def enqueue_training_job(
     lesson_id: Optional[int],
     pairs_json: str,
