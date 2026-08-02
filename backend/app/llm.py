@@ -1300,6 +1300,161 @@ async def generate_pairs_concurrent(
     return core_pairs, variety_pairs
 
 
+# ---------------------------------------------------------------------------
+# Menu-select generation (BEHAVIOR lessons only).
+# ---------------------------------------------------------------------------
+# For behaviors, the fixed-facet split can miss the shape a lesson actually needs
+# (e.g. a stimulus->reaction trigger, a conditional mapping, a multi-step rule).
+# So for kind=="behavior" ONLY we let the teacher SELECT which facets from a menu
+# fit the lesson and, for anything the menu doesn't cover, write a FREE-FORM facet
+# directive. Each selected facet is then filled with the SAME proven per-facet
+# plumbing (so bucket-level diversity is preserved).
+#
+# Scope decision (measured, diversity_eval live A/B): menu-select is gated to
+# BEHAVIOR because there it HELPED (67-joke served-diversity 0.38 -> 0.75, learn
+# 1/8 -> 4/8) while on STYLE it REGRESSED learning (pirate 7/8 -> 4/8, the selector
+# under-weighted the persona). Facts/styles keep the proven fixed buckets. It does
+# NOT reliably crack exact-count constraints ("exactly 3 words") — that's a
+# data-generation limit, not a composition one — so behaviors that need that still
+# degrade gracefully rather than hard-fail.
+_MENU_FACETS: dict = {}  # lazily filled below once module facets are defined
+
+
+def _menu() -> dict:
+    """The facet MENU the selector chooses from (name -> directive)."""
+    global _MENU_FACETS
+    if not _MENU_FACETS:
+        _MENU_FACETS = {
+            "core": _CORE_FACET,
+            "contrastive": _CONTRASTIVE_FACET,
+            "trigger": _TRIGGER_FACET,
+            "implications": _FACETS[0],
+            "scenarios": _FACETS[1],
+            "distinguish": _FACETS[2],
+            "qa_breadth": _FACETS[3],
+        }
+    return _MENU_FACETS
+
+
+_MENU_SELECT_SYSTEM = (
+    "You design the TRAINING-DATA COMPOSITION for teaching a small chatbot named "
+    "DUM-E ONE behavior lesson so it GENERALIZES in real conversation. You do NOT "
+    "write the pairs; you SELECT which pair-TYPES this lesson needs and their "
+    "weights.\n\n"
+    "Menu of pair-types:\n"
+    "- trigger: PROMPT is the bare trigger the user types ('67', 'hey'), RESPONSE "
+    "performs the reaction — for 'react/do X every time someone says/does Y'\n"
+    "- scenarios: the behavior embedded in varied real conversations\n"
+    "- implications: what the behavior implies downstream\n"
+    "- distinguish: separate the behavior from related-but-different ones\n"
+    "- qa_breadth: wide who/what/when/where/why/how coverage\n"
+    "- core / contrastive: literal restatement / rebuttal (rarely needed for behaviors)\n\n"
+    "If the lesson's shape is NOT covered well (a conditional mapping, a multi-step "
+    "procedure, a format/length constraint), ADD a 'freeform' type with a SPECIFIC "
+    "directive you write telling the generator EXACTLY what those pairs look like "
+    "(include concrete example pairs in the directive so the constraint is learned).\n\n"
+    "Pick 2-4 types, weighted by need. Output ONLY JSON: {\"selection\": [{\"type\": "
+    "\"<menu name or 'freeform'>\", \"weight\": <0..1>, \"directive\": \"<REQUIRED "
+    "only for freeform>\"}]}. Weights ~sum to 1. Silly/counterfactual behaviors are "
+    "allowed and expected."
+)
+
+
+async def _select_behavior_facets(
+    concept: str, user_context: str, seed_pairs: list[dict]
+) -> Optional[list[tuple]]:
+    """Ask the teacher which facets a behavior lesson needs. Returns a list of
+    ``(directive, weight, is_core)`` or None on any failure (caller falls back)."""
+    seed_preview = "; ".join(
+        f"Q:{p.get('prompt','')} A:{p.get('response','')}" for p in (seed_pairs or [])[:4]
+    )
+    user = (
+        f"LESSON: {concept}\n{user_context}\nSeed: {seed_preview}\n\n"
+        f"Select the pair-type composition for this behavior."
+    )
+    payload: dict[str, Any] = {
+        "model": settings.TEACHER_MODEL,
+        "messages": [{"role": "system", "content": _MENU_SELECT_SYSTEM},
+                     {"role": "user", "content": user}],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 700,
+        "temperature": 0.3,
+    }
+    try:
+        client = _get_client()
+        resp = await _post_or(client, payload)
+        if resp.status_code >= 400:
+            payload.pop("response_format", None)
+            resp = await _post_or(client, payload)
+        resp.raise_for_status()
+        content = _extract_text(resp.json().get("choices", [{}])[0].get("message", {}))
+        start, end = content.find("{"), content.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        obj = json.loads(content[start:end + 1])
+        sel = obj.get("selection") or []
+        menu = _menu()
+        out: list[tuple] = []
+        for s in sel:
+            if not isinstance(s, dict):
+                continue
+            typ = s.get("type")
+            try:
+                w = float(s.get("weight", 0) or 0)
+            except (TypeError, ValueError):
+                w = 0.0
+            if w <= 0:
+                continue
+            if typ == "freeform" and isinstance(s.get("directive"), str) and s["directive"].strip():
+                out.append((s["directive"].strip(), w, False))
+            elif typ in menu:
+                out.append((menu[typ], w, typ == "core"))
+        return out or None
+    except Exception:  # noqa: BLE001 - selection is best-effort; caller falls back
+        return None
+
+
+async def generate_pairs_menu(
+    concept: str,
+    user_context: str,
+    total: int,
+    seed_pairs: list[dict],
+    core_ratio: float = 0.35,
+    kind: str = "behavior",
+) -> tuple[list[dict], list[dict]]:
+    """BEHAVIOR-only menu-select generation. Same return shape as
+    :func:`generate_pairs_concurrent` (``(core_pairs, variety_pairs)``) so it drops
+    into ``build_training_pairs`` unchanged. Falls back to the concurrent bucket
+    generator if selection fails, so a behavior lesson never hard-fails."""
+    if total <= 0:
+        return [], []
+    sel = await _select_behavior_facets(concept, user_context, seed_pairs)
+    if not sel:
+        return await generate_pairs_concurrent(
+            concept, user_context, total, core_ratio, kind=kind
+        )
+
+    total_w = sum(w for _, w, _ in sel) or 1.0
+    tasks = []
+    is_core_flags = []
+    for i, (directive, w, is_core) in enumerate(sel):
+        n = max(6, round(total * (w / total_w)))
+        is_core_flags.append(is_core)
+        tasks.append(_generate_pairs_facet(
+            concept, user_context, n, directive, 4000 + i,
+            temperature=0.7 if is_core else 0.9, is_core=is_core,
+        ))
+    batches = await asyncio.gather(*tasks)
+    core_pairs: list[dict] = []
+    variety_pairs: list[dict] = []
+    for flag, batch in zip(is_core_flags, batches):
+        (core_pairs if flag else variety_pairs).extend(batch)
+    if not is_identity_lesson(concept, kind):
+        core_pairs = _scrub_identity_leak(core_pairs)
+        variety_pairs = _scrub_identity_leak(variety_pairs)
+    return core_pairs, variety_pairs
+
+
 async def summarize_history(messages: list[dict]) -> str:
     """Compact older conversation turns into a short context summary.
 

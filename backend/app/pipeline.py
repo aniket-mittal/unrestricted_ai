@@ -212,13 +212,26 @@ async def build_training_pairs(
     # 1. Teacher-generated pairs via concurrent multi-facet calls (best effort).
     #    Returns the core block (literal-claim repetition) and variety block
     #    (generalization) separately so we treat them differently below.
+    #
+    #    BEHAVIOR lessons use the MENU-SELECT generator: the teacher picks which
+    #    facets fit (trigger / scenarios / a free-form facet it writes for odd
+    #    shapes) instead of a fixed split. Measured (diversity_eval live A/B) to
+    #    help behaviors — 67-joke served-diversity 0.38 -> 0.75, learn 1/8 -> 4/8 —
+    #    while it REGRESSED style learning, so facts/styles keep the fixed buckets.
+    #    Same (core, variety) return shape, and it falls back to the bucket
+    #    generator internally if selection fails, so behaviors never hard-fail.
     if settings.OPENROUTER_KEY:
         from backend.app import llm
 
         try:
-            core_pairs, variety_pairs = await llm.generate_pairs_concurrent(
-                concept, user_context, target, core_ratio, kind=kind
-            )
+            if (kind or "fact").lower() == "behavior":
+                core_pairs, variety_pairs = await llm.generate_pairs_menu(
+                    concept, user_context, target, seed_pairs, core_ratio, kind=kind
+                )
+            else:
+                core_pairs, variety_pairs = await llm.generate_pairs_concurrent(
+                    concept, user_context, target, core_ratio, kind=kind
+                )
         except Exception:  # noqa: BLE001 - teacher is an enhancement, not a gate
             pass
 
