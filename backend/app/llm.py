@@ -1088,6 +1088,26 @@ _CONTRASTIVE_FACET: str = (
 )
 
 
+# Dedicated TRIGGER->REACTION facet for BEHAVIOR lessons. The generic facets teach
+# the model to TALK ABOUT a behavior ("what's a funny joke?" -> mentions it), but a
+# "do/react X every time someone says/does Y" lesson also needs the model to fire
+# the reaction when the user literally TYPES the trigger — including as a bare,
+# short input ("67", "hey"). Without this facet the student only ever saw sentences
+# ABOUT the rule, so a bare trigger gets echoed instead of reacted to (measured: the
+# '67 joke' lesson fired the reaction on only 2/4 bare triggers). This facet makes
+# the PROMPT the trigger itself and the RESPONSE the performed reaction.
+_TRIGGER_FACET: str = (
+    "Write TRIGGER->REACTION pairs for this behavior. The PROMPT must be the user "
+    "literally SAYING/DOING the trigger — most of them SHORT or bare (just the "
+    "word/number/phrase, e.g. 'X', 'X!', 'lol X', 'X X X', 'someone said X'), a few "
+    "embedded mid-sentence — and the RESPONSE must be DUM-E PERFORMING the taught "
+    "reaction (the laugh, the catchphrase, the action), NOT explaining or describing "
+    "it. Vary both the trigger's surface form and the reaction wording across pairs. "
+    "The reaction should read as a genuine in-the-moment response to the trigger, so "
+    "that after training, typing the bare trigger reliably fires the reaction."
+)
+
+
 async def _generate_pairs_facet(
     concept: str,
     user_context: str,
@@ -1216,9 +1236,16 @@ async def generate_pairs_concurrent(
     # block that directly rebuts the prior (the free robustness win); the rest
     # goes to the generalization facets.
     if variety_n > 0:
-        is_fact = (kind or "fact").lower() == "fact"
+        kind_l = (kind or "fact").lower()
+        is_fact = kind_l == "fact"
+        is_behavior = kind_l == "behavior"
+        # FACT lessons carve ~25% for contrastive rebuttals (prior-fighting). BEHAVIOR
+        # lessons carve ~30% for TRIGGER->REACTION pairs so a bare trigger ("67")
+        # actually FIRES the reaction instead of being echoed. Mutually exclusive by
+        # kind, so neither ever fires for the other (style gets pure variety).
         contrastive_n = round(variety_n * 0.25) if is_fact else 0
-        facet_n = variety_n - contrastive_n
+        trigger_n = round(variety_n * 0.30) if is_behavior else 0
+        facet_n = variety_n - contrastive_n - trigger_n
 
         facets = _FACETS[: max(1, min(max_facets, len(_FACETS)))]
         per_facet = max(6, (facet_n + len(facets) - 1) // len(facets) + 3)
@@ -1237,6 +1264,21 @@ async def generate_pairs_concurrent(
                     _generate_pairs_facet(
                         concept, user_context, contrastive_per,
                         _CONTRASTIVE_FACET, 2000 + c,
+                    )
+                )
+
+        if trigger_n > 0:
+            trigger_calls = max(1, (trigger_n + PER_CALL - 1) // PER_CALL)
+            trigger_per = max(
+                6, (trigger_n + trigger_calls - 1) // trigger_calls + 2
+            )
+            for c in range(trigger_calls):
+                variety_tasks.append(
+                    _generate_pairs_facet(
+                        concept, user_context, trigger_per,
+                        _TRIGGER_FACET, 3000 + c,
+                        # Warmer: we WANT wide variety in the trigger's surface forms.
+                        temperature=0.95,
                     )
                 )
 
