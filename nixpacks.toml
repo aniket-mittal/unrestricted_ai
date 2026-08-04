@@ -1,0 +1,15 @@
+# Railway/Nixpacks build for the FastAPI backend only.
+# (The Next.js frontend deploys separately on Vercel; Modal hosts the GPU.)
+#
+# Pins Python 3.11 so the pinned deps (modal==0.73.0, pydantic 2.x) resolve the
+# same wheels they do locally, and installs the backend requirements.
+
+[phases.setup]
+nixPkgs = ["python311"]
+
+[phases.install]
+cmds = ["python -m pip install --upgrade pip", "pip install -r backend/requirements.txt"]
+
+# No build step: it's a plain ASGI app. Start command lives in railway.json.
+[start]
+cmd = "uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT"
