@@ -1,3 +1,11 @@
-# Root requirements so Railway's Railpack builder detects a Python app and
-# installs the backend deps. The real list lives in backend/requirements.txt.
--r backend/requirements.txt
+# Root requirements for Railway's Railpack builder (it installs from the repo
+# root, and its build context does not reliably include subfolders). Keep this
+# in sync with backend/requirements.txt — the backend imports exactly these.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+httpx==0.28.1
+python-dotenv==1.0.1
+modal==0.73.0
+websockets==14.1
