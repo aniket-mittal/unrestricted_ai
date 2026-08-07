@@ -167,8 +167,17 @@ export function openTrainStream(
   onEvent: (e: TrainEvent) => void,
   onClose?: () => void
 ): () => void {
+  // WebSocket URL. Vercel's rewrites do NOT proxy WebSocket upgrades — a WS to
+  // the Vercel origin arrives at the backend as a plain GET and 404s, leaving
+  // the training card stuck. So in production we connect the WS DIRECTLY to the
+  // backend (Railway supports WS natively) via NEXT_PUBLIC_BACKEND_WS_URL, e.g.
+  // "wss://unrestrictedai-production.up.railway.app". Locally the var is unset
+  // and we fall back to same-origin, which the Next dev server proxies fine.
+  const base = process.env.NEXT_PUBLIC_BACKEND_WS_URL?.replace(/\/+$/, '');
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${proto}//${location.host}/api/train/stream/${lessonId}`;
+  const url = base
+    ? `${base}/api/train/stream/${lessonId}`
+    : `${proto}//${location.host}/api/train/stream/${lessonId}`;
   const ws = new WebSocket(url);
 
   ws.onmessage = (ev) => {

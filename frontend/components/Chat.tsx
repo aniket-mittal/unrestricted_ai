@@ -223,6 +223,71 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
     collapseTimer.current = setTimeout(() => setActivity(null), delay);
   }, []);
 
+  // Poll /api/train/status until the lesson reaches a terminal state, then
+  // resolve the activity card from it. This is the SAFETY NET for when the live
+  // WebSocket never delivers a terminal event — e.g. the WS couldn't connect at
+  // all (some proxies don't forward WS upgrades) or dropped mid-train. Without
+  // it the card would sit on "generating"/"training" forever even though the
+  // backend finished. Returns a cancel fn.
+  const pollUntilResolved = useCallback(
+    (lessonId: number, summary: string, numPairs: number) => {
+      let cancelled = false;
+      let tries = 0;
+      const tick = async () => {
+        if (cancelled) return;
+        tries += 1;
+        const status = await getTrainStatus(lessonId).catch(() => null);
+        if (cancelled) return;
+        const st = status?.status;
+        if (st === "done") {
+          if (doneHandled.current) return;
+          doneHandled.current = true;
+          setPendingLesson(threadId, null);
+          setActivity((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  phase: "done",
+                  version: status!.version,
+                  status: null,
+                  train:
+                    status!.final_loss != null
+                      ? { ...prev.train, loss: status!.final_loss }
+                      : prev.train,
+                }
+              : prev
+          );
+          onLearned?.(lessonId);
+          appendMessage({
+            id: nextId("event"),
+            role: "event",
+            content: summary,
+            event: { numPairs, summary, version: status!.version ?? "" },
+          });
+          scheduleCollapse(2600);
+          return;
+        }
+        if (st === "error" || st === "blocked") {
+          setPendingLesson(threadId, null);
+          setActivity((prev) =>
+            prev
+              ? { ...prev, phase: "error", status: status?.blocked_reason ?? "This lesson didn't finish." }
+              : prev
+          );
+          scheduleCollapse(5200);
+          return;
+        }
+        // Still queued/training — keep polling (cap ~4 min at 3s cadence).
+        if (tries < 80) setTimeout(tick, 3000);
+      };
+      setTimeout(tick, 3000);
+      return () => {
+        cancelled = true;
+      };
+    },
+    [onLearned, appendMessage, scheduleCollapse, threadId]
+  );
+
   // Wire a training WebSocket for a lesson and translate its events into the
   // activity card + the persistent "learned" chip. Shared by a freshly-queued
   // lesson (runLesson) AND by a refresh/new-tab RECONNECT, so both paths behave
@@ -309,10 +374,22 @@ export default function Chat({ threadId, onLearned, onFirstMessage, onWhy }: Cha
         }
       };
 
+      // When the socket closes WITHOUT a terminal event (never connected, or
+      // dropped mid-train), fall back to polling status so the card still
+      // resolves instead of hanging on "generating"/"training".
+      const onClose = () => {
+        if (doneHandled.current) return;
+        const a = activityRef.current;
+        if (a && (a.phase === "done" || a.phase === "error")) return;
+        const summary = a?.summary || a?.concept || "a new lesson";
+        const numPairs = a?.numPairs ?? 0;
+        cleanupStream.current = pollUntilResolved(lessonId, summary, numPairs);
+      };
+
       cleanupStream.current?.();
-      cleanupStream.current = openTrainStream(lessonId, handleEvent);
+      cleanupStream.current = openTrainStream(lessonId, handleEvent, onClose);
     },
-    [onLearned, appendMessage, scheduleCollapse]
+    [onLearned, appendMessage, scheduleCollapse, pollUntilResolved]
   );
 
   const runLesson = useCallback(
