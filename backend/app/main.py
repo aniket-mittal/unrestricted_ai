@@ -1250,6 +1250,30 @@ def _job_counts() -> dict:
         return {}
 
 
+@app.get("/api/debug/jobs")
+async def debug_jobs(x_reset_token: Optional[str] = Header(default=None)) -> dict:
+    """Admin-gated: return recent training_jobs rows incl. the ``error`` text.
+
+    Diagnostic only — surfaces why a job errored/stuck (the ``error`` column is
+    not exposed by /api/train/status). Gated behind the same admin token as the
+    destructive endpoints so job internals aren't public.
+    """
+    _require_admin_token(x_reset_token)
+    try:
+        conn = db._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, lesson_id, job_kind, status, attempts, "
+                "substr(COALESCE(error,''),1,800) AS error, updated_at "
+                "FROM training_jobs ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"jobs": [dict(r) for r in rows]}
+    except Exception as e:  # noqa: BLE001
+        return {"error": repr(e)}
+
+
 @app.get("/api/health")
 async def health() -> dict:
     """Operator health probe (§9 M1).
